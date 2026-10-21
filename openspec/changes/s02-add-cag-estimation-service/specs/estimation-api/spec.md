@@ -3,16 +3,16 @@
 ### Requirement: Endpoint de estimación
 El sistema SHALL exponer `POST /api/v1/estimate`, que recibe una transcripción y devuelve la estimación generada por el LLM.
 
-Request (`application/json`):
+Request (`application/json`, schema `EstimationRequest`):
 | Campo | Tipo | Reglas |
 |---|---|---|
 | `transcription` | `string` | obligatorio, no vacío tras eliminar espacios, máximo 20 000 caracteres |
 
-Response `200` (`application/json`):
+Response `200` (`application/json`, schema `EstimationResponse`):
 | Campo | Tipo |
 |---|---|
 | `estimation` | `string` (Markdown) |
-| `model` | `string` |
+| `model` | `string` (modelo solicitado, el efectivo de la configuración) |
 | `provider` | `"openai" \| "anthropic"` |
 | `input_tokens` | `integer` |
 | `output_tokens` | `integer` |
@@ -34,6 +34,10 @@ Response `200` (`application/json`):
 #### Scenario: Fallo del proveedor
 - **WHEN** el proveedor LLM devuelve un error
 - **THEN** la respuesta es 502 con un `detail` genérico, sin traza ni datos sensibles
+
+#### Scenario: Error 502 documentado
+- **WHEN** se consulta `/openapi.json`
+- **THEN** la operación `POST /api/v1/estimate` documenta las respuestas 200, 422 y 502
 
 ### Requirement: Health check
 El sistema SHALL exponer `GET /health`, que responde 200 con `{"status": "ok", "env": <APP_ENV>, "provider": <LLM_PROVIDER>, "model": <modelo efectivo>}`, sin llamar al LLM.

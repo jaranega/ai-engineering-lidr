@@ -28,4 +28,4 @@ El sistema SHALL enviar al LLM las instrucciones y los ejemplos como mensaje `sy
 #### Scenario: Separación de roles
 - **GIVEN** una transcripción `T`
 - **WHEN** se construyen los mensajes para el LLM
-- **THEN** el mensaje `user` contiene `T` y el system prompt no contiene `T`
+- **THEN** el mensaje `user` es exactamente `T` y el system prompt no contiene `T`

@@ -21,12 +21,16 @@ El sistema SHALL seleccionar la implementación del proveedor exclusivamente a p
 - **THEN** las estimaciones se generan con Anthropic sin ningún cambio de código
 
 ### Requirement: Coste estimado
-El sistema SHALL calcular `cost_usd` a partir de los tokens de entrada y salida y de una tabla de precios en código (USD por millón de tokens, input/output), verificada contra la documentación oficial. Si el modelo no está en la tabla, `cost_usd` MUST ser `null`.
+El sistema SHALL calcular `cost_usd` a partir de los tokens de entrada y salida y de una tabla de precios en código (USD por millón de tokens, input/output), verificada contra la documentación oficial. El coste MUST calcularse con el modelo solicitado (modelo efectivo de la configuración), y la tabla MUST incluir tanto los alias como los snapshots conocidos de cada modelo soportado. Si el modelo no está en la tabla, `cost_usd` MUST ser `null`.
 
 #### Scenario: Modelo con precio conocido
 - **GIVEN** que el modelo tiene precios `p_in` y `p_out` por millón de tokens
 - **WHEN** una llamada consume `i` tokens de entrada y `o` de salida
 - **THEN** `cost_usd = (i * p_in + o * p_out) / 1_000_000`, redondeado a 6 decimales
+
+#### Scenario: Snapshot fijado por configuración
+- **WHEN** `LLM_MODEL=claude-haiku-4-5-20251001`
+- **THEN** `cost_usd` se calcula con los mismos precios que `claude-haiku-4-5`
 
 #### Scenario: Modelo desconocido
 - **WHEN** el modelo efectivo no está en la tabla de precios
@@ -38,3 +42,14 @@ Los errores del SDK del proveedor (autenticación, rate limit, timeout, error de
 #### Scenario: Proveedor no disponible
 - **WHEN** el SDK lanza un error de conexión o de servidor
 - **THEN** el servicio produce un error de dominio que el router transforma en una respuesta HTTP 502
+
+### Requirement: Límites de la llamada al LLM
+Cada llamada al proveedor MUST usar `max_tokens = 2048`, un timeout de 60 segundos y como máximo 2 reintentos, definidos como constantes en el código. Si la salida se corta por alcanzar `max_tokens`, el sistema MUST registrar un warning en el log y devolver la estimación sin cambios en el contrato.
+
+#### Scenario: Salida truncada
+- **WHEN** el proveedor indica que la generación terminó por límite de tokens (`finish_reason=length` o `stop_reason=max_tokens`)
+- **THEN** se registra un warning y la respuesta HTTP es 200 con el texto recibido
+
+#### Scenario: Errores sin datos sensibles en el log
+- **WHEN** el SDK lanza un error
+- **THEN** el log registra el tipo de error y el status HTTP, sin el mensaje completo del SDK ni ninguna API key
