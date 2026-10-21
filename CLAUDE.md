@@ -34,6 +34,22 @@ Solución oficial (solo si hay bloqueo total): https://github.com/LIDR-academy-t
 5. `openspec validate --strict` + tests + ruff en verde.
 6. `/opsx:archive` — mueve el change a `archive/` y actualiza `openspec/specs/` (la fuente de verdad).
 
+## Harness: subagentes y automatizaciones
+
+La sesión principal actúa como **orquestadora**: aplica el flujo de OpenSpec y delega cada tarea al subagente que es dueño de esa capa (`.claude/agents/`). Las rutas de cada agente se respetan por instrucción, y el orquestador comprueba que se cumplen.
+
+| Agente | Modelo | Rutas que le pertenecen | Cuándo |
+|---|---|---|---|
+| `architect` | opus | solo `openspec/changes/**/design.md` | tras `/opsx:propose` y en cambios transversales |
+| `backend-engineer` | sonnet | `pyproject.toml`, `app/{main,config,schemas}.py`, `app/routers/`, `.github/workflows/` | `/opsx:apply` |
+| `ai-engineer` | opus | `app/services/`, `app/context/`, `app/prompts/` | `/opsx:apply` y revisión de la calidad de los prompts |
+| `qa-engineer` | sonnet | `tests/`, `samples/` | `/opsx:apply`, de escenarios a tests |
+
+- Ningún subagente decide por el usuario: las dudas vuelven al orquestador, que es quien pregunta.
+- **Hook** `PostToolUse` (`.claude/hooks/ruff-on-edit.sh`): ejecuta `ruff format` y `ruff check --fix` sobre cada `.py` editado y devuelve a Claude los errores que no puede corregir.
+- **Permisos** preaprobados en `.claude/settings.json`: `uv run/sync/lock/tree`, `openspec`, y `git status/diff/log/show/branch`. Los commits, el push y las acciones en GitHub siguen requiriendo confirmación.
+- **Roadmap del harness**: `code-reviewer` y la skill `delivery` al cerrar S02; `frontend-engineer` en S03; las skills `llm-integration` y `prompt-versioning`, y valorar un `eval-engineer` en S04 o después. Se añaden solo cuando hacen falta.
+
 Naming de changes: `sNN-<verbo>-<qué>` en kebab-case (p. ej. `s02-add-cag-estimation-service`), para trazar change ↔ sesión.
 
 ## Git y entregas
