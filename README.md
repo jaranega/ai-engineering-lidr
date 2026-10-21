@@ -141,7 +141,7 @@ Los tests no usan API keys reales ni hacen llamadas de red: el proveedor se sust
 - **502** cuando falla el proveedor LLM, además de los códigos habituales.
 - **Riesgo con `claude-haiku-4-5`**: es un modelo considerado legacy y Anthropic podría retirarlo; si deja de estar disponible, se configura otro con `LLM_MODEL`.
 
-Detalle completo de las decisiones: [`openspec/changes/s02-add-cag-estimation-service`](openspec/changes/s02-add-cag-estimation-service/).
+Detalle completo de las decisiones: [`openspec/changes/archive/2026-10-21-s02-add-cag-estimation-service`](openspec/changes/archive/2026-10-21-s02-add-cag-estimation-service/). Specs vigentes: [`openspec/specs/`](openspec/specs/).
 
 ## Metodología
 
