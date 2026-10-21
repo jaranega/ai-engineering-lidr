@@ -60,6 +60,8 @@ cp .env.example .env
 
 Las variables de entorno prevalecen sobre `.env`. Las keys vacías se tratan como no definidas y nunca se registran en logs ni en respuestas.
 
+Con `LOG_LEVEL=DEBUG`, los loggers de terceros (`openai`, `anthropic`, `httpx`, `httpx2`, `httpcore`, `httpcore2`) se mantienen en `INFO` como mínimo para no volcar en el log el prompt con la transcripción del cliente.
+
 > `python-dotenv` se incluye como dependencia porque lo pide el enunciado, aunque `pydantic-settings` ya lee `.env` por sí mismo.
 
 ## Arranque

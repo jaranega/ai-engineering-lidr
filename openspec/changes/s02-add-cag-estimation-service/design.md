@@ -205,6 +205,9 @@ No aplica, porque es el primer change. La entrega consiste en hacer push de la r
 19. **Todo fallo del SDK** (excepción base `openai.OpenAIError` / `anthropic.AnthropicError`, no solo `APIError`) se envuelve en `LLMProviderError` y se responde con **502**.
 20. Si OpenAI devuelve `usage=None`, se informan **0 tokens** (y por tanto un coste de 0). Es un caso raro y queda documentado.
 21. Detalles de implementación verificados contra los SDK instalados (openai 3.35.1, anthropic 1.17.0): OpenAI usa `max_completion_tokens` (`max_tokens` está obsoleto en Chat Completions); `build_provider(name, settings)` usa `effective_model` para el proveedor activo y `DEFAULT_MODELS[name]` para cualquier otro (pensando en el fallback de S03).
+22. **Regla de idioma reforzada** tras la verificación manual (8.3): con una transcripción en inglés, los dos modelos respondían en español, arrastrados por los ejemplos y las instrucciones en español. Ahora la regla aparece en español en el bloque de rol y en la última regla, con las etiquetas de formato también en inglés. Además, una **regla en inglés abre el prompt, como excepción al orden rol → formato → ejemplos → reglas**: solo así gpt-4o-mini pasó a responder en inglés, mientras que Haiku ya cumplía sin ella. Es una evidencia limitada (una llamada por caso) que se revisará con evals.
+23. **Loggers de los SDK a INFO como mínimo**: con `LOG_LEVEL=DEBUG`, `openai`, `anthropic` y sus clientes HTTP volcaban en el log el prompt completo con la transcripción. La app mantiene su nivel, pero esos loggers de terceros quedan en `max(INFO, LOG_LEVEL)`.
+24. **Totales que no cuadran con el desglose**, en los dos modelos (en la 8.3: gpt-4o-mini con 390 h frente a 430 h y 375 h frente a 405 h; Haiku con 450 h frente a 470 h). Se anotan como observación de calidad para la sesión en vivo. No se corrigen en código: la salida estructurada y los guardrails llegan en S04.
 
 ## Open Questions
 

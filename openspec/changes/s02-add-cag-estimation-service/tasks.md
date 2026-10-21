@@ -52,13 +52,13 @@
 ## 7. CI
 
 - [x] 7.1 Crear `.github/workflows/ci.yml` (push y PR): setup-uv; `uv sync --locked`; `ruff check`; `ruff format --check`; `pytest`; `actions/setup-node` con una versión fijada; `npx --yes @fission-ai/openspec@<versión local exacta> validate --all --strict`
-- [ ] 7.2 Verificar: `uv run ruff check . && uv run ruff format --check .` en local, y el workflow en verde tras el push
+- [x] 7.2 Verificar: `uv run ruff check . && uv run ruff format --check .` en local, y el workflow en verde tras el push
 
 ## 8. Documentación y muestras
 
 - [x] 8.1 Añadir 1–2 transcripciones de prueba en `samples/` (incluida la del enunciado: landing + HubSpot + blog)
 - [x] 8.2 Actualizar el README con: requisitos, instalación, `.env`, arranque (incluido el comportamiento del fail fast con `--reload`), Swagger, un ejemplo con `curl` usando `samples/`, tests, arquitectura y desviaciones respecto al enunciado
-- [ ] 8.3 Verificación manual con keys reales (previa confirmación del usuario, porque tiene coste): `curl` con cada sample en OpenAI y en Anthropic, comprobando que la estimación sigue el formato de los ejemplos y está en el idioma de la transcripción
+- [x] 8.3 Verificación manual con keys reales (previa confirmación del usuario, porque tiene coste): `curl` con cada sample en OpenAI y en Anthropic, comprobando que la estimación sigue el formato de los ejemplos y está en el idioma de la transcripción. Resultado (2026-10-21): 200 en los dos proveedores y formato correcto. La regla de idioma se corrigió tras la prueba (decisión 22) y los logs de los SDK se subieron a INFO (decisión 23). Los totales que no cuadran quedan anotados como observación (decisión 24). Coste total aproximado: 0,04 USD.
 
 ## 9. Cierre
 

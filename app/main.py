@@ -14,6 +14,9 @@ from app.services.llm_service import get_llm_provider
 
 logger = logging.getLogger(__name__)
 
+# Third-party loggers emit full request payloads (client transcriptions) at DEBUG.
+NOISY_LOGGERS = ("openai", "anthropic", "httpx", "httpx2", "httpcore", "httpcore2")
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -26,6 +29,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.error(message)
         raise RuntimeError(message) from None
     logging.basicConfig(level=settings.log_level)
+    # Never below INFO, so SDK/HTTP debug logs do not dump customer data.
+    third_party_level = max(logging.INFO, logging.getLevelName(settings.log_level))
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(third_party_level)
     yield
 
 
