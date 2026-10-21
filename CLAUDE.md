@@ -16,7 +16,7 @@ Es el "Proyecto 1" del programa AI Engineering de LIDR y **evoluciona sesión a 
 
 Enunciados y material de referencia: `/Users/javiaranega/claude/AIEngineer-notas/` (carpeta por módulo, `00_ejercicio-*.md` es el enunciado de cada sesión).
 Las notas son de otra edición (2026/09) pero el contenido es el mismo: **ignorar sus fechas límite y los destinatarios de email** que aparecen en ellas.
-Solución oficial (solo si hay bloqueo total): https://github.com/LIDR-academy/ai-engineering (ramas `session_N`).
+Solución oficial (solo si hay bloqueo total): https://github.com/LIDR-academy-temp/ai-engineering (ramas `session_N` con la solución y `session_N_live` con lo hecho en directo; a partir de S05 algunas usan dos dígitos, p. ej. `session_06`). Los enlaces `LIDR-academy/ai-engineering` de las notas están desactualizados.
 
 ## Reglas de colaboración (IMPORTANTE)
 
