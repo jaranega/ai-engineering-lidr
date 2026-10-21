@@ -1,0 +1,37 @@
+schema: spec-driven
+
+# Contexto del proyecto: se inyecta en cada artefacto que genera OpenSpec.
+# La fuente completa de convenciones es CLAUDE.md en la raíz del repo.
+context: |
+  Proyecto: estimador de software con LLMs (Proyecto 1 del programa AI Engineering 2026/09 de LIDR).
+  Recibe la transcripción de una reunión con cliente y devuelve una estimación de software generada por un LLM.
+  Evoluciona por sesiones (una rama git por sesión): S02 scaffolding FastAPI + CAG; S03 Streamlit, streaming,
+  wrapper de proveedores, caché y observabilidad; S04 formulario tipado y prompts Jinja2 versionados; S05+ contexto
+  dinámico, memoria, evaluación, RAG.
+  Enunciados de referencia en /Users/javiaranega/claude/AIEngineer-notas/ (ficheros 00_ejercicio-*.md por módulo).
+
+  Stack: Python 3.12 (mín. 3.11), uv, FastAPI, uvicorn, Pydantic v2, pydantic-settings, SDKs oficiales openai y
+  anthropic (seleccionables con LLM_PROVIDER), pytest, ruff, GitHub Actions.
+  Arquitectura en capas: app/routers (HTTP, sin lógica) -> app/services (prompt + llamada LLM) -> app/context
+  (datos estáticos CAG). Configuración solo por variables de entorno; los secrets nunca en código, logs ni respuestas.
+
+  Idioma: specs, propuestas, diseño y tareas en español. Código, comentarios y commits en inglés.
+  El criterio del usuario es el último: ante cualquier ambigüedad, preguntar antes de decidir.
+
+rules:
+  proposal:
+    - Indicar la sesión del curso a la que corresponde el change y enlazar el enunciado de referencia
+    - Incluir siempre una sección "Fuera de alcance" con lo que se deja para sesiones posteriores
+    - Señalar explícitamente cualquier desviación respecto al enunciado del curso y su motivo
+  specs:
+    - Requisitos con SHALL/MUST y escenarios en formato GIVEN/WHEN/THEN
+    - Cubrir happy path y sad paths (validación de entrada, proveedor caído, configuración ausente)
+    - Los contratos HTTP (request/response) se especifican con nombres de campo y tipos exactos
+  design:
+    - Documentar cada decisión con alternativas consideradas y motivo de la elección
+    - Explicar cómo la decisión habilita la siguiente sesión sin implementarla por adelantado
+    - Listar preguntas abiertas para que el usuario las resuelva antes de implementar
+  tasks:
+    - Tareas pequeñas y verificables, agrupadas por capa (config, context, services, routers, tests, CI, docs)
+    - Cada grupo termina con una tarea de verificación (tests, ruff o comprobación manual)
+    - Los tests nunca llaman a APIs reales de LLM
