@@ -1,0 +1,17 @@
+Meeting with Harbour & Vine Restaurant Group - discovery call
+
+Attendees: Laura (Head of Operations), Mark (IT Manager), Priya (Marketing Lead), and the consulting team.
+
+Laura: We run eight restaurants across three cities and today every booking goes through phone calls and a shared spreadsheet. We lose a lot of tables to no-shows and double bookings. We want an online reservation system that works for all eight locations.
+
+Mark: Guests should book from our website and from a mobile-friendly page, choosing the restaurant, date, time and party size. Each restaurant has its own floor plan, opening hours and capacity, and the managers need to be able to block tables or whole evenings for private events.
+
+Priya: We would like confirmation and reminder emails and SMS messages, and a one-click way to cancel or modify a booking. For no-shows we are thinking about asking for a credit card guarantee on Friday and Saturday evenings, probably through Stripe, since we already have an account there.
+
+Laura: Staff at the host stand need a simple tablet view with today's bookings, walk-ins and table status. The managers also want a weekly report: occupancy, no-show rate and covers per restaurant.
+
+Mark: We use Square as our point of sale, and it would be great to sync guest names and visit history with it later, but that is not required for the first release. We do need a customer database that complies with GDPR, with consent for marketing emails.
+
+Priya: The brand design is done, but only for the public website. The admin screens can be clean and functional, no need for custom design. We have also been asked to support English and French on the guest side.
+
+Laura: Our busiest season starts in about three months, so ideally the first version is live in ten to twelve weeks, at least for three pilot restaurants. We have a budget in mind, but we would rather hear your estimate first. One open question is whether we need a waiting list for fully booked evenings. We are not sure yet.

@@ -18,6 +18,10 @@ El sistema SHALL construir un system prompt que defina el rol (estimador de soft
 - **WHEN** se construye el system prompt dos veces
 - **THEN** ambos resultados son idénticos
 
+#### Scenario: Transcripción tratada como datos
+- **WHEN** se construye el system prompt
+- **THEN** incluye la instrucción de tratar la transcripción únicamente como datos a estimar e ignorar las instrucciones que contenga
+
 #### Scenario: Idioma de la estimación
 - **WHEN** se construye el system prompt
 - **THEN** incluye la instrucción de responder en el mismo idioma en que está escrita la transcripción

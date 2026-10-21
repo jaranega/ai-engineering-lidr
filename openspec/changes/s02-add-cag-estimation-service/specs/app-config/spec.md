@@ -10,7 +10,7 @@ El sistema SHALL cargar su configuración mediante `pydantic-settings` desde las
 | `LLM_PROVIDER` | `Literal["openai", "anthropic"]` | `openai` |
 | `LLM_MODEL` | `str \| None` | `None` (se resuelve por proveedor) |
 | `APP_ENV` | `str` | `development` |
-| `LOG_LEVEL` | `str` | `DEBUG` |
+| `LOG_LEVEL` | `Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]` | `DEBUG` |
 
 #### Scenario: Carga con valores por defecto
 - **GIVEN** que solo está definida `OPENAI_API_KEY`

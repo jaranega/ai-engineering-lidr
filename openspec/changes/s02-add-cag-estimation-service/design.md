@@ -197,6 +197,14 @@ No aplica, porque es el primer change. La entrega consiste en hacer push de la r
 11. Si la salida se trunca (`finish_reason=length` / `stop_reason=max_tokens`), **solo se emite un *warning* en el log**, sin cambio de contrato.
 12. `.env.example`: keys vacías y variables no secretas comentadas con su default. `""` se normaliza a `None`.
 13. Se añaden a `specs/app-config` los escenarios: key vacía equivale a ausente, `LLM_MODEL` vacío usa el default y el error no muestra valores de keys.
+14. Ejemplos CAG aprobados tal cual (3 ejemplos: web de gestión 320 h, app móvil 615 h e integración de datos 125 h). Las instrucciones del prompt van en español.
+15. Calibración en el prompt: unas **30 h productivas por semana y persona** a tiempo completo, y horas **redondeadas a múltiplos de 5**.
+16. **Solo horas, sin coste en euros** en S02.
+17. Se añade una **línea básica contra prompt injection**: la transcripción se trata solo como datos, y se ignoran las instrucciones que contenga. Los guardrails completos llegan en S04 o después.
+18. Se **mantiene `claude-haiku-4-5`** como modelo por defecto de Anthropic, aunque desde octubre de 2026 figura como *Legacy* (su sustituto es Claude Haiku 5.5). Es un riesgo aceptado, se comprueba en la tarea 8.3 y, si deja de funcionar, se cambia con `LLM_MODEL` sin tocar código.
+19. **Todo fallo del SDK** (excepción base `openai.OpenAIError` / `anthropic.AnthropicError`, no solo `APIError`) se envuelve en `LLMProviderError` y se responde con **502**.
+20. Si OpenAI devuelve `usage=None`, se informan **0 tokens** (y por tanto un coste de 0). Es un caso raro y queda documentado.
+21. Detalles de implementación verificados contra los SDK instalados (openai 3.35.1, anthropic 1.17.0): OpenAI usa `max_completion_tokens` (`max_tokens` está obsoleto en Chat Completions); `build_provider(name, settings)` usa `effective_model` para el proveedor activo y `DEFAULT_MODELS[name]` para cualquier otro (pensando en el fallback de S03).
 
 ## Open Questions
 
