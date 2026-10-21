@@ -15,6 +15,7 @@ Es el "Proyecto 1" del programa AI Engineering de LIDR y **evoluciona sesión a 
 | S05+ | Contexto dinámico, memoria, prompts adaptativos, evaluación, RAG… | — |
 
 Enunciados y material de referencia: `/Users/javiaranega/claude/AIEngineer-notas/` (carpeta por módulo, `00_ejercicio-*.md` es el enunciado de cada sesión).
+Las notas son de otra edición (2026/09) pero el contenido es el mismo: **ignorar sus fechas límite y los destinatarios de email** que aparecen en ellas.
 Solución oficial (solo si hay bloqueo total): https://github.com/LIDR-academy/ai-engineering (ramas `session_N`).
 
 ## Reglas de colaboración (IMPORTANTE)
@@ -39,7 +40,7 @@ Naming de changes: `sNN-<verbo>-<qué>` en kebab-case (p. ej. `s02-add-cag-estim
 
 - Repo único **público** en GitHub con todos los ejercicios. `main` contiene la base y el último estado entregado.
 - **Una rama por sesión** con ejercicio (`session-02`, `session-03`, … o el nombre que exija el enunciado). Cada rama parte de la anterior; tras la entrega se mergea a `main`.
-- Entrega: email con la sesión y el enlace completo a la rama (destinatario indicado en cada enunciado / programa; Sisley: sisley@lidr.co, mismo hilo para todas las entregas).
+- Entrega: email a **sisley@lidr.co** (único destinatario) indicando la sesión y el enlace completo a la rama; siempre en el mismo hilo para agrupar las entregas.
 - Commits pequeños con **Conventional Commits en inglés** (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `ci:`). Nunca commitear `.env`.
 - No hacer commit/push/PR sin que el usuario lo pida.
 

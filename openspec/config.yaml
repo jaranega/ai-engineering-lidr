@@ -9,6 +9,7 @@ context: |
   wrapper de proveedores, caché y observabilidad; S04 formulario tipado y prompts Jinja2 versionados; S05+ contexto
   dinámico, memoria, evaluación, RAG.
   Enunciados de referencia en /Users/javiaranega/claude/AIEngineer-notas/ (ficheros 00_ejercicio-*.md por módulo).
+  Las notas son de la edición 2026/09 con el mismo contenido: ignorar sus fechas y destinatarios de email.
 
   Stack: Python 3.12 (mín. 3.11), uv, FastAPI, uvicorn, Pydantic v2, pydantic-settings, SDKs oficiales openai y
   anthropic (seleccionables con LLM_PROVIDER), pytest, ruff, GitHub Actions.
