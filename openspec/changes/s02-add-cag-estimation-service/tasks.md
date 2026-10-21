@@ -62,6 +62,6 @@
 
 ## 9. Cierre
 
-- [ ] 9.1 Recorrer el checklist del enunciado y marcar cada punto
+- [x] 9.1 Recorrer el checklist del enunciado y marcar cada punto
 - [ ] 9.2 `openspec validate --all --strict` en verde y archivar el change (`/opsx:archive`) tras la aprobación del usuario
 - [ ] 9.3 Commit de `uv.lock`, push de `session-02` (con la aprobación del usuario) y preparar el texto del email de entrega para sisley@lidr.co
