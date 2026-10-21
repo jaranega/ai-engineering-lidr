@@ -1,4 +1,4 @@
-# CLAUDE.md — Estimador de software con LLMs (AI Engineering 2026/09, LIDR)
+# CLAUDE.md — Estimador de software con LLMs (AI-Engineering 2026/10, LIDR)
 
 Contexto persistente para todas las sesiones de Claude Code en este repositorio.
 

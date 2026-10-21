@@ -1,6 +1,6 @@
 # Estimador de software con LLMs
 
-Proyecto del programa **AI Engineering 2026/09 (LIDR)**. Servicio que recibe la transcripción de una reunión con cliente y devuelve una estimación de software generada por un LLM. Evoluciona sesión a sesión.
+Proyecto del programa **AI-Engineering 2026/10 (LIDR)**. Servicio que recibe la transcripción de una reunión con cliente y devuelve una estimación de software generada por un LLM. Evoluciona sesión a sesión.
 
 ## Entregas por sesión
 

@@ -3,7 +3,7 @@ schema: spec-driven
 # Contexto del proyecto: se inyecta en cada artefacto que genera OpenSpec.
 # La fuente completa de convenciones es CLAUDE.md en la raíz del repo.
 context: |
-  Proyecto: estimador de software con LLMs (Proyecto 1 del programa AI Engineering 2026/09 de LIDR).
+  Proyecto: estimador de software con LLMs (Proyecto 1 del programa AI-Engineering 2026/10 de LIDR).
   Recibe la transcripción de una reunión con cliente y devuelve una estimación de software generada por un LLM.
   Evoluciona por sesiones (una rama git por sesión): S02 scaffolding FastAPI + CAG; S03 Streamlit, streaming,
   wrapper de proveedores, caché y observabilidad; S04 formulario tipado y prompts Jinja2 versionados; S05+ contexto
