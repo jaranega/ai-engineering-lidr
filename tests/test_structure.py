@@ -16,6 +16,7 @@ REQUIRED_FILES = [
     "app/services/llm_service.py",
     "app/context/__init__.py",
     "app/context/examples.py",
+    "streamlit_app.py",
     ".env.example",
     ".gitignore",
     "pyproject.toml",
@@ -25,5 +26,5 @@ REQUIRED_FILES = [
 
 @pytest.mark.parametrize("relative_path", REQUIRED_FILES)
 def test_required_file_exists(relative_path):
-    """Requirement: Validación de la estructura / Scenario: Falta un fichero obligatorio."""
+    """Requirement: Validación de la estructura / Scenarios: fichero obligatorio y app Streamlit."""
     assert (REPO_ROOT / relative_path).is_file(), f"Missing required file: {relative_path}"

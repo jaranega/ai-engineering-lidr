@@ -52,7 +52,7 @@ def test_estimate_returns_full_contract_matching_settings(client, settings, prov
     assert (body["input_tokens"], body["output_tokens"]) == (1000, 500)
     assert body["cost_usd"] is None  # unknown model: no price
     assert provider.call_count == 1
-    assert provider.calls[0][1] == "Necesitamos una web de reservas."
+    assert provider.calls[0][1] == [{"role": "user", "content": "Necesitamos una web de reservas."}]
 
 
 def test_estimate_cost_is_a_number_for_known_model(client, provider):

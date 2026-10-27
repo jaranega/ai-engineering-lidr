@@ -1,6 +1,6 @@
 """Shared pytest configuration and fixtures."""
 
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator, Sequence
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,13 +8,14 @@ from fastapi.testclient import TestClient
 from app.config import Settings, get_settings
 from app.main import app
 from app.services import llm_service
-from app.services.llm_service import LLMProviderError, LLMResult
+from app.services.llm_service import ChatMessage, LLMProviderError, LLMResult, LLMStream
 
 
 def _clear_caches() -> None:
     get_settings.cache_clear()
     llm_service.get_llm_provider.cache_clear()
     llm_service._system_prompt.cache_clear()
+    llm_service._chat_system_prompt.cache_clear()
 
 
 CONFIG_ENV_VARS = (
@@ -50,7 +51,12 @@ def _clear_cached_state():
 
 
 class FakeProvider:
-    """In-memory LLMProvider: counts calls, records prompts, optionally fails."""
+    """In-memory LLMProvider: counts calls, records what it receives, optionally fails.
+
+    `stream()` yields `fragments` (default: the whole `text` as one fragment). With
+    `error_after=N` it raises `error` after N fragments (0 = before the first one, like an
+    SDK failure at creation: the real streams are lazy, so it surfaces on iteration).
+    """
 
     def __init__(
         self,
@@ -60,6 +66,8 @@ class FakeProvider:
         input_tokens: int = 1000,
         output_tokens: int = 500,
         error: LLMProviderError | None = None,
+        fragments: Sequence[str] | None = None,
+        error_after: int | None = None,
     ) -> None:
         self.result = LLMResult(
             text=text,
@@ -69,17 +77,39 @@ class FakeProvider:
             output_tokens=output_tokens,
         )
         self.error = error
-        self.calls: list[tuple[str, str]] = []
+        self.fragments = list(fragments) if fragments is not None else [text]
+        self.error_after = error_after
+        # (system, messages) received by generate() and stream(), in call order.
+        self.calls: list[tuple[str, list[ChatMessage]]] = []
 
     @property
     def call_count(self) -> int:
         return len(self.calls)
 
-    def generate(self, system: str, user: str) -> LLMResult:
-        self.calls.append((system, user))
+    def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
+        self.calls.append((system, list(messages)))
         if self.error is not None:
             raise self.error
         return self.result
+
+    def stream(self, system: str, messages: Sequence[ChatMessage]) -> LLMStream:
+        self.calls.append((system, list(messages)))
+        return LLMStream(self._stream())
+
+    def _stream(self) -> Generator[str, None, LLMResult]:
+        for index, fragment in enumerate(self.fragments):
+            if self.error is not None and self.error_after == index:
+                raise self.error
+            yield fragment
+        if self.error is not None and (self.error_after is not None or not self.fragments):
+            raise self.error
+        return LLMResult(
+            text="".join(self.fragments),
+            model=self.result.model,
+            provider=self.result.provider,
+            input_tokens=self.result.input_tokens,
+            output_tokens=self.result.output_tokens,
+        )
 
 
 @pytest.fixture

@@ -13,6 +13,7 @@ from app.services import llm_service
 from app.services.llm_service import (
     MAX_TOKENS,
     AnthropicProvider,
+    ChatMessage,
     LLMProviderError,
     OpenAIProvider,
     build_provider,
@@ -20,6 +21,8 @@ from app.services.llm_service import (
 )
 
 LOGGER = "app.services.llm_service"
+USR: list[ChatMessage] = [{"role": "user", "content": "USR"}]
+U: list[ChatMessage] = [{"role": "user", "content": "u"}]
 SECRET_MSG = "sk-secret-in-msg"
 
 
@@ -118,7 +121,7 @@ ANTHROPIC_ERRORS = [
 def test_openai_call_sends_system_and_user_and_reads_result():
     """Requirement: Interfaz mínima / Scenario: Llamada con OpenAI."""
     stub = OpenAIStub(openai_response(content="texto", prompt=11, completion=22))
-    result = OpenAIProvider(stub, "gpt-4o-mini").generate("SYS", "USR")
+    result = OpenAIProvider(stub, "gpt-4o-mini").generate("SYS", USR)
     assert stub.kwargs == {
         "model": "gpt-4o-mini",
         "messages": [
@@ -133,20 +136,20 @@ def test_openai_call_sends_system_and_user_and_reads_result():
 
 def test_openai_none_content_yields_empty_text():
     """Requirement: Interfaz mínima / Scenario: Llamada con OpenAI (content=None)."""
-    result = OpenAIProvider(OpenAIStub(openai_response(content=None)), "m").generate("s", "u")
+    result = OpenAIProvider(OpenAIStub(openai_response(content=None)), "m").generate("s", U)
     assert result.text == ""
 
 
 def test_openai_missing_usage_reports_zero_tokens():
     """Requirement: Interfaz mínima / Scenario: Llamada con OpenAI (usage=None)."""
-    result = OpenAIProvider(OpenAIStub(openai_response(usage=False)), "m").generate("s", "u")
+    result = OpenAIProvider(OpenAIStub(openai_response(usage=False)), "m").generate("s", U)
     assert (result.input_tokens, result.output_tokens) == (0, 0)
 
 
 def test_anthropic_call_sends_system_param_and_user_message():
     """Requirement: Interfaz mínima / Scenario: Llamada con Anthropic."""
     stub = AnthropicStub(anthropic_response(input_tokens=33, output_tokens=44))
-    result = AnthropicProvider(stub, "claude-haiku-4-5").generate("SYS", "USR")
+    result = AnthropicProvider(stub, "claude-haiku-4-5").generate("SYS", USR)
     assert stub.kwargs == {
         "model": "claude-haiku-4-5",
         "system": "SYS",
@@ -169,7 +172,7 @@ def test_anthropic_concatenates_only_text_blocks():
         SimpleNamespace(type="text", text="bar"),
     ]
     stub = AnthropicStub(anthropic_response(blocks=blocks))
-    assert AnthropicProvider(stub, "m").generate("s", "u").text == "foobar"
+    assert AnthropicProvider(stub, "m").generate("s", U).text == "foobar"
 
 
 def test_max_tokens_constant_is_2048():
@@ -252,7 +255,7 @@ def test_openai_sdk_errors_are_wrapped(error):
     """Requirement: Errores del proveedor / Scenario: Proveedor no disponible (OpenAI)."""
     provider = OpenAIProvider(OpenAIStub(error=error), "gpt-4o-mini")
     with pytest.raises(LLMProviderError) as exc_info:
-        provider.generate("s", "u")
+        provider.generate("s", U)
     assert exc_info.value.provider == "openai"
     assert exc_info.value.__cause__ is error
     assert SECRET_MSG not in str(exc_info.value)
@@ -263,7 +266,7 @@ def test_anthropic_sdk_errors_are_wrapped(error):
     """Requirement: Errores del proveedor / Scenario: Proveedor no disponible (Anthropic)."""
     provider = AnthropicProvider(AnthropicStub(error=error), "claude-haiku-4-5")
     with pytest.raises(LLMProviderError) as exc_info:
-        provider.generate("s", "u")
+        provider.generate("s", U)
     assert exc_info.value.provider == "anthropic"
     assert exc_info.value.__cause__ is error
     assert SECRET_MSG not in str(exc_info.value)
@@ -276,7 +279,7 @@ def test_openai_truncated_output_logs_warning_and_returns_text(caplog):
     """Requirement: Límites / Scenario: Salida truncada (OpenAI finish_reason=length)."""
     stub = OpenAIStub(openai_response(content="partial", finish_reason="length"))
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        result = OpenAIProvider(stub, "m").generate("s", "u")
+        result = OpenAIProvider(stub, "m").generate("s", U)
     assert result.text == "partial"
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("LLM output truncated" in r.getMessage() for r in warnings)
@@ -287,7 +290,7 @@ def test_anthropic_truncated_output_logs_warning_and_returns_text(caplog):
     blocks = [SimpleNamespace(type="text", text="partial")]
     stub = AnthropicStub(anthropic_response(blocks=blocks, stop_reason="max_tokens"))
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        result = AnthropicProvider(stub, "m").generate("s", "u")
+        result = AnthropicProvider(stub, "m").generate("s", U)
     assert result.text == "partial"
     assert any("LLM output truncated" in r.getMessage() for r in caplog.records)
 
@@ -295,8 +298,8 @@ def test_anthropic_truncated_output_logs_warning_and_returns_text(caplog):
 def test_normal_completion_does_not_warn(caplog):
     """Requirement: Límites / sin warning cuando la salida no se trunca."""
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        OpenAIProvider(OpenAIStub(openai_response()), "m").generate("s", "u")
-        AnthropicProvider(AnthropicStub(anthropic_response()), "m").generate("s", "u")
+        OpenAIProvider(OpenAIStub(openai_response()), "m").generate("s", U)
+        AnthropicProvider(AnthropicStub(anthropic_response()), "m").generate("s", U)
     assert not caplog.records
 
 
@@ -326,7 +329,7 @@ def test_error_log_has_type_and_status_but_no_sdk_message(
     """Requirement: Límites / Scenario: Errores sin datos sensibles en el log."""
     provider = provider_cls(stub_cls(error=error), "m")
     with caplog.at_level(logging.ERROR, logger=LOGGER), pytest.raises(LLMProviderError):
-        provider.generate("s", "u")
+        provider.generate("s", U)
     records = [r for r in caplog.records if r.levelno == logging.ERROR and r.name == LOGGER]
     assert len(records) == 1
     message = records[0].getMessage()
@@ -334,3 +337,31 @@ def test_error_log_has_type_and_status_but_no_sdk_message(
     assert f"status={expected_status}" in message
     assert SECRET_MSG not in message
     assert SECRET_MSG not in caplog.text
+
+
+# --- Requirement: Interfaz mínima de proveedor / Scenario: Conversación de varios turnos ---
+
+CONVERSATION: list[ChatMessage] = [
+    {"role": "user", "content": "TRANSCRIPT-T"},
+    {"role": "assistant", "content": "ESTIMATE-E"},
+    {"role": "user", "content": "ADJUST-A"},
+]
+
+
+def test_openai_multi_turn_sends_system_first_then_messages_in_order():
+    """Requirement: Interfaz mínima / Scenario: Conversación de varios turnos (OpenAI)."""
+    stub = OpenAIStub(openai_response())
+    OpenAIProvider(stub, "m").generate("SYS", CONVERSATION)
+    assert stub.kwargs["messages"] == [{"role": "system", "content": "SYS"}, *CONVERSATION]
+    assert stub.kwargs["messages"][0]["content"] == "SYS"
+    for message in CONVERSATION:
+        assert message["content"] not in stub.kwargs["messages"][0]["content"]
+
+
+def test_anthropic_multi_turn_sends_system_param_and_messages_in_order():
+    """Requirement: Interfaz mínima / Scenario: Conversación de varios turnos (Anthropic)."""
+    stub = AnthropicStub(anthropic_response())
+    AnthropicProvider(stub, "m").generate("SYS", CONVERSATION)
+    assert stub.kwargs["system"] == "SYS"
+    assert stub.kwargs["messages"] == CONVERSATION
+    assert all(m["role"] != "system" for m in stub.kwargs["messages"])
