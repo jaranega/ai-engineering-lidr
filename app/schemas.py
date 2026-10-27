@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
-MAX_TRANSCRIPTION_CHARS = 20_000
+from app.services.llm_service import MAX_TRANSCRIPTION_CHARS
 
 
 class EstimationRequest(BaseModel):

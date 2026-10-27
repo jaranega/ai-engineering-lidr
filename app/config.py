@@ -1,5 +1,6 @@
 """Application settings loaded from environment variables and an optional `.env` file."""
 
+import logging
 from functools import lru_cache
 from typing import Literal, Self
 
@@ -15,6 +16,9 @@ _KEY_VARS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
 }
+
+# Third-party loggers emit full request payloads (client transcriptions) at DEBUG.
+NOISY_LOGGERS = ("openai", "anthropic", "httpx", "httpx2", "httpcore", "httpcore2")
 
 
 class Settings(BaseSettings):
@@ -66,3 +70,12 @@ def format_config_error(exc: ValidationError) -> str:
         else:
             lines.append(f"- {loc.upper()}: {err['msg']}")
     return "\n".join(lines)
+
+
+def configure_logging(settings: Settings) -> None:
+    """Configure root logging; safe to call repeatedly."""
+    logging.basicConfig(level=settings.log_level)
+    # Never below INFO, so SDK/HTTP debug logs do not dump customer data.
+    third_party_level = max(logging.INFO, logging.getLevelName(settings.log_level))
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(third_party_level)
