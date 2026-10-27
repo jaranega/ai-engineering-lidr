@@ -53,7 +53,7 @@
 ## 6. CI
 
 - [x] 6.1 Comprobar que el workflow existente cubre el change sin cambios (`uv sync --locked` instala streamlit; `ruff` incluye `streamlit_app.py`) y ajustarlo solo si hace falta (backend-engineer)
-- [ ] 6.2 Verificar: `uv run ruff check . && uv run ruff format --check .` y `openspec validate --all --strict` en local; el workflow en verde tras el push
+- [x] 6.2 Verificar: `uv run ruff check . && uv run ruff format --check .` y `openspec validate --all --strict` en local; el workflow en verde tras el push. Resultado: CI en verde tras el push (run 40584877486)
 
 ## 7. Documentación y verificación manual
 
@@ -64,4 +64,4 @@
 
 - [x] 8.1 Recorrer el checklist de verificación del enunciado y marcar cada punto. Resultado: los 5 puntos se cumplen (interfaz con `streamlit run`, estimación de una transcripción, conversación persistente, streaming y API key desde `.env`), más el Nivel 3 opcional
 - [x] 8.2 `openspec validate --all --strict` en verde y archivar el change (`/opsx:archive`) tras la aprobación del usuario
-- [ ] 8.3 Commit y push de `session-03` (con la aprobación del usuario) y preparar el texto del email de entrega para sisley@lidr.co con el enlace a la rama (el envío lo gestiona el usuario)
+- [x] 8.3 Commit y push de `session-03` (con la aprobación del usuario) y preparar el texto del email de entrega para sisley@lidr.co con el enlace a la rama (el envío lo gestiona el usuario) (texto del email preparado; el envío lo gestiona el usuario)
