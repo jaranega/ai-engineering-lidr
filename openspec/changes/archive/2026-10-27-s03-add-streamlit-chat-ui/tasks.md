@@ -63,5 +63,5 @@
 ## 8. Cierre
 
 - [x] 8.1 Recorrer el checklist de verificación del enunciado y marcar cada punto. Resultado: los 5 puntos se cumplen (interfaz con `streamlit run`, estimación de una transcripción, conversación persistente, streaming y API key desde `.env`), más el Nivel 3 opcional
-- [ ] 8.2 `openspec validate --all --strict` en verde y archivar el change (`/opsx:archive`) tras la aprobación del usuario
+- [x] 8.2 `openspec validate --all --strict` en verde y archivar el change (`/opsx:archive`) tras la aprobación del usuario
 - [ ] 8.3 Commit y push de `session-03` (con la aprobación del usuario) y preparar el texto del email de entrega para sisley@lidr.co con el enlace a la rama (el envío lo gestiona el usuario)

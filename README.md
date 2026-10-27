@@ -170,7 +170,7 @@ Los tests no usan API keys reales ni hacen llamadas de red: el proveedor se sust
 - **Coste estimado y tiempo hasta el primer fragmento** en las métricas, además de las pedidas.
 - **Botón "Nueva conversación"** en el panel lateral.
 
-Detalle completo: [`openspec/changes/s03-add-streamlit-chat-ui`](openspec/changes/s03-add-streamlit-chat-ui/).
+Detalle completo: [`openspec/changes/archive/2026-10-27-s03-add-streamlit-chat-ui`](openspec/changes/archive/2026-10-27-s03-add-streamlit-chat-ui/).
 
 ### S02 (API)
 
