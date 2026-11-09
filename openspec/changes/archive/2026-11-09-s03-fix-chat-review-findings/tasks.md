@@ -34,4 +34,4 @@
 - [x] 5.1 README: campo `truncated` en el contrato de respuesta y aviso de truncado en la descripción del chat (orquestador)
 - [x] 5.2 `openspec validate --all --strict`, `ruff` y `pytest` en verde en local
 - [x] 5.3 Archivar el change (`/opsx:archive`) tras la aprobación del usuario
-- [ ] 5.4 Commit y push a `session-03` (con la aprobación del usuario) y comprobar que la CI de la PR #2 sale en verde
+- [x] 5.4 Commit y push a `session-03` (con la aprobación del usuario) y comprobar que la CI de la PR #2 sale en verde. Resultado: CI en verde (run 42652927036)
