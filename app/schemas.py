@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
-MAX_TRANSCRIPTION_CHARS = 20_000
+from app.services.llm_service import MAX_TRANSCRIPTION_CHARS
 
 
 class EstimationRequest(BaseModel):
@@ -30,4 +30,7 @@ class EstimationResponse(BaseModel):
     cost_usd: float | None = Field(
         description="Approximate cost in USD; null if the model has no known price.",
         examples=[0.00087],
+    )
+    truncated: bool = Field(
+        description="True if the estimation was cut off by the output token limit."
     )

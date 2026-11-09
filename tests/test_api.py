@@ -17,7 +17,15 @@ from tests.conftest import CONFIG_ENV_VARS, FakeProvider
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ESTIMATE = "/api/v1/estimate"
-CONTRACT_FIELDS = {"estimation", "model", "provider", "input_tokens", "output_tokens", "cost_usd"}
+CONTRACT_FIELDS = {
+    "estimation",
+    "model",
+    "provider",
+    "input_tokens",
+    "output_tokens",
+    "cost_usd",
+    "truncated",
+}
 
 
 # --- Requirement: Health check ---
@@ -51,8 +59,9 @@ def test_estimate_returns_full_contract_matching_settings(client, settings, prov
     assert body["model"] == settings.effective_model == "custom-model-x"
     assert (body["input_tokens"], body["output_tokens"]) == (1000, 500)
     assert body["cost_usd"] is None  # unknown model: no price
+    assert body["truncated"] is False
     assert provider.call_count == 1
-    assert provider.calls[0][1] == "Necesitamos una web de reservas."
+    assert provider.calls[0][1] == [{"role": "user", "content": "Necesitamos una web de reservas."}]
 
 
 def test_estimate_cost_is_a_number_for_known_model(client, provider):
@@ -60,6 +69,16 @@ def test_estimate_cost_is_a_number_for_known_model(client, provider):
     provider.result = FakeProvider(model="gpt-4o-mini").result
     body = client.post(ESTIMATE, json={"transcription": "hola"}).json()
     assert isinstance(body["cost_usd"], float)
+
+
+def test_estimate_truncated_true_when_provider_cuts_generation(client, provider):
+    """Requirement: Endpoint de estimación / Scenario: Estimación truncada."""
+    provider.result = FakeProvider(text="parcial", truncated=True).result
+    response = client.post(ESTIMATE, json={"transcription": "hola"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["estimation"] == "parcial"
+    assert body["truncated"] is True
 
 
 @pytest.mark.parametrize(
@@ -118,7 +137,10 @@ def test_openapi_documents_route_schemas_and_responses(client):
     assert {"200", "422", "502"} <= set(operation["responses"])
     schemas = spec["components"]["schemas"]
     assert {"EstimationRequest", "EstimationResponse"} <= set(schemas)
-    assert set(schemas["EstimationResponse"]["properties"]) == CONTRACT_FIELDS
+    properties = schemas["EstimationResponse"]["properties"]
+    assert set(properties) == CONTRACT_FIELDS
+    assert properties["truncated"]["type"] == "boolean"
+    assert "truncated" in schemas["EstimationResponse"]["required"]
     assert spec["info"]["title"]
     assert spec["info"]["description"]
 

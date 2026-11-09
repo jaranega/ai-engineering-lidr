@@ -2,7 +2,6 @@
 
 ## Purpose
 Exponer por HTTP la generación de estimaciones a partir de transcripciones de reuniones, junto con el health check y la documentación OpenAPI del servicio.
-
 ## Requirements
 ### Requirement: Endpoint de estimación
 El sistema SHALL exponer `POST /api/v1/estimate`, que recibe una transcripción y devuelve la estimación generada por el LLM.
@@ -21,11 +20,17 @@ Response `200` (`application/json`, schema `EstimationResponse`):
 | `input_tokens` | `integer` |
 | `output_tokens` | `integer` |
 | `cost_usd` | `number \| null` |
+| `truncated` | `boolean` (`true` si la estimación se cortó por el límite de tokens) |
 
 #### Scenario: Estimación correcta
 - **GIVEN** un proveedor LLM disponible
 - **WHEN** se hace POST a `/api/v1/estimate` con `{"transcription": "<texto de reunión>"}`
-- **THEN** la respuesta es 200 con todos los campos del contrato y `provider`/`model` coinciden con la configuración efectiva
+- **THEN** la respuesta es 200 con todos los campos del contrato, `provider`/`model` coinciden con la configuración efectiva y `truncated` es `false`
+
+#### Scenario: Estimación truncada
+- **GIVEN** un proveedor que corta la generación por el límite de tokens
+- **WHEN** se hace POST a `/api/v1/estimate` con una transcripción válida
+- **THEN** la respuesta es 200 con el texto recibido y `truncated` es `true`
 
 #### Scenario: Transcripción ausente o vacía
 - **WHEN** el body no incluye `transcription` o esta solo contiene espacios
