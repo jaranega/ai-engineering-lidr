@@ -4,7 +4,7 @@
 Abstraer la llamada a los proveedores LLM (OpenAI y Anthropic) tras una interfaz mínima: selección por configuración, uso de tokens, coste estimado, límites de la llamada y tratamiento de errores sin filtrar datos sensibles.
 ## Requirements
 ### Requirement: Interfaz mínima de proveedor
-El sistema SHALL exponer una interfaz común de proveedor LLM que reciba el system prompt y una lista ordenada de mensajes de conversación (cada uno con `role` `user` o `assistant` y `content`) y devuelva un resultado con: `text`, `model`, `provider`, `input_tokens` y `output_tokens`. Habrá dos implementaciones: OpenAI (Chat Completions, con el system prompt como primer mensaje `system` seguido de los mensajes de la conversación) y Anthropic (Messages, con el system prompt en el parámetro `system` y los mensajes de la conversación en `messages`).
+El sistema SHALL exponer una interfaz común de proveedor LLM que reciba el system prompt y una lista ordenada de mensajes de conversación (cada uno con `role` `user` o `assistant` y `content`) y devuelva un resultado con: `text`, `model`, `provider`, `input_tokens`, `output_tokens` y `truncated` (`true` si la generación terminó por alcanzar el límite de tokens). Habrá dos implementaciones: OpenAI (Chat Completions, con el system prompt como primer mensaje `system` seguido de los mensajes de la conversación) y Anthropic (Messages, con el system prompt en el parámetro `system` y los mensajes de la conversación en `messages`).
 
 #### Scenario: Llamada con OpenAI
 - **GIVEN** `LLM_PROVIDER=openai`
@@ -20,6 +20,10 @@ El sistema SHALL exponer una interfaz común de proveedor LLM que reciba el syst
 - **GIVEN** los mensajes `user`, `assistant`, `user`
 - **WHEN** se solicita una generación con cualquiera de los dos proveedores
 - **THEN** el SDK recibe los tres mensajes con sus roles y contenidos sin modificar, y ningún mensaje de la conversación aparece dentro del system prompt
+
+#### Scenario: Mismos parámetros en ambos modos
+- **WHEN** se solicita una generación normal y una en streaming con las mismas entradas
+- **THEN** el SDK recibe en ambas llamadas el mismo modelo, los mismos mensajes y el mismo límite de tokens, y la de streaming añade solo los parámetros propios del streaming
 
 ### Requirement: Selección de proveedor por configuración
 El sistema SHALL seleccionar la implementación del proveedor exclusivamente a partir de `LLM_PROVIDER`, sin condicionales de proveedor en los routers.
@@ -62,22 +66,26 @@ Los errores del SDK del proveedor (autenticación, rate limit, timeout, error de
 - **THEN** la iteración termina con el error de dominio y el log registra el tipo de la excepción original
 
 ### Requirement: Límites de la llamada al LLM
-Cada llamada al proveedor, en modo normal o en streaming, MUST usar `max_tokens = 2048`, un timeout de 60 segundos y como máximo 2 reintentos, definidos como constantes en el código. Si la salida se corta por alcanzar `max_tokens`, el sistema MUST registrar un warning en el log y devolver la estimación sin cambios en el contrato.
+Cada llamada al proveedor, en modo normal o en streaming, MUST usar `max_tokens = 2048`, un timeout de 60 segundos y como máximo 2 reintentos, definidos como constantes en el código. Si la salida se corta por alcanzar `max_tokens`, el sistema MUST registrar un warning en el log, devolver el texto recibido y marcar el resultado con `truncated = true`.
 
 #### Scenario: Salida truncada
 - **WHEN** el proveedor indica que la generación terminó por límite de tokens (`finish_reason=length` o `stop_reason=max_tokens`)
-- **THEN** se registra un warning y la respuesta HTTP es 200 con el texto recibido
+- **THEN** se registra un warning y el resultado contiene el texto recibido con `truncated = true`
+
+#### Scenario: Salida completa
+- **WHEN** el proveedor indica que la generación terminó normalmente
+- **THEN** el resultado tiene `truncated = false`
 
 #### Scenario: Salida truncada en streaming
 - **WHEN** una respuesta en streaming termina por límite de tokens
-- **THEN** se registra el mismo warning y el texto entregado se conserva
+- **THEN** se registra el mismo warning, el texto entregado se conserva y el resultado tiene `truncated = true`
 
 #### Scenario: Errores sin datos sensibles en el log
 - **WHEN** el SDK lanza un error
 - **THEN** el log registra el tipo de error y el status HTTP, sin el mensaje completo del SDK ni ninguna API key
 
 ### Requirement: Generación en streaming
-La interfaz de proveedor SHALL ofrecer, con las mismas entradas que la generación normal, un modo streaming que entregue el texto de la respuesta como una secuencia de fragmentos a medida que los produce la API. Al agotarse la secuencia, MUST quedar disponible un resultado con los mismos campos que la generación normal (`text` igual a la concatenación de los fragmentos, `model`, `provider`, `input_tokens` y `output_tokens`), con los tokens que informa la API en el propio stream (en OpenAI, solicitando el uso con `stream_options={"include_usage": true}`).
+La interfaz de proveedor SHALL ofrecer, con las mismas entradas que la generación normal, un modo streaming que entregue el texto de la respuesta como una secuencia de fragmentos a medida que los produce la API. Al agotarse la secuencia, MUST quedar disponible un resultado con los mismos campos que la generación normal (`text` igual a la concatenación de los fragmentos, `model`, `provider`, `input_tokens`, `output_tokens` y `truncated`), con los tokens que informa la API en el propio stream (en OpenAI, solicitando el uso con `stream_options={"include_usage": true}`). Una vez consumido, el resultado MUST seguir disponible aunque la secuencia se vuelva a recorrer.
 
 #### Scenario: Streaming con OpenAI
 - **GIVEN** `LLM_PROVIDER=openai` y una API que devuelve tres fragmentos de texto y un último chunk con el uso de tokens
@@ -97,4 +105,9 @@ La interfaz de proveedor SHALL ofrecer, con las mismas entradas que la generaci�
 - **GIVEN** un stream de OpenAI que no incluye el chunk de uso
 - **WHEN** se consume por completo
 - **THEN** el resultado informa 0 tokens de entrada y de salida, igual que en la generación normal
+
+#### Scenario: Segunda iteración
+- **GIVEN** un stream ya consumido por completo
+- **WHEN** se vuelve a recorrer
+- **THEN** no entrega ningún fragmento, no llama de nuevo al SDK y el resultado sigue siendo el de la primera iteración
 
