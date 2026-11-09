@@ -31,3 +31,6 @@ class EstimationResponse(BaseModel):
         description="Approximate cost in USD; null if the model has no known price.",
         examples=[0.00087],
     )
+    truncated: bool = Field(
+        description="True if the estimation was cut off by the output token limit."
+    )

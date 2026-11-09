@@ -195,6 +195,9 @@ class LLMResult:
     provider: str
     input_tokens: int
     output_tokens: int
+    # True when generation stopped at MAX_TOKENS (design D3). Last field with a default so
+    # test doubles and future providers stay valid without changes.
+    truncated: bool = False
 
 
 class LLMStream:
@@ -210,6 +213,10 @@ class LLMStream:
         self._result: LLMResult | None = None
 
     def __iter__(self) -> Iterator[str]:
+        # Already consumed: yield nothing and keep the result, without touching the
+        # exhausted generator (design D2), so composed streams can re-iterate safely.
+        if self._result is not None:
+            return
         self._result = yield from self._gen
 
     @property
@@ -272,20 +279,27 @@ class OpenAIProvider:
         self._client = client
         self._model = model
 
+    def _request_kwargs(self, system: str, messages: Sequence[ChatMessage]) -> dict:
+        """SDK arguments shared by `generate` and `_stream` (design D5)."""
+        return {
+            "model": self._model,
+            "messages": [{"role": "system", "content": system}, *messages],
+            # `max_tokens` is deprecated in Chat Completions in favour of this parameter.
+            "max_completion_tokens": MAX_TOKENS,
+        }
+
     def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
         try:
             response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[{"role": "system", "content": system}, *messages],
-                # `max_tokens` is deprecated in Chat Completions in favour of this parameter.
-                max_completion_tokens=MAX_TOKENS,
+                **self._request_kwargs(system, messages)
             )
         except openai.OpenAIError as exc:
             _log_sdk_error(self.name, exc)
             raise LLMProviderError(provider=self.name) from exc
 
         choice = response.choices[0]
-        if choice.finish_reason == "length":
+        truncated = choice.finish_reason == "length"
+        if truncated:
             _log_truncated(self.name, self._model)
         usage = response.usage  # Optional in the SDK; reported as 0 tokens when missing
         return LLMResult(
@@ -294,6 +308,7 @@ class OpenAIProvider:
             provider=self.name,
             input_tokens=usage.prompt_tokens if usage else 0,
             output_tokens=usage.completion_tokens if usage else 0,
+            truncated=truncated,
         )
 
     def stream(self, system: str, messages: Sequence[ChatMessage]) -> LLMStream:
@@ -304,9 +319,7 @@ class OpenAIProvider:
     ) -> Generator[str, None, LLMResult]:
         try:
             response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[{"role": "system", "content": system}, *messages],
-                max_completion_tokens=MAX_TOKENS,
+                **self._request_kwargs(system, messages),
                 stream=True,
                 # Adds a final chunk with `usage` and an empty `choices` list.
                 stream_options={"include_usage": True},
@@ -317,6 +330,7 @@ class OpenAIProvider:
 
         parts: list[str] = []
         input_tokens = output_tokens = 0
+        truncated = False
         try:
             for chunk in response:
                 if chunk.usage:
@@ -326,6 +340,7 @@ class OpenAIProvider:
                     continue
                 choice = chunk.choices[0]
                 if choice.finish_reason == "length":
+                    truncated = True
                     _log_truncated(self.name, self._model)
                 # The first chunk usually carries only `role`; empty fragments are skipped so
                 # the UI's time-to-first-fragment is real.
@@ -344,6 +359,7 @@ class OpenAIProvider:
             provider=self.name,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            truncated=truncated,
         )
 
 
@@ -356,19 +372,24 @@ class AnthropicProvider:
         self._client = client
         self._model = model
 
+    def _request_kwargs(self, system: str, messages: Sequence[ChatMessage]) -> dict:
+        """SDK arguments shared by `generate` and `_stream` (design D5)."""
+        return {
+            "model": self._model,
+            "system": system,
+            "messages": list(messages),
+            "max_tokens": MAX_TOKENS,
+        }
+
     def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
         try:
-            response = self._client.messages.create(
-                model=self._model,
-                system=system,
-                messages=list(messages),
-                max_tokens=MAX_TOKENS,
-            )
+            response = self._client.messages.create(**self._request_kwargs(system, messages))
         except anthropic.AnthropicError as exc:
             _log_sdk_error(self.name, exc)
             raise LLMProviderError(provider=self.name) from exc
 
-        if response.stop_reason == "max_tokens":
+        truncated = response.stop_reason == "max_tokens"
+        if truncated:
             _log_truncated(self.name, self._model)
         text = "".join(block.text for block in response.content if block.type == "text")
         return LLMResult(
@@ -377,6 +398,7 @@ class AnthropicProvider:
             provider=self.name,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            truncated=truncated,
         )
 
     def stream(self, system: str, messages: Sequence[ChatMessage]) -> LLMStream:
@@ -389,11 +411,7 @@ class AnthropicProvider:
         # both providers follow the same "iterate events" scheme (design D3).
         try:
             response = self._client.messages.create(
-                model=self._model,
-                system=system,
-                messages=list(messages),
-                max_tokens=MAX_TOKENS,
-                stream=True,
+                **self._request_kwargs(system, messages), stream=True
             )
         except anthropic.AnthropicError as exc:
             _log_sdk_error(self.name, exc)
@@ -401,6 +419,7 @@ class AnthropicProvider:
 
         parts: list[str] = []
         input_tokens = output_tokens = 0
+        truncated = False
         try:
             for event in response:
                 if event.type == "message_start":
@@ -413,6 +432,7 @@ class AnthropicProvider:
                     # Cumulative count: assign, do not add.
                     output_tokens = event.usage.output_tokens
                     if event.delta.stop_reason == "max_tokens":
+                        truncated = True
                         _log_truncated(self.name, self._model)
         except Exception as exc:  # anthropic does not wrap mid-stream transport errors (D3)
             _log_sdk_error(self.name, exc)
@@ -426,6 +446,7 @@ class AnthropicProvider:
             provider=self.name,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            truncated=truncated,
         )
 
 
@@ -477,6 +498,7 @@ class EstimationResult:
     input_tokens: int
     output_tokens: int
     cost_usd: float | None
+    truncated: bool = False  # see LLMResult.truncated (design D3)
 
 
 def _to_estimation_result(result: LLMResult) -> EstimationResult:
@@ -488,6 +510,7 @@ def _to_estimation_result(result: LLMResult) -> EstimationResult:
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         cost_usd=estimate_cost(result.model, result.input_tokens, result.output_tokens),
+        truncated=result.truncated,
     )
 
 

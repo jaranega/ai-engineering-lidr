@@ -358,3 +358,112 @@ def test_streams_without_truncation_do_not_warn(caplog):
         consume(OpenAIProvider(OpenAIStub(oa_chunks("a")), "m").stream("s", MESSAGES))
         consume(AnthropicProvider(AnthropicStub(an_events("a")), "m").stream("s", MESSAGES))
     assert not caplog.records
+
+
+# --- Requirement: Límites / Scenario: Salida truncada en streaming (+ Salida completa) ---
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "expected"), [("length", True), ("stop", False)], ids=["length", "stop"]
+)
+def test_openai_stream_sets_truncated_flag(finish_reason, expected, caplog):
+    """Requirement: Límites / Scenario: Salida truncada en streaming (OpenAI)."""
+    chunks = [oa_chunk("a"), oa_chunk("b", finish_reason=finish_reason), oa_usage_chunk()]
+    stream = OpenAIProvider(OpenAIStub(chunks), "m").stream("s", MESSAGES)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert consume(stream) == ["a", "b"]
+    assert stream.result.truncated is expected
+    assert stream.result.text == "ab"
+    warned = any("LLM output truncated" in r.getMessage() for r in caplog.records)
+    assert warned is expected
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [("max_tokens", True), ("end_turn", False)],
+    ids=["max_tokens", "end_turn"],
+)
+def test_anthropic_stream_sets_truncated_flag(stop_reason, expected, caplog):
+    """Requirement: Límites / Scenario: Salida truncada en streaming (Anthropic)."""
+    events = an_events("a", "b", stop_reason=stop_reason)
+    stream = AnthropicProvider(AnthropicStub(events), "m").stream("s", MESSAGES)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert consume(stream) == ["a", "b"]
+    assert stream.result.truncated is expected
+    assert stream.result.text == "ab"
+    warned = any("LLM output truncated" in r.getMessage() for r in caplog.records)
+    assert warned is expected
+
+
+# --- Requirement: Generación en streaming / Scenario: Segunda iteración ---
+
+
+def _openai_stream():
+    stub = OpenAIStub(oa_chunks("a", "b"))
+    return stub, OpenAIProvider(stub, "m").stream("s", MESSAGES)
+
+
+def _anthropic_stream():
+    stub = AnthropicStub(an_events("a", "b"))
+    return stub, AnthropicProvider(stub, "m").stream("s", MESSAGES)
+
+
+@pytest.mark.parametrize(
+    "factory", [_openai_stream, _anthropic_stream], ids=["openai", "anthropic"]
+)
+def test_second_iteration_yields_nothing_and_keeps_result(factory):
+    """Requirement: Generación en streaming / Scenario: Segunda iteración."""
+    stub, stream = factory()
+    assert consume(stream) == ["a", "b"]
+    result = stream.result
+    stub.kwargs = None  # reset: any new SDK call would set it again
+    assert consume(stream) == []
+    assert stub.kwargs is None  # no new SDK call
+    assert stream.result is result
+    assert result.text == "ab"
+
+
+def test_llmstream_second_iteration_does_not_touch_generator():
+    """Requirement: Generación en streaming / Scenario: Segunda iteración (LLMStream)."""
+    final = LLMResult("x", "m", "openai", 1, 2, True)
+
+    def gen():
+        yield "x"
+        return final
+
+    stream = LLMStream(gen())
+    assert consume(stream) == ["x"]
+    assert consume(stream) == []
+    assert consume(stream) == []
+    assert stream.result is final
+
+
+# --- Requirement: Interfaz mínima / Scenario: Mismos parámetros en ambos modos ---
+
+
+def test_openai_generate_and_stream_share_kwargs():
+    """Requirement: Interfaz mínima de proveedor / Scenario: Mismos parámetros en ambos modos."""
+    from tests.test_llm_providers import openai_response
+
+    normal = OpenAIStub(openai_response())
+    OpenAIProvider(normal, "gpt-4o-mini").generate("SYS", MESSAGES)
+    streamed = OpenAIStub(oa_chunks("a"))
+    consume(OpenAIProvider(streamed, "gpt-4o-mini").stream("SYS", MESSAGES))
+    extra = {k: v for k, v in streamed.kwargs.items() if k not in normal.kwargs}
+    assert set(extra) == {"stream", "stream_options"}
+    assert {k: streamed.kwargs[k] for k in normal.kwargs} == normal.kwargs
+    assert normal.kwargs["max_completion_tokens"] == MAX_TOKENS
+
+
+def test_anthropic_generate_and_stream_share_kwargs():
+    """Requirement: Interfaz mínima de proveedor / Scenario: Mismos parámetros en ambos modos."""
+    from tests.test_llm_providers import anthropic_response
+
+    normal = AnthropicStub(anthropic_response())
+    AnthropicProvider(normal, "claude-haiku-4-5").generate("SYS", MESSAGES)
+    streamed = AnthropicStub(an_events("a"))
+    consume(AnthropicProvider(streamed, "claude-haiku-4-5").stream("SYS", MESSAGES))
+    extra = {k: v for k, v in streamed.kwargs.items() if k not in normal.kwargs}
+    assert set(extra) == {"stream"}
+    assert {k: streamed.kwargs[k] for k in normal.kwargs} == normal.kwargs
+    assert normal.kwargs["max_tokens"] == MAX_TOKENS

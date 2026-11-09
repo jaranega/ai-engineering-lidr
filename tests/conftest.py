@@ -56,6 +56,7 @@ class FakeProvider:
     `stream()` yields `fragments` (default: the whole `text` as one fragment). With
     `error_after=N` it raises `error` after N fragments (0 = before the first one, like an
     SDK failure at creation: the real streams are lazy, so it surfaces on iteration).
+    `fragments=[]` delivers zero fragments (empty reply); `truncated` sets the result flag.
     """
 
     def __init__(
@@ -68,6 +69,7 @@ class FakeProvider:
         error: LLMProviderError | None = None,
         fragments: Sequence[str] | None = None,
         error_after: int | None = None,
+        truncated: bool = False,
     ) -> None:
         self.result = LLMResult(
             text=text,
@@ -75,6 +77,7 @@ class FakeProvider:
             provider=provider,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            truncated=truncated,
         )
         self.error = error
         self.fragments = list(fragments) if fragments is not None else [text]
@@ -109,6 +112,7 @@ class FakeProvider:
             provider=self.result.provider,
             input_tokens=self.result.input_tokens,
             output_tokens=self.result.output_tokens,
+            truncated=self.result.truncated,
         )
 
 

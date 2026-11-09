@@ -1,5 +1,6 @@
 """Streamlit chat UI: in-process client of the estimation service layer."""
 
+import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -21,7 +22,12 @@ from app.services.llm_service import (
     system_prompt_for,
 )
 
+logger = logging.getLogger(__name__)
+
 PROVIDER_ERROR_MESSAGE = "No se pudo generar la estimación. Inténtalo de nuevo en unos instantes."
+TRUNCATED_WARNING = (
+    "La respuesta se ha cortado por el límite de longitud. Pide un ajuste o una versión más breve."
+)
 
 
 @dataclass(frozen=True)
@@ -35,11 +41,13 @@ class CallMetrics:
     cost_usd: float | None
     ttft_s: float
     total_s: float
+    truncated: bool
 
 
 def init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("last_metrics", None)
+    st.session_state.setdefault("truncated_turns", set())
 
 
 def load_config() -> tuple[Settings, LLMProvider]:
@@ -55,9 +63,11 @@ def load_config() -> tuple[Settings, LLMProvider]:
 
 
 def render_history() -> None:
-    for message in st.session_state.messages:
+    for index, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if index in st.session_state.truncated_turns:
+                st.warning(TRUNCATED_WARNING)
 
 
 def validate_input(text: str) -> str | None:
@@ -87,6 +97,7 @@ def build_metrics(result: EstimationResult, timings: dict[str, float]) -> CallMe
         cost_usd=result.cost_usd,
         ttft_s=timings["ttft_s"],
         total_s=timings["total_s"],
+        truncated=result.truncated,
     )
 
 
@@ -109,6 +120,12 @@ def handle_user_message(text: str, provider: LLMProvider) -> None:
         except LLMProviderError:
             st.error(PROVIDER_ERROR_MESSAGE)
             return
+        if "ttft_s" not in timings or not str(reply).strip():
+            logger.warning("Empty LLM reply: provider=%s model=%s", result.provider, result.model)
+            st.error(PROVIDER_ERROR_MESSAGE)
+            return
+    if result.truncated:
+        st.session_state.truncated_turns.add(len(st.session_state.messages) + 1)
     st.session_state.messages.extend([new_message, {"role": "assistant", "content": str(reply)}])
     st.session_state.last_metrics = build_metrics(result, timings)
     st.rerun()  # control-flow exception: keep outside try/except; refreshes the sidebar
@@ -117,6 +134,7 @@ def handle_user_message(text: str, provider: LLMProvider) -> None:
 def reset_conversation() -> None:
     st.session_state.messages = []
     st.session_state.last_metrics = None
+    st.session_state.truncated_turns = set()
 
 
 def render_metrics(metrics: CallMetrics | None) -> None:
@@ -132,7 +150,8 @@ def render_metrics(metrics: CallMetrics | None) -> None:
         f"- Tokens de salida: {metrics.output_tokens}\n"
         f"- Tiempo total: {metrics.total_s:.2f} s\n"
         f"- Tiempo hasta el primer fragmento: {metrics.ttft_s:.2f} s\n"
-        f"- Coste estimado: {cost}"
+        f"- Coste estimado: {cost}\n"
+        f"- Respuesta cortada: {'sí' if metrics.truncated else 'no'}"
     )
 
 

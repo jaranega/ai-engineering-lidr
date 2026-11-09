@@ -365,3 +365,26 @@ def test_anthropic_multi_turn_sends_system_param_and_messages_in_order():
     assert stub.kwargs["system"] == "SYS"
     assert stub.kwargs["messages"] == CONVERSATION
     assert all(m["role"] != "system" for m in stub.kwargs["messages"])
+
+
+# --- Requirement: Límites (truncated en generate) y Mismos parámetros en ambos modos ---
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "expected"), [("length", True), ("stop", False)], ids=["length", "stop"]
+)
+def test_openai_generate_sets_truncated_flag(finish_reason, expected):
+    """Requirement: Límites / Scenarios: Salida truncada y Salida completa (OpenAI generate)."""
+    stub = OpenAIStub(openai_response(finish_reason=finish_reason))
+    assert OpenAIProvider(stub, "m").generate("s", U).truncated is expected
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [("max_tokens", True), ("end_turn", False)],
+    ids=["max_tokens", "end_turn"],
+)
+def test_anthropic_generate_sets_truncated_flag(stop_reason, expected):
+    """Requirement: Límites / Scenarios: Salida truncada y Salida completa (Anthropic generate)."""
+    stub = AnthropicStub(anthropic_response(stop_reason=stop_reason))
+    assert AnthropicProvider(stub, "m").generate("s", U).truncated is expected

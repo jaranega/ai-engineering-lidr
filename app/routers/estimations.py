@@ -42,4 +42,5 @@ def estimate(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         cost_usd=result.cost_usd,
+        truncated=result.truncated,
     )

@@ -99,7 +99,7 @@ Se abre en <http://localhost:8501>. Usa la misma configuración que la API (`.en
 
 - **Chat**: pega una transcripción y la estimación se escribe en streaming. Después puedes pedir ajustes ("quita el blog", "¿y con dos desarrolladores?") y el asistente responde con la estimación completa actualizada, en el idioma de la transcripción. Todo el historial se envía al modelo en cada turno.
 - **Panel lateral**: proveedor y modelo activos, botón **Nueva conversación**, métricas de la última llamada (modelo, tokens de entrada y salida, tiempo total, tiempo hasta el primer fragmento y coste estimado), el system prompt que se enviará en el siguiente turno (solo lectura) y los ejemplos CAG inyectados.
-- Los mensajes se recortan y tienen el mismo límite de 20 000 caracteres que la API. Si el proveedor falla, se muestra un error genérico y el mensaje no queda en el historial, para que puedas reenviarlo.
+- Los mensajes se recortan y tienen el mismo límite de 20 000 caracteres que la API. Si el proveedor falla o no devuelve texto, se muestra un error genérico y el mensaje no queda en el historial, para que puedas reenviarlo. Si una respuesta se corta por el límite de longitud, se guarda con un aviso debajo y las métricas lo indican.
 
 En el primer turno el chat envía exactamente el system prompt del endpoint; a partir del segundo le añade al final una sección que explica cómo tratar los mensajes de seguimiento. Se hace así porque, con cualquier texto añadido, gpt-4o-mini respondía en español a la mitad de las transcripciones en inglés (medido con llamadas reales; detalle en el design del change). `.streamlit/config.toml` desactiva la telemetría de Streamlit.
 
@@ -136,11 +136,12 @@ Ejemplo ilustrativo de la forma de la respuesta (los valores son de muestra, no 
   "provider": "openai",
   "input_tokens": 3200,
   "output_tokens": 650,
-  "cost_usd": 0.00087
+  "cost_usd": 0.00087,
+  "truncated": false
 }
 ```
 
-`cost_usd` es aproximado y vale `null` si el modelo no tiene precio conocido. `model` es el modelo solicitado según la configuración.
+`cost_usd` es aproximado y vale `null` si el modelo no tiene precio conocido. `model` es el modelo solicitado según la configuración. `truncated` vale `true` si la estimación se cortó por el límite de tokens de salida (2048); en ese caso el texto llega incompleto.
 
 ### Códigos de estado
 

@@ -529,3 +529,124 @@ def test_sidebar_is_rendered_before_the_stream_so_it_survives_an_interruption(mo
     assert "1234" in text
     assert [t for t in at.sidebar.text_area if t.value == _chat_system_prompt()]
     assert history(at) == before
+
+
+# --- Requirement: Errores del proveedor en la interfaz / Scenario: Respuesta sin texto ---
+
+
+@pytest.mark.parametrize("fragments", [[], ["   ", "\n"]], ids=["no-fragments", "whitespace-only"])
+def test_empty_reply_shows_generic_error_and_keeps_state(monkeypatch, caplog, fragments):
+    """Requirement: Errores del proveedor en la interfaz / Scenario: Respuesta sin texto."""
+    fake = FakeProvider(text="E")
+    at = send(make_app(monkeypatch, fake), "T")
+    before_history = history(at)
+    before_metrics = at.session_state["last_metrics"]
+    before_sidebar = sidebar_text(at)
+    fake.fragments = fragments
+
+    with caplog.at_level("WARNING"):
+        send(at, "T2 secreto-usuario")
+
+    assert not at.exception
+    assert len(at.error) == 1
+    assert "Traceback" not in at.error[0].value
+    assert "openai" not in at.error[0].value.lower()
+    assert history(at) == before_history
+    assert at.session_state["last_metrics"] == before_metrics
+    assert sidebar_text(at) == before_sidebar
+    records = [r.getMessage() for r in caplog.records if "Empty LLM reply" in r.getMessage()]
+    assert len(records) == 1
+    assert "secreto-usuario" not in records[0]
+
+
+def test_empty_reply_on_first_turn_leaves_no_history_or_metrics(monkeypatch):
+    """Requirement: Errores del proveedor en la interfaz / Scenario: Respuesta sin texto."""
+    at = send(make_app(monkeypatch, FakeProvider(fragments=[])), "T")
+    assert not at.exception
+    assert at.session_state["messages"] == []
+    assert at.session_state["last_metrics"] is None
+    assert at.session_state["truncated_turns"] == set()
+    assert "Aún no hay métricas" in sidebar_text(at)
+
+
+# --- Requirement: Aviso de respuesta truncada ---
+
+TRUNCATED_TEXT = "cortado por el límite de longitud"
+
+
+def warnings_text(at: AppTest) -> list[str]:
+    return [w.value for w in at.warning]
+
+
+def test_truncated_reply_is_stored_with_warning(monkeypatch):
+    """Requirement: Aviso de respuesta truncada / Scenario: Respuesta truncada."""
+    fake = FakeProvider(text="PARCIAL", truncated=True)
+    at = send(make_app(monkeypatch, fake), "T")
+    assert not at.exception
+    assert history(at) == [("user", "T"), ("assistant", "PARCIAL")]
+    assert len(at.warning) == 1
+    assert TRUNCATED_TEXT in at.warning[0].value
+    assistant = at.chat_message[1]
+    assert len(assistant.warning) == 1
+
+
+def test_truncated_warning_persists_and_only_under_truncated_reply(monkeypatch):
+    """Requirement: Aviso de respuesta truncada / Scenario: Aviso persistente."""
+    fake = FakeProvider(text="PARCIAL", truncated=True)
+    at = send(make_app(monkeypatch, fake), "T")
+    fake.result = FakeProvider(text="COMPLETA", truncated=False).result
+    fake.fragments = ["COMPLETA"]
+    send(at, "ajuste")
+    assert not at.exception
+    assert [m.name for m in at.chat_message] == ["user", "assistant", "user", "assistant"]
+    assert len(at.chat_message[1].warning) == 1  # truncated reply keeps its warning
+    assert len(at.chat_message[3].warning) == 0  # complete reply has none
+    assert len(at.warning) == 1
+
+
+def test_truncation_indicator_is_not_sent_to_provider(monkeypatch):
+    """Requirement: Aviso de respuesta truncada / Scenario: Indicador fuera de los mensajes."""
+    fake = FakeProvider(text="PARCIAL", truncated=True)
+    at = send(make_app(monkeypatch, fake), "T")
+    send(at, "ajuste")
+    sent = fake.calls[-1][1]
+    assert sent == [
+        {"role": "user", "content": "T"},
+        {"role": "assistant", "content": "PARCIAL"},
+        {"role": "user", "content": "ajuste"},
+    ]
+    assert all(set(m) == {"role", "content"} for m in sent)
+    assert all(set(m) == {"role", "content"} for m in at.session_state["messages"])
+
+
+def test_new_conversation_removes_truncation_warnings(monkeypatch):
+    """Requirement: Aviso de respuesta truncada / Scenario: Nueva conversación."""
+    fake = FakeProvider(text="PARCIAL", truncated=True)
+    at = send(make_app(monkeypatch, fake), "T")
+    assert len(at.warning) == 1
+    at.sidebar.button[0].click().run()
+    assert at.session_state["messages"] == []
+    assert at.session_state["truncated_turns"] == set()
+    assert len(at.warning) == 0
+    # a fresh complete reply at the same index must not inherit a warning
+    fake.result = FakeProvider(text="OK").result
+    fake.fragments = ["OK"]
+    send(at, "T2")
+    assert len(at.warning) == 0
+
+
+# --- Requirement: Métricas / Scenarios: Métricas de una respuesta truncada y tras una respuesta ---
+
+
+def test_metrics_show_truncated_yes(monkeypatch):
+    """Requirement: Métricas / Scenario: Métricas de una respuesta truncada."""
+    at = send(make_app(monkeypatch, FakeProvider(truncated=True)), "T")
+    assert at.session_state["last_metrics"].truncated is True
+    assert "Respuesta cortada: sí" in sidebar_text(at)
+
+
+def test_metrics_show_truncated_no_for_complete_reply(monkeypatch):
+    """Requirement: Métricas / Scenario: Métricas tras una respuesta (no se cortó)."""
+    at = send(make_app(monkeypatch, FakeProvider()), "T")
+    assert at.session_state["last_metrics"].truncated is False
+    assert "Respuesta cortada: no" in sidebar_text(at)
