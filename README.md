@@ -35,10 +35,85 @@ Los routers dependen de los servicios mediante `Depends` y nunca importan los SD
 
 La interfaz Streamlit (`streamlit_app.py`, en la raíz) es un cliente **in-process** de la misma capa de servicios: no llama a la API HTTP ni necesita uvicorn arrancado, y tampoco importa los SDKs. Reutiliza la configuración, los proveedores, el system prompt CAG y el cálculo de coste.
 
+```mermaid
+flowchart TB
+    user_http(["Cliente HTTP<br/>curl / Swagger /docs"])
+    user_ui(["Usuario en el navegador"])
+
+    subgraph ST["streamlit_app.py · chat Streamlit (in-process)"]
+        direction TB
+        st_main["main()<br/>load_config → init_state"]
+        st_sidebar["render_sidebar<br/>proveedor/modelo · métricas · system prompt · ejemplos CAG"]
+        st_chat["render_history + chat_input<br/>validate_input (strip, ≤ 20 000)"]
+        st_handle["handle_user_message<br/>st.write_stream + timed_fragments (TTFT)"]
+        st_state[("st.session_state<br/>messages · last_metrics · truncated_turns")]
+        st_main --> st_sidebar --> st_chat --> st_handle
+        st_handle <--> st_state
+    end
+
+    subgraph API["FastAPI (uvicorn)"]
+        direction TB
+        main["app/main.py<br/>GET /health · include_router /api/v1"]
+        router["app/routers/estimations.py<br/>POST /api/v1/estimate<br/>LLMProviderError → 502"]
+        schemas["app/schemas.py<br/>EstimationRequest / EstimationResponse<br/>(tokens, cost_usd, truncated)"]
+        main --> router
+        router -. valida con .-> schemas
+    end
+
+    subgraph SVC["app/services · lógica de negocio"]
+        direction TB
+        service["EstimationService<br/>estimate() · stream_chat()"]
+        prompt["Construcción del prompt CAG<br/>system_prompt_for(messages)<br/>1 turno → prompt del endpoint<br/>multi-turno → + sección de conversación"]
+        stream["EstimationStream / LLMStream<br/>fragmentos + resultado final"]
+        proto{{"LLMProvider (Protocol)<br/>generate() · stream()"}}
+        openai_p["OpenAIProvider<br/>Chat Completions"]
+        anth_p["AnthropicProvider<br/>Messages (system aparte)"]
+        pricing["pricing.py<br/>estimate_cost → cost_usd"]
+        err["LLMProviderError<br/>(error de dominio)"]
+
+        service --> prompt
+        service --> proto
+        service --> pricing
+        service --> stream
+        proto --> openai_p
+        proto --> anth_p
+        openai_p -. errores SDK .-> err
+        anth_p -. errores SDK .-> err
+    end
+
+    subgraph CTX["app/context"]
+        examples["examples.py<br/>ESTIMATION_EXAMPLES (few-shot CAG)"]
+    end
+
+    subgraph CFG["app/config.py"]
+        settings["Settings (pydantic-settings)<br/>get_settings · configure_logging<br/>format_config_error"]
+        env[(".env / variables de entorno<br/>LLM_PROVIDER · LLM_MODEL · API keys")]
+        env --> settings
+    end
+
+    subgraph EXT["Proveedores LLM externos"]
+        oai[["OpenAI API<br/>gpt-4o-mini"]]
+        ant[["Anthropic API<br/>claude-haiku-4-5"]]
+    end
+
+    user_http -->|HTTP JSON| main
+    user_ui --> ST
+    router -->|Depends get_estimation_service| service
+    st_handle -->|llamada directa, sin HTTP| service
+    st_sidebar -. lee .-> examples
+    st_sidebar -. lee .-> prompt
+    prompt -. inyecta .-> examples
+    settings -->|get_llm_provider / build_provider| proto
+    main -. Depends .-> settings
+    st_main -. load_config .-> settings
+    openai_p -->|max_tokens 2048 · timeout 60 s · 2 reintentos| oai
+    anth_p -->|max_tokens 2048 · timeout 60 s · 2 reintentos| ant
 ```
-streamlit_app.py ──► app/services ──► app/context
-app/routers      ──► app/services
-```
+
+- El router no tiene lógica: recibe el servicio con `Depends`, valida con los schemas y traduce `LLMProviderError` a 502.
+- El proveedor se elige solo con `LLM_PROVIDER`; ni los routers ni la interfaz tienen condicionales de proveedor.
+- En el chat, el primer turno usa exactamente el prompt del endpoint y los siguientes añaden la sección de conversación.
+- Las API keys solo llegan desde `.env` (o variables de entorno) a través de `Settings`.
 
 Los proveedores exponen dos modos con la misma entrada (system prompt + lista de mensajes `user`/`assistant`): `generate` (respuesta completa, la usa la API) y `stream` (fragmentos de texto a medida que llegan y, al terminar, tokens y coste; lo usa el chat).
 
