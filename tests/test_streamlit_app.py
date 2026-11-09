@@ -12,8 +12,9 @@ from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
+from structlog.testing import capture_logs
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.context.examples import ESTIMATION_EXAMPLES
 from app.services import llm_service
 from app.services.llm_service import (
@@ -35,7 +36,7 @@ def make_app(monkeypatch: pytest.MonkeyPatch, fake: FakeProvider | None = None) 
     monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
     monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_ANTHROPIC_KEY)
     fake = fake if fake is not None else FakeProvider()
-    monkeypatch.setattr(llm_service, "build_provider", lambda name, settings: fake)
+    monkeypatch.setattr(llm_service, "build_provider", lambda settings: fake)
     return AppTest.from_file(str(APP_PATH), default_timeout=10).run()
 
 
@@ -108,8 +109,8 @@ def test_estimation_needs_no_fastapi_server(monkeypatch):
     assert len(at.session_state["messages"]) == 2
 
 
-def test_streamlit_app_does_not_import_llm_sdks():
-    """Requirement: Aplicación Streamlit de chat (no importa openai ni anthropic)."""
+def test_streamlit_app_does_not_import_llm_libraries():
+    """Requirement: Aplicación Streamlit de chat (no importa SDKs, litellm ni redis)."""
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     imported: set[str] = set()
     for node in ast.walk(tree):
@@ -117,7 +118,7 @@ def test_streamlit_app_does_not_import_llm_sdks():
             imported.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
-    assert not imported & {"openai", "anthropic"}
+    assert not imported & {"openai", "anthropic", "litellm", "redis"}
 
 
 # --- Requirement: Historial de la conversación ---
@@ -262,15 +263,21 @@ def test_blank_message_is_rejected_without_calling_provider(monkeypatch, blank):
 
 
 def test_missing_active_provider_key_shows_error_and_no_chat(monkeypatch):
-    """Requirement: Configuración y API key / Scenario: Falta la API key del proveedor activo."""
-    built: list[str] = []
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    """Requirement: Configuración y API key / Scenario: Falta la API key del modelo primario."""
+    built: list[Settings] = []
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("PRIMARY_MODEL", "claude-haiku-4-5")
     monkeypatch.setattr(
-        llm_service, "build_provider", lambda name, settings: built.append(name) or FakeProvider()
+        llm_service,
+        "build_provider",
+        lambda settings: built.append(settings) or FakeProvider(),
     )
     at = AppTest.from_file(str(APP_PATH), default_timeout=10).run()
     assert not at.exception
-    assert "ANTHROPIC_API_KEY" in conversation_error(at)
+    error = conversation_error(at)
+    assert "ANTHROPIC_API_KEY" in error
+    assert "PRIMARY_MODEL" in error
+    assert FAKE_KEY not in error
     assert len(at.chat_input) == 0
     assert built == []
 
@@ -284,7 +291,7 @@ def test_missing_openai_key_error_names_variable(monkeypatch):
 
 def test_invalid_config_error_does_not_leak_other_key_values(monkeypatch):
     """Requirement: Configuración y API key (el error no incluye valores de keys)."""
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("PRIMARY_MODEL", "claude-haiku-4-5")
     monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
     at = AppTest.from_file(str(APP_PATH), default_timeout=10).run()
     assert FAKE_KEY not in all_text(at)
@@ -432,23 +439,50 @@ def test_sidebar_shows_each_cag_example(monkeypatch):
         assert example["estimation"] in text
 
 
+def test_sidebar_shows_primary_and_fallback_models_with_providers(monkeypatch):
+    """Requirement: Panel de contexto CAG / Scenario: Contexto visible (modelos)."""
+    at = make_app(monkeypatch)  # both keys defined: the fallback is active
+    text = sidebar_text(at)
+    assert "**Modelo primario:** `gpt-4o-mini` (`openai`)" in text
+    assert "**Modelo de respaldo:** `claude-haiku-4-5` (`anthropic`)" in text
+    assert "Sin respaldo" not in text
+
+
+def test_sidebar_follows_the_configured_models(monkeypatch):
+    """Requirement: Panel de contexto CAG / Scenario: Contexto visible (modelos configurados)."""
+    monkeypatch.setenv("PRIMARY_MODEL", "claude-haiku-4-5")
+    monkeypatch.setenv("FALLBACK_MODEL", "gpt-4o-mini")
+    text = sidebar_text(make_app(monkeypatch))
+    assert "**Modelo primario:** `claude-haiku-4-5` (`anthropic`)" in text
+    assert "**Modelo de respaldo:** `gpt-4o-mini` (`openai`)" in text
+
+
 @pytest.mark.parametrize(
-    ("env", "provider", "model"),
-    [
-        ({}, "openai", "gpt-4o-mini"),
-        ({"LLM_PROVIDER": "anthropic"}, "anthropic", "claude-haiku-4-5"),
-        ({"LLM_MODEL": "custom-model-x"}, "openai", "custom-model-x"),
-    ],
+    "env",
+    [{"ANTHROPIC_API_KEY": ""}, {"FALLBACK_MODEL": ""}],
+    ids=["no-fallback-key", "fallback-model-empty"],
 )
-def test_sidebar_shows_active_provider_and_model(monkeypatch, env, provider, model):
-    """Requirement: Panel de contexto CAG / Scenario: Contexto visible (proveedor y modelo)."""
+def test_sidebar_says_there_is_no_fallback(monkeypatch, env):
+    """Requirement: Panel de contexto CAG / Scenario: Sin respaldo."""
+    at = make_app(monkeypatch)  # sets both keys; override afterwards and rerun
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    at = make_app(monkeypatch)
-    text = sidebar_text(at)
-    assert provider in text
-    assert model in text
-    assert Settings(_env_file=None).effective_model == model
+    get_settings.cache_clear()
+    text = sidebar_text(at.run())
+    assert "**Modelo primario:** `gpt-4o-mini` (`openai`)" in text
+    assert "**Modelo de respaldo:** Sin respaldo" in text
+
+
+def test_missing_fallback_logs_one_warning_per_session(monkeypatch):
+    """Requirement: Sin respaldo / app-config: warning `llm_fallback_disabled` (una vez)."""
+    monkeypatch.setattr("app.config.configure_logging", lambda settings: None)
+    monkeypatch.setenv("FALLBACK_MODEL", "")
+    with capture_logs() as logs:
+        at = make_app(monkeypatch)
+        send(at, "T")  # a rerun in the same session
+    warnings = [e for e in logs if e["event"] == "llm_fallback_disabled"]
+    assert len(warnings) == 1
+    assert "FALLBACK_MODEL" in warnings[0]["reason"]
 
 
 # --- Requirement: Métricas de la última llamada ---
@@ -480,6 +514,47 @@ def test_sidebar_shows_metrics_after_a_response(monkeypatch):
     assert metrics.cost_usd == pytest.approx(expected_cost)
     assert f"${expected_cost:.6f}" in text
     assert metrics.total_s >= metrics.ttft_s >= 0
+
+
+def test_metrics_show_no_fallback_and_no_cache_by_default(monkeypatch):
+    """Requirement: Métricas / Scenario: Métricas tras una respuesta (respaldo y caché: no)."""
+    text = sidebar_text(send(make_app(monkeypatch), "T"))
+    assert "- Respaldo: no" in text
+    assert "- Desde caché: no" in text
+
+
+def test_metrics_show_fallback_model_and_that_the_fallback_answered(monkeypatch):
+    """Requirement: Métricas / Scenario: Métricas de una respuesta del respaldo."""
+    fake = FakeProvider(model="claude-haiku-4-5", provider="anthropic", fallback_used=True)
+    at = send(make_app(monkeypatch, fake), "T")
+    text = sidebar_text(at)
+    assert at.session_state["last_metrics"].fallback_used is True
+    assert "- Modelo: `claude-haiku-4-5`" in text
+    assert "- Proveedor: `anthropic`" in text
+    assert "- Respaldo: sí" in text
+    assert "- Desde caché: no" in text
+
+
+def test_metrics_show_that_the_answer_came_from_the_cache(monkeypatch):
+    """Requirement: Métricas / Scenario: Métricas de una respuesta desde la caché."""
+    at = send(make_app(monkeypatch, FakeProvider(cache_hit=True)), "T")
+    text = sidebar_text(at)
+    assert at.session_state["last_metrics"].cache_hit is True
+    assert "- Desde caché: sí" in text
+    assert "- Respaldo: no" in text
+
+
+def test_real_cached_provider_hit_is_shown_in_the_chat_metrics(monkeypatch, response_cache):
+    """Requirement: Métricas desde caché (CachedProvider real sobre un doble, segundo envío)."""
+    inner = FakeProvider(fragments=["estimación"], text="estimación")
+    cached = llm_service.CachedProvider(inner, response_cache, "gpt-4o-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
+    monkeypatch.setattr(llm_service, "build_provider", lambda settings: cached)
+    for expected in ("no", "sí"):
+        at = AppTest.from_file(str(APP_PATH), default_timeout=10).run()
+        send(at, "misma transcripción")
+        assert f"- Desde caché: {expected}" in sidebar_text(at)
+    assert inner.call_count == 1
 
 
 def test_metrics_show_nd_when_model_has_no_known_price(monkeypatch):
@@ -535,7 +610,7 @@ def test_sidebar_is_rendered_before_the_stream_so_it_survives_an_interruption(mo
 
 
 @pytest.mark.parametrize("fragments", [[], ["   ", "\n"]], ids=["no-fragments", "whitespace-only"])
-def test_empty_reply_shows_generic_error_and_keeps_state(monkeypatch, caplog, fragments):
+def test_empty_reply_shows_generic_error_and_keeps_state(monkeypatch, fragments):
     """Requirement: Errores del proveedor en la interfaz / Scenario: Respuesta sin texto."""
     fake = FakeProvider(text="E")
     at = send(make_app(monkeypatch, fake), "T")
@@ -544,7 +619,8 @@ def test_empty_reply_shows_generic_error_and_keeps_state(monkeypatch, caplog, fr
     before_sidebar = sidebar_text(at)
     fake.fragments = fragments
 
-    with caplog.at_level("WARNING"):
+    monkeypatch.setattr("app.config.configure_logging", lambda settings: None)
+    with capture_logs() as logs:
         send(at, "T2 secreto-usuario")
 
     assert not at.exception
@@ -554,9 +630,10 @@ def test_empty_reply_shows_generic_error_and_keeps_state(monkeypatch, caplog, fr
     assert history(at) == before_history
     assert at.session_state["last_metrics"] == before_metrics
     assert sidebar_text(at) == before_sidebar
-    records = [r.getMessage() for r in caplog.records if "Empty LLM reply" in r.getMessage()]
+    records = [e for e in logs if e["event"] == "empty_llm_reply"]
     assert len(records) == 1
-    assert "secreto-usuario" not in records[0]
+    assert records[0]["log_level"] == "warning"
+    assert "secreto-usuario" not in repr(logs)
 
 
 def test_empty_reply_on_first_turn_leaves_no_history_or_metrics(monkeypatch):

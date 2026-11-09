@@ -15,12 +15,16 @@ El repositorio SHALL incluir un workflow de GitHub Actions que se ejecute en cad
 - **THEN** el workflow termina en rojo e indica el paso de pytest
 
 ### Requirement: Tests sin coste ni red
-La suite de tests MUST ejecutarse sin API keys reales y sin llamadas de red a proveedores LLM, sustituyendo el proveedor por un doble de prueba mediante la inyección de dependencias de FastAPI en la API y mediante la sustitución del proveedor en la app Streamlit.
+La suite de tests MUST ejecutarse sin API keys reales, sin servidor Redis y sin ninguna llamada de red (ni a proveedores LLM ni a recursos que LiteLLM pueda descargar, como su mapa de precios), sustituyendo el proveedor por un doble de prueba mediante la inyección de dependencias de FastAPI en la API y mediante la sustitución del proveedor en la app Streamlit, la llamada de LiteLLM por un doble en los tests del proveedor, y Redis por `fakeredis`.
 
 #### Scenario: Ejecución en CI
-- **GIVEN** un entorno sin API keys reales
+- **GIVEN** un entorno sin API keys reales ni Redis
 - **WHEN** se ejecuta `uv run pytest`
-- **THEN** todos los tests pasan y no se realiza ninguna llamada a OpenAI ni a Anthropic
+- **THEN** todos los tests pasan y no se realiza ninguna llamada de red
+
+#### Scenario: Mapa de precios de LiteLLM local
+- **WHEN** se importa la aplicación
+- **THEN** LiteLLM carga su mapa de modelos desde la copia local incluida en el paquete, sin descargarlo
 
 ### Requirement: Validación de la estructura del proyecto
 La suite SHALL incluir un test que verifique la existencia de la estructura del enunciado: `app/__init__.py`, `app/main.py`, `app/config.py`, `app/routers/{__init__,estimations}.py`, `app/services/{__init__,llm_service}.py`, `app/context/{__init__,examples}.py`, `streamlit_app.py`, `.env.example`, `.gitignore`, `pyproject.toml` y `README.md`.
@@ -34,7 +38,7 @@ La suite SHALL incluir un test que verifique la existencia de la estructura del 
 - **THEN** el test de estructura falla indicando el fichero ausente
 
 ### Requirement: Tests de comportamiento del servicio
-La suite SHALL cubrir, como mínimo: `GET /health` (200), `POST /api/v1/estimate` correcto con el proveedor simulado, el 422 por transcripción vacía, el 502 por fallo del proveedor, la inclusión de los ejemplos CAG en el system prompt, el streaming de ambos proveedores con un cliente de SDK simulado y la app Streamlit ejecutada sin navegador (`streamlit.testing.v1.AppTest`) con el proveedor simulado: respuesta en el historial, conversación multi-turno, error del proveedor, error de configuración y panel lateral.
+La suite SHALL cubrir, como mínimo: `GET /health` (200, también con Redis caído), `POST /api/v1/estimate` correcto con el proveedor simulado, el 422 por transcripción vacía, el 502 por fallo del proveedor, la inclusión de los ejemplos CAG en el system prompt, el proveedor LiteLLM (generación, streaming, truncado, fallback, errores) con LiteLLM simulado, la caché (acierto, fallo, qué no se guarda, streaming, Redis caído) con `fakeredis`, los eventos de log y la ausencia de datos sensibles en ellos, y la app Streamlit ejecutada sin navegador (`streamlit.testing.v1.AppTest`) con el proveedor simulado: respuesta en el historial, conversación multi-turno, error del proveedor, error de configuración y panel lateral.
 
 #### Scenario: Cobertura mínima
 - **WHEN** se ejecuta `uv run pytest`

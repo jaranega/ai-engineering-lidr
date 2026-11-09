@@ -20,10 +20,12 @@ class EstimationRequest(BaseModel):
 class EstimationResponse(BaseModel):
     estimation: str = Field(description="Software estimation in Markdown.")
     model: str = Field(
-        description="Requested model, as set in the configuration.", examples=["gpt-4o-mini"]
+        description="Effective model: the configured model of the deployment that answered.",
+        examples=["gpt-4o-mini"],
     )
-    provider: Literal["openai", "anthropic"] = Field(
-        description="LLM provider that served the request."
+    provider: str = Field(
+        description="Effective provider: the one that answered (primary or fallback).",
+        examples=["openai"],
     )
     input_tokens: int = Field(description="Prompt tokens consumed.", examples=[3200])
     output_tokens: int = Field(description="Completion tokens generated.", examples=[650])
@@ -34,3 +36,17 @@ class EstimationResponse(BaseModel):
     truncated: bool = Field(
         description="True if the estimation was cut off by the output token limit."
     )
+    fallback_used: bool = Field(description="True if the fallback model answered.")
+    cache_hit: bool = Field(description="True if the response was served from the cache.")
+    latency_ms: int = Field(ge=0, description="Total latency in milliseconds.", examples=[1450])
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(examples=["ok"])
+    env: str = Field(examples=["development"])
+    primary_model: str = Field(examples=["gpt-4o-mini"])
+    fallback_model: str | None = Field(
+        description="Fallback model, or null if the fallback is disabled.",
+        examples=["claude-haiku-4-5"],
+    )
+    cache: Literal["ok", "unavailable"] = Field(description="Redis cache status.")

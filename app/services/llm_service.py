@@ -1,33 +1,31 @@
 """LLM service: CAG prompt construction, LLM providers and the estimation use case."""
 
-import logging
+import time
 from collections.abc import Generator, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import cache, lru_cache
-from typing import Literal, Protocol, TypedDict
+from typing import Any, Literal, Protocol, TypedDict
 
-import anthropic
-import openai
+import structlog
+from litellm import Router
 
-from app.config import DEFAULT_MODELS, Settings, get_settings
+from app.config import Deployment, Settings, get_settings
 from app.context.examples import ESTIMATION_EXAMPLES, EstimationExample
+from app.services.cache import ResponseCache, cache_key, get_response_cache, key_prefix
 from app.services.pricing import estimate_cost
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
-# Generation limits (design D7). Constants on purpose: they are tuned in the live session,
-# not through the environment. The SDK default timeout (600 s) would hold a threadpool
-# thread for up to 10 minutes.
+# Output token limit, a constant on purpose (S02 D7). Timeout and retries come from
+# `Settings` (`LLM_TIMEOUT`, `LLM_RETRIES`).
 MAX_TOKENS = 2048
-LLM_TIMEOUT_S = 60
-LLM_MAX_RETRIES = 2
 
 # Domain limit for a transcription or chat message, shared by the HTTP schema and the UI.
 MAX_TRANSCRIPTION_CHARS = 20_000
 
 
 class ChatMessage(TypedDict):
-    """One conversation turn; the same shape both SDKs expect and the UI stores."""
+    """One conversation turn; the shape LiteLLM expects and the UI stores."""
 
     role: Literal["user", "assistant"]
     content: str
@@ -188,24 +186,34 @@ def build_estimation_prompt(transcription: str) -> tuple[str, list[ChatMessage]]
 
 @dataclass(frozen=True)
 class LLMResult:
-    """Provider-agnostic generation result. `model` is the requested model, not the served one."""
+    """Provider-agnostic generation result.
+
+    `model`/`provider` are the *effective* ones: the configured deployment (primary or
+    fallback) that answered, without provider prefix (design D4), never the API snapshot.
+    """
 
     text: str
     model: str
     provider: str
     input_tokens: int
     output_tokens: int
-    # True when generation stopped at MAX_TOKENS (design D3). Last field with a default so
-    # test doubles and future providers stay valid without changes.
+    # Fields with defaults so test doubles stay valid without changes.
+    # True when generation stopped at MAX_TOKENS.
     truncated: bool = False
+    # True when the fallback deployment answered.
+    fallback_used: bool = False
+    # True when the result was served from the response cache.
+    cache_hit: bool = False
+    # End-to-end latency of this request, set by the outermost layer (design D8).
+    latency_ms: int = 0
 
 
 class LLMStream:
     """Streamed generation: iterate to get the text fragments, then read `.result`.
 
-    Wraps a generator that yields the fragments and *returns* the `LLMResult`, so the live
-    session can compose providers (fallback, cache) with `yield from` (design D3). The SDK
-    call happens when iteration starts, not when the stream is built.
+    Wraps a generator that yields the fragments and *returns* the `LLMResult`, so layers
+    (cache) compose with `yield from`. The LLM call happens when iteration starts, not
+    when the stream is built.
     """
 
     def __init__(self, gen: Generator[str, None, LLMResult]) -> None:
@@ -214,7 +222,7 @@ class LLMStream:
 
     def __iter__(self) -> Iterator[str]:
         # Already consumed: yield nothing and keep the result, without touching the
-        # exhausted generator (design D2), so composed streams can re-iterate safely.
+        # exhausted generator, so composed streams can re-iterate safely.
         if self._result is not None:
             return
         self._result = yield from self._gen
@@ -236,169 +244,193 @@ class LLMProvider(Protocol):
 
 
 class LLMProviderError(Exception):
-    """Domain error for any SDK failure. The original exception is kept as `__cause__`."""
+    """Domain error for any LLM failure. The original exception is kept as `__cause__`."""
 
     def __init__(self, provider: str) -> None:
         super().__init__(f"LLM provider '{provider}' failed")
         self.provider = provider
 
 
-def _log_sdk_error(provider: str, exc: Exception) -> None:
-    # Only the exception type and HTTP status: SDK messages may echo fragments of the key.
-    logger.error(
-        "LLM provider call failed: provider=%s error_type=%s status=%s",
-        provider,
-        type(exc).__name__,
-        getattr(exc, "status_code", None),
+def _elapsed_ms(start: float) -> int:
+    return int((time.perf_counter() - start) * 1000)
+
+
+def _log_completed(result: LLMResult, mode: str, finish_reason: str | None) -> None:
+    logger.info(
+        "llm_call_completed",
+        mode=mode,
+        model=result.model,
+        provider=result.provider,
+        fallback_used=result.fallback_used,
+        cache_hit=result.cache_hit,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cost_usd=estimate_cost(result.model, result.input_tokens, result.output_tokens),
+        latency_ms=result.latency_ms,
+        finish_reason=finish_reason,
+        truncated=result.truncated,
     )
 
 
-def _log_truncated(provider: str, model: str) -> None:
-    logger.warning(
-        "LLM output truncated: provider=%s model=%s max_tokens=%d",
-        provider,
-        model,
-        MAX_TOKENS,
+# Router model groups; each holds one deployment whose `model_info.id` is the group name,
+# so `_hidden_params["model_id"]` tells which one answered (design D3, D4).
+PRIMARY_GROUP = "primary"
+FALLBACK_GROUP = "fallback"
+
+
+def _router_deployment(group: str, deployment: Deployment, settings: Settings) -> dict:
+    return {
+        "model_name": group,
+        "litellm_params": {
+            # Explicit provider prefix from the config resolution (design D3).
+            "model": f"{deployment.provider}/{deployment.model}",
+            "api_key": settings.api_key(deployment.provider),
+            "timeout": settings.llm_timeout,
+        },
+        "model_info": {"id": group},
+    }
+
+
+def build_router(settings: Settings) -> Router:
+    """LiteLLM Router: primary always first, fallback only after its retries (design D3).
+
+    Two single-deployment groups instead of one shuffled group, so requests never
+    load-balance to the fallback. No network at build time.
+    """
+    model_list = [_router_deployment(PRIMARY_GROUP, settings.primary, settings)]
+    fallbacks: list[dict[str, list[str]]] = []
+    if settings.fallback is not None:
+        model_list.append(_router_deployment(FALLBACK_GROUP, settings.fallback, settings))
+        fallbacks = [{PRIMARY_GROUP: [FALLBACK_GROUP]}]
+    return Router(
+        model_list=model_list,
+        fallbacks=fallbacks,
+        num_retries=settings.llm_retries,
+        timeout=settings.llm_timeout,
     )
 
 
-def _close_stream(response: object) -> None:
+def _model_id(obj: object) -> str | None:
+    hidden = getattr(obj, "_hidden_params", None)
+    if isinstance(hidden, dict):
+        model_id = hidden.get("model_id")
+        if isinstance(model_id, str) and model_id:
+            return model_id
+    return None
+
+
+def _close(response: object) -> None:
     # Release the HTTP connection when the consumer stops early (e.g. Streamlit's Stop).
-    # Test stubs may be plain sequences without `close`.
+    # Test doubles may be plain sequences without `close`.
     close = getattr(response, "close", None)
     if callable(close):
         close()
 
 
-class OpenAIProvider:
-    """OpenAI Chat Completions provider. The SDK client is injected (stubbed in tests)."""
+class LiteLLMProvider:
+    """`LLMProvider` over a LiteLLM `Router` with a primary and an optional fallback.
 
-    name = "openai"
+    The Router is injected (a double or a real Router with `mock_response` in tests).
+    Any exception becomes `LLMProviderError`; logs never carry content or error messages.
+    """
 
-    def __init__(self, client: openai.OpenAI, model: str) -> None:
-        self._client = client
-        self._model = model
-
-    def _request_kwargs(self, system: str, messages: Sequence[ChatMessage]) -> dict:
-        """SDK arguments shared by `generate` and `_stream` (design D5)."""
-        return {
-            "model": self._model,
-            "messages": [{"role": "system", "content": system}, *messages],
-            # `max_tokens` is deprecated in Chat Completions in favour of this parameter.
-            "max_completion_tokens": MAX_TOKENS,
-        }
-
-    def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
-        try:
-            response = self._client.chat.completions.create(
-                **self._request_kwargs(system, messages)
-            )
-        except openai.OpenAIError as exc:
-            _log_sdk_error(self.name, exc)
-            raise LLMProviderError(provider=self.name) from exc
-
-        choice = response.choices[0]
-        truncated = choice.finish_reason == "length"
-        if truncated:
-            _log_truncated(self.name, self._model)
-        usage = response.usage  # Optional in the SDK; reported as 0 tokens when missing
-        return LLMResult(
-            text=choice.message.content or "",
-            model=self._model,
-            provider=self.name,
-            input_tokens=usage.prompt_tokens if usage else 0,
-            output_tokens=usage.completion_tokens if usage else 0,
-            truncated=truncated,
-        )
-
-    def stream(self, system: str, messages: Sequence[ChatMessage]) -> LLMStream:
-        return LLMStream(self._stream(system, messages))
-
-    def _stream(
-        self, system: str, messages: Sequence[ChatMessage]
-    ) -> Generator[str, None, LLMResult]:
-        try:
-            response = self._client.chat.completions.create(
-                **self._request_kwargs(system, messages),
-                stream=True,
-                # Adds a final chunk with `usage` and an empty `choices` list.
-                stream_options={"include_usage": True},
-            )
-        except openai.OpenAIError as exc:
-            _log_sdk_error(self.name, exc)
-            raise LLMProviderError(provider=self.name) from exc
-
-        parts: list[str] = []
-        input_tokens = output_tokens = 0
-        truncated = False
-        try:
-            for chunk in response:
-                if chunk.usage:
-                    input_tokens = chunk.usage.prompt_tokens
-                    output_tokens = chunk.usage.completion_tokens
-                if not chunk.choices:
-                    continue
-                choice = chunk.choices[0]
-                if choice.finish_reason == "length":
-                    truncated = True
-                    _log_truncated(self.name, self._model)
-                # The first chunk usually carries only `role`; empty fragments are skipped so
-                # the UI's time-to-first-fragment is real.
-                if choice.delta.content:
-                    parts.append(choice.delta.content)
-                    yield choice.delta.content
-        except Exception as exc:  # any mid-stream failure becomes a domain error (design D3)
-            _log_sdk_error(self.name, exc)
-            raise LLMProviderError(provider=self.name) from exc
-        finally:
-            _close_stream(response)
-
-        return LLMResult(
-            text="".join(parts),
-            model=self._model,
-            provider=self.name,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            truncated=truncated,
-        )
-
-
-class AnthropicProvider:
-    """Anthropic Messages provider; the system prompt goes in the `system` parameter."""
-
-    name = "anthropic"
-
-    def __init__(self, client: anthropic.Anthropic, model: str) -> None:
-        self._client = client
-        self._model = model
+    def __init__(self, router: Any, primary: Deployment, fallback: Deployment | None) -> None:
+        self._router = router
+        self._primary = primary
+        self._fallback = fallback
 
     def _request_kwargs(self, system: str, messages: Sequence[ChatMessage]) -> dict:
-        """SDK arguments shared by `generate` and `_stream` (design D5)."""
+        """Arguments shared by `generate` and `stream` (same model, messages and limit)."""
         return {
-            "model": self._model,
-            "system": system,
-            "messages": list(messages),
+            "model": PRIMARY_GROUP,
+            # LiteLLM moves the system message to Anthropic's `system` parameter.
+            "messages": [{"role": "system", "content": system}, *(dict(m) for m in messages)],
             "max_tokens": MAX_TOKENS,
         }
 
-    def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
-        try:
-            response = self._client.messages.create(**self._request_kwargs(system, messages))
-        except anthropic.AnthropicError as exc:
-            _log_sdk_error(self.name, exc)
-            raise LLMProviderError(provider=self.name) from exc
+    def _effective(self, model_id: str | None, mode: str) -> tuple[Deployment, bool]:
+        """Configured deployment that answered and whether it was the fallback."""
+        if model_id == FALLBACK_GROUP and self._fallback is not None:
+            return self._fallback, True
+        if model_id != PRIMARY_GROUP:
+            logger.warning("llm_deployment_unknown", mode=mode, model_id=model_id)
+        return self._primary, False
 
-        truncated = response.stop_reason == "max_tokens"
+    def _log_started(self, mode: str, messages: Sequence[ChatMessage]) -> None:
+        logger.info(
+            "llm_call_started", mode=mode, primary_model=self._primary.model, messages=len(messages)
+        )
+
+    def _fail(self, exc: Exception, mode: str, start: float, fragments: int) -> LLMProviderError:
+        # Type and status only: LiteLLM messages include the provider response body.
+        logger.error(
+            "llm_call_failed",
+            error_type=type(exc).__name__,
+            status_code=getattr(exc, "status_code", None),
+            mode=mode,
+            latency_ms=_elapsed_ms(start),
+            fragments=fragments,
+        )
+        return LLMProviderError(provider=self._primary.provider)
+
+    def _finish(
+        self,
+        *,
+        mode: str,
+        text: str,
+        model_id: str | None,
+        input_tokens: int,
+        output_tokens: int,
+        finish_reason: str | None,
+        start: float,
+    ) -> LLMResult:
+        deployment, fallback_used = self._effective(model_id, mode)
+        truncated = finish_reason == "length"
         if truncated:
-            _log_truncated(self.name, self._model)
-        text = "".join(block.text for block in response.content if block.type == "text")
-        return LLMResult(
+            logger.warning(
+                "llm_output_truncated",
+                mode=mode,
+                model=deployment.model,
+                provider=deployment.provider,
+                max_tokens=MAX_TOKENS,
+            )
+        result = LLMResult(
             text=text,
-            model=self._model,
-            provider=self.name,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
+            model=deployment.model,
+            provider=deployment.provider,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             truncated=truncated,
+            fallback_used=fallback_used,
+            latency_ms=_elapsed_ms(start),
+        )
+        _log_completed(result, mode, finish_reason)
+        return result
+
+    def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
+        mode = "generate"
+        self._log_started(mode, messages)
+        start = time.perf_counter()
+        try:
+            response = self._router.completion(**self._request_kwargs(system, messages))
+            choices = getattr(response, "choices", None) or []
+            choice = choices[0] if choices else None
+            message = getattr(choice, "message", None)
+            text = getattr(message, "content", None) or ""
+            finish_reason = getattr(choice, "finish_reason", None)
+            usage = getattr(response, "usage", None)  # reported as 0 tokens when missing
+            input_tokens = (getattr(usage, "prompt_tokens", None) or 0) if usage else 0
+            output_tokens = (getattr(usage, "completion_tokens", None) or 0) if usage else 0
+        except Exception as exc:
+            raise self._fail(exc, mode, start, fragments=0) from exc
+        return self._finish(
+            mode=mode,
+            text=text,
+            model_id=_model_id(response),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            finish_reason=finish_reason,
+            start=start,
         )
 
     def stream(self, system: str, messages: Sequence[ChatMessage]) -> LLMStream:
@@ -407,82 +439,151 @@ class AnthropicProvider:
     def _stream(
         self, system: str, messages: Sequence[ChatMessage]
     ) -> Generator[str, None, LLMResult]:
-        # Raw events via `create(stream=True)` rather than the `messages.stream()` helper, so
-        # both providers follow the same "iterate events" scheme (design D3).
-        try:
-            response = self._client.messages.create(
-                **self._request_kwargs(system, messages), stream=True
-            )
-        except anthropic.AnthropicError as exc:
-            _log_sdk_error(self.name, exc)
-            raise LLMProviderError(provider=self.name) from exc
-
+        mode = "stream"
+        self._log_started(mode, messages)
+        start = time.perf_counter()
+        response = None
         parts: list[str] = []
         input_tokens = output_tokens = 0
-        truncated = False
+        finish_reason: str | None = None
+        model_id: str | None = None
         try:
-            for event in response:
-                if event.type == "message_start":
-                    input_tokens = event.message.usage.input_tokens
-                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
-                    if event.delta.text:
-                        parts.append(event.delta.text)
-                        yield event.delta.text
-                elif event.type == "message_delta":
-                    # Cumulative count: assign, do not add.
-                    output_tokens = event.usage.output_tokens
-                    if event.delta.stop_reason == "max_tokens":
-                        truncated = True
-                        _log_truncated(self.name, self._model)
-        except Exception as exc:  # anthropic does not wrap mid-stream transport errors (D3)
-            _log_sdk_error(self.name, exc)
-            raise LLMProviderError(provider=self.name) from exc
+            response = self._router.completion(
+                **self._request_kwargs(system, messages),
+                stream=True,
+                # Adds a final chunk with `usage` (and possibly empty `choices`).
+                stream_options={"include_usage": True},
+            )
+            for chunk in response:
+                # After a pre-first-chunk fallback, the Router stamps the fallback's
+                # hidden params on each chunk: the last chunk carrying an id wins.
+                model_id = _model_id(chunk) or model_id
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    input_tokens = getattr(usage, "prompt_tokens", None) or 0
+                    output_tokens = getattr(usage, "completion_tokens", None) or 0
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                choice = choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                delta = getattr(choice, "delta", None)
+                content = getattr(delta, "content", None)
+                # Empty fragments (e.g. the role-only first chunk) are skipped so the UI's
+                # time-to-first-fragment is real.
+                if content:
+                    parts.append(content)
+                    yield content
+        except Exception as exc:  # open and mid-stream failures alike (design D5, D6)
+            raise self._fail(exc, mode, start, fragments=len(parts)) from exc
         finally:
-            _close_stream(response)
+            # GeneratorExit (consumer stopped early) is a BaseException: it is not wrapped
+            # above and only runs this cleanup.
+            if response is not None:
+                _close(response)
 
-        return LLMResult(
+        return self._finish(
+            mode=mode,
             text="".join(parts),
-            model=self._model,
-            provider=self.name,
+            model_id=model_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            truncated=truncated,
+            finish_reason=finish_reason,
+            start=start,
         )
 
 
-def build_provider(name: str, settings: Settings) -> LLMProvider:
-    """Build a provider by name with its SDK client (no caching; no network at build time).
+class CachedProvider:
+    """Exact-match cache decorator over any `LLMProvider` (design D2, D8).
 
-    The active provider uses `settings.effective_model`; any other provider (e.g. a future
-    fallback) uses its default model.
+    Checks the cache, delegates on a miss and stores complete, non-truncated, non-blank
+    results. Sets the end-to-end `latency_ms`. With `cache=None` it only delegates.
     """
-    if name not in DEFAULT_MODELS:
-        raise ValueError(f"Unknown LLM provider: {name!r}")
-    model = settings.effective_model if name == settings.llm_provider else DEFAULT_MODELS[name]
-    if name == "openai":
-        key = settings.openai_api_key
-        if key is None:
-            raise ValueError("OPENAI_API_KEY is required to build the openai provider")
-        client = openai.OpenAI(
-            api_key=key.get_secret_value(), timeout=LLM_TIMEOUT_S, max_retries=LLM_MAX_RETRIES
-        )
-        return OpenAIProvider(client, model)
-    if name == "anthropic":
-        key = settings.anthropic_api_key
-        if key is None:
-            raise ValueError("ANTHROPIC_API_KEY is required to build the anthropic provider")
-        client = anthropic.Anthropic(
-            api_key=key.get_secret_value(), timeout=LLM_TIMEOUT_S, max_retries=LLM_MAX_RETRIES
-        )
-        return AnthropicProvider(client, model)
-    raise ValueError(f"Unknown LLM provider: {name!r}")  # unreachable while DEFAULT_MODELS matches
+
+    def __init__(self, inner: LLMProvider, cache: ResponseCache | None, key_model: str) -> None:
+        self._inner = inner
+        self._cache = cache
+        self._key_model = key_model
+
+    def _key(self, system: str, messages: Sequence[ChatMessage]) -> str:
+        # A params dict, so per-request knobs can be added later as extra fields.
+        params = {
+            "system": system,
+            "messages": [dict(m) for m in messages],
+            "model": self._key_model,
+            "max_tokens": MAX_TOKENS,
+        }
+        return cache_key(params)
+
+    def _hit_result(self, stored: dict) -> LLMResult:
+        return LLMResult(**stored, truncated=False, cache_hit=True)
+
+    def _store(self, cache: ResponseCache, key: str, result: LLMResult) -> None:
+        reason = "truncated" if result.truncated else "empty" if not result.text.strip() else None
+        if reason is not None:
+            logger.info("cache_skipped", reason=reason, key_prefix=key_prefix(key))
+            return
+        cache.set(key, asdict(result))
+
+    def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
+        start = time.perf_counter()
+        cache = self._cache
+        if cache is None:
+            return replace(self._inner.generate(system, messages), latency_ms=_elapsed_ms(start))
+        key = self._key(system, messages)
+        stored, available = cache.lookup(key)
+        if stored is not None:
+            result = replace(self._hit_result(stored), latency_ms=_elapsed_ms(start))
+            _log_completed(result, "generate", finish_reason=None)
+            return result
+        result = self._inner.generate(system, messages)
+        if available:  # skip the set when Redis already failed for this request
+            self._store(cache, key, result)
+        return replace(result, latency_ms=_elapsed_ms(start))
+
+    def stream(self, system: str, messages: Sequence[ChatMessage]) -> LLMStream:
+        return LLMStream(self._stream(system, messages))
+
+    def _stream(
+        self, system: str, messages: Sequence[ChatMessage]
+    ) -> Generator[str, None, LLMResult]:
+        start = time.perf_counter()
+        cache = self._cache
+        key, available = "", False
+        if cache is not None:
+            key = self._key(system, messages)
+            stored, available = cache.lookup(key)
+            if stored is not None:
+                hit = self._hit_result(stored)
+                if hit.text:
+                    yield hit.text  # replayed as a single fragment
+                result = replace(hit, latency_ms=_elapsed_ms(start))
+                _log_completed(result, "stream", finish_reason=None)
+                return result
+
+        inner = self._inner.stream(system, messages)
+        # Exceptions and GeneratorExit leave here, so an interrupted stream is never stored.
+        yield from inner
+        result = inner.result
+        if cache is not None and available:
+            self._store(cache, key, result)
+        return replace(result, latency_ms=_elapsed_ms(start))
+
+
+def build_provider(settings: Settings) -> LLMProvider:
+    """Compose the cache over the LiteLLM provider (no network at build time)."""
+    return CachedProvider(
+        LiteLLMProvider(build_router(settings), settings.primary, settings.fallback),
+        get_response_cache(),
+        settings.primary.model,
+    )
 
 
 @lru_cache
 def get_llm_provider() -> LLMProvider:
-    """Provider for the configured `LLM_PROVIDER`, built once per process (FastAPI dependency)."""
-    settings = get_settings()
-    return build_provider(settings.llm_provider, settings)
+    """Provider built once per process (FastAPI dependency and Streamlit)."""
+    return build_provider(get_settings())
 
 
 # --- Estimation use case ---------------------------------------------------------------
@@ -498,11 +599,14 @@ class EstimationResult:
     input_tokens: int
     output_tokens: int
     cost_usd: float | None
-    truncated: bool = False  # see LLMResult.truncated (design D3)
+    truncated: bool = False  # see LLMResult
+    fallback_used: bool = False
+    cache_hit: bool = False
+    latency_ms: int = 0
 
 
 def _to_estimation_result(result: LLMResult) -> EstimationResult:
-    """Single place where the estimated cost is computed."""
+    """Single place where the estimated cost is computed (from stored tokens on hits)."""
     return EstimationResult(
         text=result.text,
         model=result.model,
@@ -511,6 +615,9 @@ def _to_estimation_result(result: LLMResult) -> EstimationResult:
         output_tokens=result.output_tokens,
         cost_usd=estimate_cost(result.model, result.input_tokens, result.output_tokens),
         truncated=result.truncated,
+        fallback_used=result.fallback_used,
+        cache_hit=result.cache_hit,
+        latency_ms=result.latency_ms,
     )
 
 

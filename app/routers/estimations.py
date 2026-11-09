@@ -43,4 +43,7 @@ def estimate(
         output_tokens=result.output_tokens,
         cost_usd=result.cost_usd,
         truncated=result.truncated,
+        fallback_used=result.fallback_used,
+        cache_hit=result.cache_hit,
+        latency_ms=result.latency_ms,
     )

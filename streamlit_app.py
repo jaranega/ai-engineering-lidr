@@ -1,11 +1,11 @@
 """Streamlit chat UI: in-process client of the estimation service layer."""
 
-import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 import streamlit as st
+import structlog
 from pydantic import ValidationError
 
 from app.config import Settings, configure_logging, format_config_error, get_settings
@@ -22,7 +22,7 @@ from app.services.llm_service import (
     system_prompt_for,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 PROVIDER_ERROR_MESSAGE = "No se pudo generar la estimación. Inténtalo de nuevo en unos instantes."
 TRUNCATED_WARNING = (
@@ -42,12 +42,21 @@ class CallMetrics:
     ttft_s: float
     total_s: float
     truncated: bool
+    fallback_used: bool
+    cache_hit: bool
 
 
 def init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("last_metrics", None)
     st.session_state.setdefault("truncated_turns", set())
+
+
+def warn_fallback_disabled_once(settings: Settings) -> None:
+    """Log the disabled-fallback warning once per session, not on every rerun."""
+    if settings.fallback is None and not st.session_state.get("fallback_warning_logged"):
+        logger.warning("llm_fallback_disabled", reason=settings.fallback_disabled_reason)
+        st.session_state.fallback_warning_logged = True
 
 
 def load_config() -> tuple[Settings, LLMProvider]:
@@ -59,6 +68,7 @@ def load_config() -> tuple[Settings, LLMProvider]:
         st.error(format_config_error(exc))
         st.stop()
     configure_logging(settings)
+    warn_fallback_disabled_once(settings)
     return settings, provider
 
 
@@ -98,6 +108,8 @@ def build_metrics(result: EstimationResult, timings: dict[str, float]) -> CallMe
         ttft_s=timings["ttft_s"],
         total_s=timings["total_s"],
         truncated=result.truncated,
+        fallback_used=result.fallback_used,
+        cache_hit=result.cache_hit,
     )
 
 
@@ -121,7 +133,7 @@ def handle_user_message(text: str, provider: LLMProvider) -> None:
             st.error(PROVIDER_ERROR_MESSAGE)
             return
         if "ttft_s" not in timings or not str(reply).strip():
-            logger.warning("Empty LLM reply: provider=%s model=%s", result.provider, result.model)
+            logger.warning("empty_llm_reply", provider=result.provider, model=result.model)
             st.error(PROVIDER_ERROR_MESSAGE)
             return
     if result.truncated:
@@ -146,6 +158,8 @@ def render_metrics(metrics: CallMetrics | None) -> None:
     st.markdown(
         f"- Modelo: `{metrics.model}`\n"
         f"- Proveedor: `{metrics.provider}`\n"
+        f"- Respaldo: {'sí' if metrics.fallback_used else 'no'}\n"
+        f"- Desde caché: {'sí' if metrics.cache_hit else 'no'}\n"
         f"- Tokens de entrada: {metrics.input_tokens}\n"
         f"- Tokens de salida: {metrics.output_tokens}\n"
         f"- Tiempo total: {metrics.total_s:.2f} s\n"
@@ -161,12 +175,21 @@ def next_turn_system_prompt() -> str:
     return system_prompt_for([*st.session_state.messages, placeholder])
 
 
+def render_models(settings: Settings) -> None:
+    primary, fallback = settings.primary, settings.fallback
+    fallback_text = (
+        "Sin respaldo" if fallback is None else f"`{fallback.model}` (`{fallback.provider}`)"
+    )
+    st.markdown(
+        f"**Modelo primario:** `{primary.model}` (`{primary.provider}`)  \n"
+        f"**Modelo de respaldo:** {fallback_text}"
+    )
+
+
 def render_sidebar(settings: Settings) -> None:
     with st.sidebar:
         st.button("Nueva conversación", on_click=reset_conversation)
-        st.markdown(
-            f"**Proveedor:** `{settings.llm_provider}`  \n**Modelo:** `{settings.effective_model}`"
-        )
+        render_models(settings)
         render_metrics(st.session_state.last_metrics)
         st.subheader("Contexto CAG")
         with st.expander("System prompt del siguiente turno"):
