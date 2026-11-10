@@ -359,11 +359,8 @@ def test_response_is_shared_between_generate_and_stream(response_cache):
     """Requirement: Caché en streaming / Scenario: Compartida entre modos."""
     inner = FakeProvider(text="estimación de la API", fragments=["estimación de la API"])
     provider = cached(inner, response_cache)
-    # `EstimationService.estimate` sends the rendered system and one user message.
-    request = make_input()
-    EstimationService(provider).estimate(request)
-    system, user = render_estimation_prompt(request, "v1")
-    stream = provider.stream(system, [{"role": "user", "content": user}])
+    assert provider.generate(SYSTEM, MESSAGES).cache_hit is False
+    stream = provider.stream(SYSTEM, MESSAGES)
     assert "".join(stream) == "estimación de la API"
     assert stream.result.cache_hit is True
     assert inner.call_count == 1
@@ -489,15 +486,13 @@ def test_default_options_and_no_options_share_the_key():
     "options",
     [
         LLMCallOptions(max_tokens=4000),
-        LLMCallOptions(thinking_budget=2048),
-        LLMCallOptions(thinking_budget=4096),
         LLMCallOptions(model=HAIKU),
         LLMCallOptions(model=SAME_AS_PRIMARY),
     ],
-    ids=["max_tokens", "thinking_budget", "other-thinking_budget", "other-model", "same-model"],
+    ids=["max_tokens", "other-model", "same-model"],
 )
 def test_key_changes_with_each_call_option(options):
-    """Requirement: Caché / Scenario: Opciones distintas (max_tokens, thinking, modelo)."""
+    """Requirement: Caché / Scenario: Opciones distintas (max_tokens, modelo)."""
     assert key_with(options) != key_with(None)
 
 
@@ -512,15 +507,14 @@ def test_same_model_as_override_has_a_different_key_than_the_configured_primary(
 def test_key_changes_with_the_rendered_system_prompt_of_each_prompt_option():
     """Requirement: Caché / Scenario: Opciones distintas (prompt y ejemplos)."""
     variants = {
-        "base": ("v1", 3, {}),
-        "v2": ("v2", 3, {}),
-        "phases_table": ("v1", 3, {"output_format": "phases_table"}),
-        "narrative": ("v1", 3, {"output_format": "narrative"}),
-        "detailed": ("v1", 3, {"detail_level": "detailed"}),
-        "summary": ("v1", 3, {"detail_level": "summary"}),
-        "mobile_app": ("v1", 3, {"project_type": "mobile_app"}),
-        "one-example": ("v1", 1, {}),
-        "no-examples": ("v1", 0, {}),
+        "base": ("v3", 3, {}),
+        "phases_table": ("v3", 3, {"output_format": "phases_table"}),
+        "narrative": ("v3", 3, {"output_format": "narrative"}),
+        "detailed": ("v3", 3, {"detail_level": "detailed"}),
+        "summary": ("v3", 3, {"detail_level": "summary"}),
+        "mobile_app": ("v3", 3, {"project_type": "mobile_app"}),
+        "one-example": ("v3", 1, {}),
+        "no-examples": ("v3", 0, {}),
     }
     keys = {}
     for name, (version, count, overrides) in variants.items():
@@ -537,10 +531,9 @@ def test_key_changes_with_the_rendered_system_prompt_of_each_prompt_option():
     "other",
     [
         LLMCallOptions(max_tokens=100),
-        LLMCallOptions(thinking_budget=1024),
         LLMCallOptions(model=SAME_AS_PRIMARY),
     ],
-    ids=["max_tokens", "thinking_budget", "override-of-the-primary"],
+    ids=["max_tokens", "override-of-the-primary"],
 )
 def test_other_options_miss_and_identical_options_hit(response_cache, other):
     """Requirement: Caché / Scenarios: Segunda petición idéntica y Opciones distintas."""
@@ -585,11 +578,9 @@ def test_evaluation_is_not_part_of_the_key(response_cache):
     ("options", "overrides"),
     [
         (GenerationOptions(max_tokens=100), {}),
-        (GenerationOptions(thinking_budget=1024), {}),
         (GenerationOptions(num_examples=1), {}),
         (GenerationOptions(use_examples=False), {}),
         (GenerationOptions(model=MODEL), {}),
-        (GenerationOptions(prompt_version="v2"), {}),
         (GenerationOptions(), {"output_format": "phases_table"}),
         (GenerationOptions(), {"detail_level": "detailed"}),
         (GenerationOptions(), {"project_type": "mobile_app"}),
@@ -601,11 +592,9 @@ def test_evaluation_is_not_part_of_the_key(response_cache):
     ],
     ids=[
         "max_tokens",
-        "thinking_budget",
         "num_examples",
         "use_examples",
         "override-of-the-primary",
-        "prompt_version-v2",
         "output_format",
         "detail_level",
         "project_type",
@@ -642,6 +631,6 @@ def test_cache_hit_reports_the_prompt_version_of_the_current_request(response_ca
     inner = FakeProvider(model=MODEL)
     service = EstimationService(cached(inner, response_cache))
     request = make_input()
-    service.estimate(request, GenerationOptions(prompt_version="v1"))
-    hit = service.estimate(request, GenerationOptions(prompt_version="v1"))
-    assert (hit.cache_hit, hit.prompt_version) == (True, "v1")
+    service.estimate(request, GenerationOptions(prompt_version="v3"))
+    hit = service.estimate(request, GenerationOptions(prompt_version="v3"))
+    assert (hit.cache_hit, hit.prompt_version) == (True, "v3")

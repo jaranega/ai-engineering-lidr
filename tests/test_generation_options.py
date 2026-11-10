@@ -1,5 +1,5 @@
 """HTTP and service tests for the per-request generation options (spec: generation-options,
-estimation-api, cag-prompt and estimation-evaluation of `s04-add-typed-form-and-jinja-prompts`)."""
+estimation-api, cag-prompt and estimation-evaluation of the S04 structured-output change)."""
 
 import pytest
 from structlog.testing import capture_logs
@@ -17,8 +17,15 @@ from app.services.llm_service import (
     LLMCallOptions,
     LLMProviderError,
     LLMResult,
+    StructuredOutputError,
 )
-from tests.conftest import FakeProvider, example_estimates, make_input, make_settings, valid_body
+from tests.conftest import (
+    FakeProvider,
+    make_input,
+    make_settings,
+    out_of_scope_payload,
+    valid_body,
+)
 
 ESTIMATE = "/api/v1/estimate"
 HAIKU = Deployment("claude-haiku-4-5", "anthropic")
@@ -33,8 +40,9 @@ def call_options(provider: FakeProvider, index: int = 0) -> LLMCallOptions:
     return provider.options[index] or LLMCallOptions()
 
 
-def llm_result(text: str, **kwargs) -> LLMResult:
-    return FakeProvider(text=text, **kwargs).result
+def llm_result(**kwargs) -> LLMResult:
+    """`LLMResult` with the model, provider and token fields a `FakeProvider` reports."""
+    return FakeProvider(**kwargs).result
 
 
 # --- Requirement: Parámetros de generación por petición ---
@@ -45,14 +53,15 @@ def test_request_without_parameters_uses_the_defaults(client, provider):
     response = post(client)
     assert response.status_code == 200
     system, messages = provider.calls[0]
-    expected_system, expected_user = render_estimation_prompt(make_input(), "v1", num_examples=3)
+    expected_system, expected_user = render_estimation_prompt(make_input(), "v3", num_examples=3)
     assert system == expected_system
     for example in ESTIMATION_EXAMPLES:
         assert example["meeting_summary"] in system
     assert messages == [{"role": "user", "content": expected_user}]
     options = call_options(provider)
     assert options == LLMCallOptions()
-    assert (options.model, options.max_tokens, options.thinking_budget) == (None, 2048, None)
+    assert (options.model, options.max_tokens) == (None, 2048)
+    assert not hasattr(options, "thinking_budget")
     assert response.json()["validation"] is not None
     assert provider.call_count == 1
 
@@ -64,9 +73,6 @@ def test_request_without_parameters_uses_the_defaults(client, provider):
         ("num_examples", -1),
         ("max_tokens", 0),
         ("max_tokens", 16385),
-        ("thinking_budget", 500),
-        ("thinking_budget", 1023),
-        ("thinking_budget", 16385),
         ("model", ""),
         ("model", "m" * 101),
         ("evaluate", "quizá"),
@@ -89,13 +95,11 @@ def test_out_of_range_value_is_422_naming_the_field_without_calling_the_llm(
         {"num_examples": 3},
         {"max_tokens": 1},
         {"max_tokens": 16384},
-        {"thinking_budget": 1024},
-        {"thinking_budget": 16384},
         {"evaluate": False},
     ],
 )
 def test_limits_are_inclusive(client, provider, options):
-    """Requirement: Parámetros de generación (rangos 0..3, 1..16384 y 1024..16384 inclusivos)."""
+    """Requirement: Parámetros de generación (rangos 0..3 y 1..16384 inclusivos)."""
     assert post(client, **options).status_code == 200
     assert provider.call_count == 1
 
@@ -111,7 +115,7 @@ def test_no_examples_in_the_prompt(client, provider, options):
     system = provider.calls[0][0]
     assert "<examples>" not in system
     assert "Cómo usar las estimaciones de referencia" not in system
-    assert system.startswith("Write your entire answer")
+    assert system.startswith("Write every text field")
     for example in ESTIMATION_EXAMPLES:
         assert example["meeting_summary"] not in system
 
@@ -127,8 +131,13 @@ def test_num_examples_one_includes_only_the_first_example(client, provider):
 
 @pytest.mark.parametrize(
     "removed",
-    [{"preprocessing": "two_phase"}, {"example_format": "json"}, {"transcription": "texto viejo"}],
-    ids=["preprocessing", "example_format", "transcription"],
+    [
+        {"preprocessing": "two_phase"},
+        {"example_format": "json"},
+        {"thinking_budget": 2048},
+        {"transcription": "texto viejo"},
+    ],
+    ids=["preprocessing", "example_format", "thinking_budget", "transcription"],
 )
 def test_removed_fields_are_ignored(client, provider, removed):
     """Requirement: Parámetros de generación / Scenario: Campos retirados."""
@@ -139,25 +148,22 @@ def test_removed_fields_are_ignored(client, provider, removed):
     assert provider.call_count == 2  # one call each: no second phase
     assert provider.calls[1][0] == system_without
     assert provider.calls[1] == provider.calls[0]
+    assert provider.options[1] == provider.options[0]  # no `thinking` nor other new option
     assert set(response.json()) == set(baseline.json())
 
 
-def test_max_tokens_reaches_the_provider_and_a_cut_generation_is_truncated(client, provider):
-    """Requirement: Límite de salida por petición / Scenario: Límite pequeño."""
-    provider.result = llm_result("parcial", truncated=True)
-    response = post(client, max_tokens=50)
-    assert response.status_code == 200
+def test_max_tokens_reaches_the_provider(client, provider):
+    """Requirement: Parámetros de generación (max_tokens llega al proveedor)."""
+    assert post(client, max_tokens=50).status_code == 200
     assert call_options(provider).max_tokens == 50
-    body = response.json()
-    assert body["truncated"] is True
-    assert body["validation"]["finish_ok"] is False
 
 
-def test_thinking_budget_reaches_the_provider_options(client, provider):
-    """Requirement: Razonamiento extendido (el presupuesto llega al proveedor)."""
-    assert post(client, thinking_budget=2048, max_tokens=2048).status_code == 200
-    options = call_options(provider)
-    assert (options.thinking_budget, options.max_tokens) == (2048, 2048)
+def test_a_structured_output_cut_by_the_limit_is_a_502_not_a_truncated_200(client, provider):
+    """Requirement: Límites de la llamada (salida estructurada cortada = error de dominio)."""
+    provider.error = StructuredOutputError("openai", "truncated", 1)
+    response = post(client, max_tokens=50)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "LLM provider error"}
 
 
 # --- Requirement: Sobrescritura del modelo por petición ---
@@ -166,7 +172,7 @@ def test_thinking_budget_reaches_the_provider_options(client, provider):
 def test_model_override_from_another_provider(client, settings, provider):
     """Requirement: Sobrescritura del modelo / Scenario: Modelo de otro proveedor."""
     assert settings.primary.model == "gpt-4o"  # the override differs from the primary
-    provider.result = llm_result("ok", model="claude-haiku-4-5", provider="anthropic")
+    provider.result = llm_result(model="claude-haiku-4-5", provider="anthropic")
     response = post(client, model="claude-haiku-4-5")
     assert response.status_code == 200
     assert call_options(provider).model == HAIKU
@@ -241,12 +247,9 @@ def test_override_failure_is_a_generic_502_without_a_second_call(client, provide
 
 # --- Requirement: Evaluación (API) ---
 
-VALID_ESTIMATION = example_estimates("line_items")[0]
-
 
 def test_evaluate_true_returns_the_full_validation_object(client, provider):
     """Requirement: Resultado de la evaluación (campos de `validation`)."""
-    provider.result = llm_result(VALID_ESTIMATION)
     validation = post(client).json()["validation"]
     assert set(validation) == {
         "output_format",
@@ -268,6 +271,7 @@ def test_evaluate_true_returns_the_full_validation_object(client, provider):
         "issues",
     }
     assert validation["score"] == 1.0
+    assert validation["finish_ok"] is True
     assert validation["issues"] == []
     assert validation["output_format"] == "line_items"
     assert validation["checks_total"] == 8
@@ -275,11 +279,11 @@ def test_evaluate_true_returns_the_full_validation_object(client, provider):
 
 
 @pytest.mark.parametrize(
-    ("fmt", "total", "table"), [("phases_table", 8, True), ("narrative", 5, None)]
+    ("fmt", "total", "table"),
+    [("phases_table", 8, True), ("line_items", 8, True), ("narrative", 5, None)],
 )
 def test_validation_follows_the_requested_output_format(client, provider, fmt, total, table):
     """Requirement: Evaluación estructural (por output_format) / Resultado de la evaluación."""
-    provider.result = llm_result(example_estimates(fmt)[1])
     validation = post(client, output_format=fmt).json()["validation"]
     assert validation["output_format"] == fmt
     assert validation["checks_total"] == total
@@ -291,7 +295,6 @@ def test_validation_follows_the_requested_output_format(client, provider, fmt, t
 
 def test_estimation_evaluated_log_has_the_output_format(client, provider):
     """Requirement: Resultado de la evaluación (log con output_format, score e incidencias)."""
-    provider.result = llm_result(example_estimates("narrative")[0])
     with capture_logs() as logs:
         post(client, output_format="narrative")
     logged = [e for e in logs if e["event"] == "estimation_evaluated"]
@@ -300,19 +303,19 @@ def test_estimation_evaluated_log_has_the_output_format(client, provider):
     ]
 
 
-def test_unstructured_estimation_gets_a_partial_score_and_issues(client, provider):
-    """Requirement: Resultado de la evaluación (la respuesta lleva score e issues)."""
-    provider.result = llm_result("1. Diseño: 40 h\n2. Backend: 80 h")
-    validation = post(client).json()["validation"]
-    assert validation["score"] < 1.0
-    assert validation["has_breakdown_table"] is False
-    assert validation["hours_match"] is None
-    assert validation["issues"]
+def test_out_of_scope_estimation_has_null_validation_and_a_skipped_log(client, provider):
+    """Requirement: Evaluación del texto renderizado / Scenario: Fuera de alcance sin evaluación."""
+    provider.structured = out_of_scope_payload(confidence_pct=10)
+    with capture_logs() as logs:
+        body = post(client, evaluate=True).json()
+    assert body["validation"] is None
+    assert body["result"]["out_of_scope"] is True
+    skipped = [e for e in logs if e["event"] == "estimation_evaluated"]
+    assert [e["skipped"] for e in skipped] == ["out_of_scope"]
 
 
 def test_evaluate_false_returns_null_validation(client, provider):
     """Requirement: Evaluación estructural / Scenario: Evaluación desactivada."""
-    provider.result = llm_result(VALID_ESTIMATION)
     with capture_logs() as logs:
         response = post(client, evaluate=False)
     assert response.status_code == 200
@@ -322,33 +325,32 @@ def test_evaluate_false_returns_null_validation(client, provider):
 
 def test_evaluation_is_logged_with_score_and_issue_count_only(client, provider):
     """Requirement: Resultado de la evaluación (log `estimation_evaluated`)."""
-    provider.result = llm_result("1. Diseño: 40 h")
     with capture_logs() as logs:
         validation = post(client).json()["validation"]
     logged = [e for e in logs if e["event"] == "estimation_evaluated"]
     assert len(logged) == 1
     assert logged[0]["score"] == validation["score"]
     assert logged[0]["issues"] == len(validation["issues"])
-    assert "1. Diseño" not in str(logged[0])
+    assert "Clinic booking platform" not in str(logged[0])
 
 
-def test_cache_hit_is_evaluated_on_the_cached_text(client, response_cache):
+def test_cache_hit_is_evaluated_on_the_rendered_text(client, response_cache):
     """Requirement: Endpoint de estimación / Scenario: Estimación desde la caché."""
-    inner = FakeProvider(text=VALID_ESTIMATION, model="gpt-4o-mini")
+    inner = FakeProvider(model="gpt-4o-mini")
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: CachedProvider(
         inner, response_cache, "gpt-4o-mini"
     )
     first = post(client).json()
     second = post(client).json()
     assert (first["cache_hit"], second["cache_hit"]) == (False, True)
-    assert second["text"] == first["text"]
+    assert second["text"] == first["text"] and second["result"] == first["result"]
     assert second["validation"]["score"] == 1.0
     assert inner.call_count == 1
 
 
 def test_evaluate_false_after_a_cached_evaluated_request_is_still_a_hit(client, response_cache):
     """Requirement: Caché / Scenario: Evaluación fuera de la clave."""
-    inner = FakeProvider(text=VALID_ESTIMATION, model="gpt-4o-mini")
+    inner = FakeProvider(model="gpt-4o-mini")
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: CachedProvider(
         inner, response_cache, "gpt-4o-mini"
     )
@@ -367,10 +369,11 @@ def test_evaluate_false_after_a_cached_evaluated_request_is_still_a_hit(client, 
     [
         (GenerationOptions(max_tokens=0), "max_tokens"),
         (GenerationOptions(num_examples=4), "num_examples"),
-        (GenerationOptions(thinking_budget=10), "thinking_budget"),
         (GenerationOptions(model=""), "model"),
         (GenerationOptions(prompt_version="v9"), "prompt_version"),
-        (GenerationOptions(prompt_version="../v1"), "prompt_version"),
+        (GenerationOptions(prompt_version="../v3"), "prompt_version"),
+        (GenerationOptions(prompt_version="v1"), "prompt_version"),
+        (GenerationOptions(prompt_version="v2"), "prompt_version"),
     ],
 )
 def test_service_rejects_invalid_options_before_any_llm_call(fake_provider, options, field):
@@ -397,19 +400,19 @@ def test_service_turns_a_resolver_error_into_an_invalid_model_option(fake_provid
 def test_service_sends_system_and_a_single_user_message(fake_provider):
     """Requirement: Endpoint de estimación / Scenario: Mensajes separados (servicio)."""
     request = make_input(output_format="phases_table")
-    result = EstimationService(fake_provider).estimate(request, GenerationOptions("v2"))
-    system, user = render_estimation_prompt(request, "v2")
+    result = EstimationService(fake_provider).estimate(request, GenerationOptions("v3"))
+    system, user = render_estimation_prompt(request, "v3")
     assert fake_provider.calls == [(system, [{"role": "user", "content": user}])]
-    assert result.prompt_version == "v2"
+    assert result.prompt_version == "v3"
     assert result.validation is not None
 
 
 def test_service_logs_the_requested_event_without_content(fake_provider):
     """Requirement: Observabilidad (estimation_requested con los campos nuevos, sin contenido)."""
     with capture_logs() as logs:
-        EstimationService(fake_provider).estimate(make_input(), GenerationOptions("v2"))
+        EstimationService(fake_provider).estimate(make_input(), GenerationOptions("v3"))
     event = next(e for e in logs if e["event"] == "estimation_requested")
-    assert event["prompt_version"] == "v2"
+    assert event["prompt_version"] == "v3"
     assert event["output_format"] == "line_items"
     assert event["detail_level"] == "medium"
     assert event["project_type"] == "web_saas"

@@ -41,6 +41,10 @@ NOISY_LOGGERS = ("httpx", "httpcore", "openai")
 # LiteLLM's own loggers can include provider response bodies in error messages.
 LITELLM_LOGGERS = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
 
+# Instructor logs every failed attempt at ERROR with the exception text, which includes
+# the invalid values (model output that may echo the description) or provider bodies.
+INSTRUCTOR_LOGGER = "instructor"
+
 
 @dataclass(frozen=True)
 class Deployment:
@@ -73,8 +77,15 @@ class Settings(BaseSettings):
     fallback_model: str | None = None  # unset: other provider default; blank: disabled
     llm_timeout: int = Field(default=60, gt=0)
     llm_retries: int = Field(default=2, ge=0)
+    structured_max_retries: int = Field(default=2, ge=0, le=5)
+    moderation_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"
     cache_ttl: int = Field(default=86400, gt=0)
+    max_conversation_turns: int = Field(default=6, ge=1, le=50)
+    max_sessions: int = Field(default=1000, ge=1, le=100_000)
+    max_attachments: int = Field(default=5, ge=0, le=20)
+    max_attachment_bytes: int = Field(default=10_485_760, ge=1024, le=52_428_800)
+    max_attachment_chars: int = Field(default=60_000, ge=1000, le=200_000)
     app_env: str = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "DEBUG"
 
@@ -216,3 +227,5 @@ def configure_logging(settings: Settings) -> None:
         ll_logger.handlers = []
         ll_logger.setLevel(logging.CRITICAL)
         ll_logger.propagate = False
+
+    logging.getLogger(INSTRUCTOR_LOGGER).setLevel(logging.CRITICAL)

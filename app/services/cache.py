@@ -1,4 +1,5 @@
-"""Exact-match response cache in Redis (design D8).
+"""Exact-match response cache in Redis (design D8; structured entries: S04 structured
+output design D7).
 
 Knows only plain dicts and Redis: the LLM types live in `llm_service`, which depends on
 this module and never the other way round.
@@ -27,16 +28,19 @@ KEY_PREFIX = "estimator:llm:v1:"
 # add seconds to every request while Redis is down.
 REDIS_TIMEOUT_S = 0.2
 
-# Value fields; `cache_hit` and `latency_ms` belong to each request, and truncated
-# responses are never stored, so none of them is persisted.
-_VALUE_FIELDS: dict[str, type | tuple[type, ...]] = {
-    "text": str,
+# Value fields common to both kinds of entry; `cache_hit` and `latency_ms` belong to
+# each request, and truncated responses are never stored, so none of them is persisted.
+_COMMON_FIELDS: dict[str, type] = {
     "model": str,
     "provider": str,
     "input_tokens": int,
     "output_tokens": int,
     "fallback_used": bool,
 }
+# Payload: a text generation stores `text`; a structured one stores the validated object
+# as a JSON dict in `value`, plus its `attempts` (structured output design D7).
+_TEXT_FIELDS: dict[str, type] = {"text": str}
+_STRUCTURED_FIELDS: dict[str, type] = {"value": dict, "attempts": int}
 
 # Number of hash characters logged to correlate events without exposing the full key.
 _KEY_PREFIX_CHARS = 12
@@ -97,7 +101,8 @@ class ResponseCache:
 
     def set(self, key: str, value: Mapping[str, Any]) -> None:
         """Store the value with SET ... EX and the configured TTL; no-op if Redis fails."""
-        data = {name: value[name] for name in _VALUE_FIELDS}
+        payload = _STRUCTURED_FIELDS if "value" in value else _TEXT_FIELDS
+        data = {name: value[name] for name in (*_COMMON_FIELDS, *payload)}
         try:
             self._client.set(key, json.dumps(data, ensure_ascii=False), ex=self._ttl)
         except redis.RedisError as exc:
@@ -133,12 +138,14 @@ def _decode(raw: object) -> dict[str, Any] | None:
         return None
     if not isinstance(value, dict):
         return None
-    for name, expected in _VALUE_FIELDS.items():
+    payload = _STRUCTURED_FIELDS if "value" in value else _TEXT_FIELDS
+    fields = {**_COMMON_FIELDS, **payload}
+    for name, expected in fields.items():
         field = value.get(name)
         # bool is a subclass of int: reject it for token counts.
         if not isinstance(field, expected) or (expected is int and isinstance(field, bool)):
             return None
-    return {name: value[name] for name in _VALUE_FIELDS}
+    return {name: value[name] for name in fields}
 
 
 def build_redis_client(url: str) -> redis.Redis:

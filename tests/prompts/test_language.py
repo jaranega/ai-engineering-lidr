@@ -11,8 +11,8 @@ from tests.conftest import make_input
 
 SAMPLES = Path(__file__).parents[2] / "samples"
 DETECTED = {
-    "en": "The project description is in English: write the entire estimate in English",
-    "es": "The project description is in Spanish: write the entire estimate in Spanish",
+    "en": 'The project description is in English: set `language` to "en"',
+    "es": 'The project description is in Spanish: set `language` to "es"',
 }
 SPANISH_REFERENCES = [
     {
@@ -76,5 +76,7 @@ def test_spanish_references_do_not_change_the_detected_language():
 def test_ambiguous_description_keeps_only_the_generic_rule():
     description = "CRM ERP SaaS API OAuth Stripe Kafka dashboards KPIs integration"
     system, _ = render_estimation_prompt(make_input(description=description))
-    assert system.endswith("if the project description is in English, answer entirely in English.")
+    assert system.endswith(
+        "if the project description is in English, write them entirely in English."
+    )
     assert all(line not in system for line in DETECTED.values())

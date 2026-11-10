@@ -26,12 +26,31 @@ REQUIRED_FILES = [
     "app/prompts/__init__.py",
     "app/prompts/loader.py",
     "app/prompts/language.py",
-    "app/prompts/estimation/v1/system.j2",
-    "app/prompts/estimation/v1/user.j2",
-    "app/prompts/estimation/v1/examples.j2",
-    "app/prompts/estimation/v2/system.j2",
-    "app/prompts/estimation/v2/user.j2",
-    "app/prompts/estimation/v2/examples.j2",
+    "app/prompts/estimation/v3/system.j2",
+    "app/prompts/estimation/v3/user.j2",
+    "app/prompts/estimation/v3/examples.j2",
+    "app/prompts/estimation/v4/system.j2",
+    "app/prompts/estimation/v4/user.j2",
+    "app/prompts/estimation/v4/examples.j2",
+    "app/prompts/estimation/v4/project_metadata.j2",
+    "app/routers/sessions.py",
+    "app/services/session_service.py",
+    "app/sessions/__init__.py",
+    "app/sessions/models.py",
+    "app/sessions/store.py",
+    "app/sessions/metadata.py",
+    "app/attachments/__init__.py",
+    "app/attachments/extractor.py",
+    "app/estimation/__init__.py",
+    "app/estimation/schema.py",
+    "app/estimation/compute.py",
+    "app/estimation/render.py",
+    "app/estimation/examples.py",
+    "app/guardrails/__init__.py",
+    "app/guardrails/input.py",
+    "app/services/moderation.py",
+    "app/services/cache.py",
+    "app/schemas.py",
     "streamlit_app.py",
     ".env.example",
     ".gitignore",
@@ -77,6 +96,20 @@ FORBIDDEN_OUTSIDE_SERVICES = {"litellm", "redis", "openai", "anthropic"}
         "app/prompts/__init__.py",
         "app/prompts/loader.py",
         "app/prompts/language.py",
+        "app/estimation/__init__.py",
+        "app/estimation/schema.py",
+        "app/estimation/compute.py",
+        "app/estimation/render.py",
+        "app/estimation/examples.py",
+        "app/guardrails/__init__.py",
+        "app/guardrails/input.py",
+        "app/routers/sessions.py",
+        "app/sessions/__init__.py",
+        "app/sessions/models.py",
+        "app/sessions/store.py",
+        "app/sessions/metadata.py",
+        "app/attachments/__init__.py",
+        "app/attachments/extractor.py",
         "streamlit_app.py",
     ],
 )
@@ -99,13 +132,123 @@ def test_only_services_and_config_import_litellm_and_redis():
 
 
 def test_openai_and_anthropic_sdks_are_not_used_anywhere_in_the_app():
-    """Design D1: the SDK adapters were removed; the app never imports the vendor SDKs."""
+    """Design D1: the SDK adapters were removed; the app never imports the vendor SDKs.
+
+    The only exception is `app/services/moderation.py`, which builds the OpenAI client with a
+    short timeout that `litellm.moderation` accepts as `client` (structured output design D8).
+    """
+    allowed = {"app/services/moderation.py": {"openai"}}
+    offenders = []
+    for path in [*(REPO_ROOT / "app").rglob("*.py"), REPO_ROOT / "streamlit_app.py"]:
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        used = _imported_roots(path) & {"openai", "anthropic"}
+        if used - allowed.get(relative, set()):
+            offenders.append(relative)
+    assert offenders == []
+
+
+def test_instructor_is_only_imported_by_the_services_layer():
+    """Design D6: Instructor stays in `app/services` (the schema never depends on it)."""
     offenders = [
         path.relative_to(REPO_ROOT).as_posix()
-        for path in [*(REPO_ROOT / "app").rglob("*.py"), REPO_ROOT / "streamlit_app.py"]
-        if _imported_roots(path) & {"openai", "anthropic"}
+        for path in (REPO_ROOT / "app").rglob("*.py")
+        if "instructor" in _imported_roots(path)
+        and not path.relative_to(REPO_ROOT).as_posix().startswith("app/services/")
     ]
     assert offenders == []
+
+
+def _imported_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            modules.add(node.module)
+    return modules
+
+
+@pytest.mark.parametrize(
+    "package", ["app/estimation", "app/guardrails"], ids=["estimation", "guardrails"]
+)
+def test_estimation_and_guardrails_never_import_services_or_prompts(package):
+    """Tasks 5.4: `estimation` and `guardrails` have no cycles with `services` / `prompts`."""
+    for path in (REPO_ROOT / package).glob("*.py"):
+        modules = _imported_modules(path)
+        assert not {
+            m for m in modules if m.startswith(("app.services", "app.prompts", "app.routers"))
+        }, path.name
+
+
+def test_estimation_package_depends_only_on_domain_context_and_itself():
+    """Design D4: layer rules of `app/estimation`."""
+    for path in (REPO_ROOT / "app/estimation").glob("*.py"):
+        internal = {m for m in _imported_modules(path) if m == "app" or m.startswith("app.")}
+        assert all(
+            m.startswith(("app.domain", "app.context", "app.estimation")) for m in internal
+        ), (path.name, internal)
+
+
+def test_guardrails_input_imports_nothing_from_the_app():
+    """Design D8: `app/guardrails/input.py` is pure stdlib."""
+    internal = {
+        m
+        for m in _imported_modules(REPO_ROOT / "app/guardrails/input.py")
+        if m == "app" or m.startswith("app.")
+    }
+    assert internal == set()
+
+
+def test_prompts_folder_has_v3_and_v4_with_their_templates():
+    """prompt-templates / Scenario: Estructura de las versiones (v3 y v4)."""
+    base = REPO_ROOT / "app/prompts/estimation"
+    folders = {p.name for p in base.iterdir() if p.is_dir() and p.name != "__pycache__"}
+    assert folders == {"v3", "v4"}
+    assert {p.name for p in (base / "v3").iterdir()} == {"system.j2", "user.j2", "examples.j2"}
+    assert {p.name for p in (base / "v4").iterdir()} == {
+        "system.j2",
+        "user.j2",
+        "examples.j2",
+        "project_metadata.j2",
+    }
+
+
+@pytest.mark.parametrize("package", ["app/sessions", "app/attachments"])
+def test_sessions_and_attachments_do_not_import_services_llm_or_instructor(package):
+    """ci-pipeline / Scenario: Capas sin dependencias del LLM."""
+    for path in (REPO_ROOT / package).glob("*.py"):
+        modules = _imported_modules(path)
+        assert not {m for m in modules if m.startswith(("app.services", "app.prompts"))}, path.name
+        assert not _imported_roots(path) & {"litellm", "instructor", "fastapi"}, path.name
+
+
+def test_attachments_package_never_imports_fastapi_nor_services():
+    """attachments / Requirement: Tipos admitidos (la extracción no importa FastAPI)."""
+    for path in (REPO_ROOT / "app/attachments").glob("*.py"):
+        assert "fastapi" not in _imported_roots(path)
+        assert not {m for m in _imported_modules(path) if m.startswith("app.services")}
+
+
+def test_session_prompt_versions_are_a_single_list_matching_the_folders():
+    """prompt-templates / Scenario: Versiones publicadas."""
+    from app.prompts.loader import PUBLISHED_PROMPT_VERSIONS
+
+    base = REPO_ROOT / "app/prompts/estimation"
+    folders = {p.name for p in base.iterdir() if p.is_dir() and p.name != "__pycache__"}
+    assert folders == set(PUBLISHED_PROMPT_VERSIONS)
+
+
+def test_retired_prompt_versions_and_thinking_are_gone():
+    """Specs REMOVED: Versión v2 y Razonamiento extendido."""
+    from app import schemas
+    from app.services.llm_service import GenerationOptions, LLMCallOptions
+
+    base = REPO_ROOT / "app/prompts/estimation"
+    assert not (base / "v1").exists() and not (base / "v2").exists()
+    assert "thinking_budget" not in GenerationOptions.__dataclass_fields__
+    assert "thinking_budget" not in LLMCallOptions.__dataclass_fields__
+    assert "thinking_budget" not in schemas.EstimationRequest.model_fields
 
 
 def test_provider_adapters_of_the_sdks_are_gone():

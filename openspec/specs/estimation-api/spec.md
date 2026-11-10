@@ -1,15 +1,15 @@
 # estimation-api Specification
 
 ## Purpose
-Exponer por HTTP la generación de estimaciones a partir de la descripción tipada de un proyecto, con la versión del prompt seleccionable, junto con el health check y la documentación OpenAPI del servicio.
+Exponer por HTTP la generación de estimaciones a partir de la descripción tipada de un proyecto, con la versión del prompt seleccionable, guardrails de entrada y salida estructurada con importes calculados en el código, junto con el health check y la documentación OpenAPI del servicio.
 ## Requirements
 ### Requirement: Endpoint de estimación
-El sistema SHALL exponer `POST /api/v1/estimate`, que recibe la descripción tipada de un proyecto y, opcionalmente, parámetros de generación, renderiza el prompt con la versión pedida (capability `prompt-templates`) y devuelve la estimación generada por el LLM.
+El sistema SHALL exponer `POST /api/v1/estimate`, que recibe la descripción tipada de un proyecto y, opcionalmente, parámetros de generación, comprueba la entrada con los guardrails (capability `input-guardrails`), renderiza el prompt con la versión pedida (capability `prompt-templates`), obtiene del LLM un `EstimationResult` validado (capabilities `llm-provider` y `structured-estimation`), calcula los importes y totales en el código y devuelve la estimación con su texto renderizado por el servidor.
 
 Query:
 | Parámetro | Tipo | Reglas |
 |---|---|---|
-| `prompt_version` | `"v1" \| "v2"` | opcional, por defecto `"v1"`; otro valor da 422 con `loc = ["query", "prompt_version"]` |
+| `prompt_version` | `"v3"` | opcional, por defecto `"v3"`; otro valor (incluidos `"v1"` y `"v2"`) da 422 con `loc = ["query", "prompt_version"]` |
 
 Request (`application/json`, schema `EstimationRequest`):
 | Campo | Tipo | Reglas |
@@ -19,7 +19,7 @@ Request (`application/json`, schema `EstimationRequest`):
 | `detail_level` | `"summary" \| "medium" \| "detailed"` | obligatorio |
 | `output_format` | `"phases_table" \| "line_items" \| "narrative"` | obligatorio |
 | `reference_projects` | `array` de `ReferenceProject` \| `null` | opcional, como máximo 5 elementos; `[]` equivale a `null` |
-| `num_examples`, `use_examples`, `model`, `max_tokens`, `thinking_budget`, `evaluate` | ver capability `generation-options` | opcionales |
+| `num_examples`, `use_examples`, `model`, `max_tokens`, `evaluate` | ver capability `generation-options` | opcionales |
 
 `ReferenceProject` (no admite campos adicionales):
 | Campo | Tipo | Reglas |
@@ -32,37 +32,45 @@ Request (`application/json`, schema `EstimationRequest`):
 Response `200` (`application/json`, schema `EstimationResponse`):
 | Campo | Tipo |
 |---|---|
-| `text` | `string` (Markdown) |
+| `text` | `string` (Markdown renderizado por el servidor a partir de `result`) |
+| `result` | `ComputedEstimate` (capability `structured-estimation`: el objeto validado con costes, totales y `out_of_scope`) |
 | `prompt_version` | `string` (versión del prompt efectivamente renderizada) |
 | `model` | `string` (modelo efectivo: el que respondió, primario, respaldo o el pedido en `model`) |
 | `provider` | `string` (proveedor del modelo efectivo: `openai` o `anthropic`) |
-| `input_tokens` | `integer` |
-| `output_tokens` | `integer` |
+| `input_tokens` | `integer` (suma de todos los intentos) |
+| `output_tokens` | `integer` (suma de todos los intentos) |
 | `cost_usd` | `number \| null` |
-| `truncated` | `boolean` (`true` si la estimación se cortó por el límite de tokens) |
+| `truncated` | `boolean` (siempre `false` en una respuesta 200: una salida estructurada cortada es un 502) |
 | `fallback_used` | `boolean` (`true` si respondió el modelo de respaldo) |
 | `cache_hit` | `boolean` (`true` si la estimación vino de la caché) |
-| `latency_ms` | `integer` (tiempo total en el servidor desde que se recibe la petición hasta que se tiene la respuesta, incluida la evaluación, en milisegundos) |
-| `validation` | objeto de la capability `estimation-evaluation` \| `null` (si `evaluate = false`) |
+| `latency_ms` | `integer` (tiempo total en el servidor desde que se recibe la petición hasta que se tiene la respuesta, incluidos los guardrails, el render y la evaluación, en milisegundos) |
+| `validation` | objeto de la capability `estimation-evaluation` \| `null` (si `evaluate = false` o la estimación está fuera de alcance) |
 
-El servicio MUST enviar al LLM el system prompt y el mensaje `user` renderizados como dos mensajes separados (`system` y `user`), sin concatenarlos.
+Response `400` (`{"detail": {"reason", "message"}}`): entrada bloqueada por un guardrail (capability `input-guardrails`).
+
+El servicio MUST enviar al LLM el system prompt y el mensaje `user` renderizados como dos mensajes separados (`system` y `user`), sin concatenarlos. Los guardrails MUST ejecutarse antes de la caché y del LLM.
 
 #### Scenario: Estimación correcta
 - **GIVEN** un modelo primario disponible y la caché vacía
 - **WHEN** se hace POST a `/api/v1/estimate` con `{"description": "<descripción de 20 a 2000 caracteres>", "project_type": "web_saas", "detail_level": "medium", "output_format": "line_items"}`
-- **THEN** la respuesta es 200 con todos los campos del contrato, `prompt_version = "v1"`, `model`/`provider` son los del modelo primario, `truncated`, `fallback_used` y `cache_hit` son `false`, `latency_ms` es mayor o igual que 0 y `validation` no es `null`
+- **THEN** la respuesta es 200 con todos los campos del contrato, `prompt_version = "v3"`, `result.total_cost_eur` igual a la suma de los costes de `result.rows`, `text` con la tabla de partidas, `model`/`provider` del modelo primario, `truncated`, `fallback_used` y `cache_hit` `false`, `latency_ms` mayor o igual que 0 y `validation` no `null`
 
 #### Scenario: Mensajes separados
 - **WHEN** se hace POST a `/api/v1/estimate` con un body válido
 - **THEN** el proveedor recibe el system prompt renderizado como `system` y una conversación con un único mensaje `user` igual al `user` renderizado
 
-#### Scenario: Versión del prompt
-- **WHEN** se hace POST a `/api/v1/estimate?prompt_version=v2` con un body válido
-- **THEN** la respuesta es 200 con `prompt_version = "v2"` y el system prompt enviado es el de `v2`
-
-#### Scenario: Versión desconocida
-- **WHEN** se hace POST a `/api/v1/estimate?prompt_version=v9`
+#### Scenario: Versión retirada
+- **WHEN** se hace POST a `/api/v1/estimate?prompt_version=v1` o `?prompt_version=v9`
 - **THEN** la respuesta es 422 con `loc = ["query", "prompt_version"]` y no se llama al LLM
+
+#### Scenario: Entrada bloqueada
+- **WHEN** se hace POST a `/api/v1/estimate` con una descripción que contiene un email
+- **THEN** la respuesta es 400 con `detail.reason = "pii"` y no se consulta la caché ni se llama al LLM
+
+#### Scenario: Fuera de alcance
+- **GIVEN** un LLM que devuelve `confidence_pct = 15`
+- **WHEN** se hace POST a `/api/v1/estimate` con un body válido
+- **THEN** la respuesta es 200 con `result.out_of_scope = true`, totales 0, un `text` con el aviso de fuera de alcance y `validation = null`
 
 #### Scenario: Estimación servida por el respaldo
 - **GIVEN** un modelo primario que falla y un respaldo disponible
@@ -72,12 +80,12 @@ El servicio MUST enviar al LLM el system prompt y el mensaje `user` renderizados
 #### Scenario: Estimación desde la caché
 - **GIVEN** que el mismo body con la misma versión ya se estimó y la caché está disponible
 - **WHEN** se hace POST a `/api/v1/estimate` con ese body
-- **THEN** la respuesta es 200 con el mismo `text`, `cache_hit = true`, el `prompt_version` de la petición y `validation` calculada sobre ese texto, sin llamar al LLM
+- **THEN** la respuesta es 200 con el mismo `result` y el mismo `text`, `cache_hit = true`, el `prompt_version` de la petición y `validation` calculada sobre ese texto, sin llamar al LLM
 
-#### Scenario: Estimación truncada
-- **GIVEN** un proveedor que corta la generación por el límite de tokens
+#### Scenario: Salida inválida o truncada
+- **GIVEN** un LLM que devuelve un objeto inválido en todos los intentos, o una salida cortada por el límite de tokens
 - **WHEN** se hace POST a `/api/v1/estimate` con un body válido
-- **THEN** la respuesta es 200 con el texto recibido, `truncated = true` y `validation.finish_ok = false`
+- **THEN** la respuesta es 502 con el `detail` genérico
 
 #### Scenario: Descripción fuera de límites
 - **WHEN** el body no incluye `description`, o esta tiene menos de 20 caracteres (o solo espacios) o más de 2000 tras recortar
@@ -101,7 +109,7 @@ El servicio MUST enviar al LLM el system prompt y el mensaje `user` renderizados
 
 #### Scenario: Errores documentados
 - **WHEN** se consulta `/openapi.json`
-- **THEN** la operación `POST /api/v1/estimate` documenta las respuestas 200, 422 y 502, el query param `prompt_version` con sus valores, los enums con sus valores y los campos opcionales del request con sus límites
+- **THEN** la operación `POST /api/v1/estimate` documenta las respuestas 200, 400, 422 y 502, el query param `prompt_version` con su único valor `v3`, los enums con sus valores, el schema de `result` y los campos opcionales del request con sus límites
 
 ### Requirement: Health check
 El sistema SHALL exponer `GET /health`, que responde 200 con `{"status": "ok", "env": <APP_ENV>, "primary_model": <PRIMARY_MODEL>, "fallback_model": <FALLBACK_MODEL, o null si está vacío o no tiene key>, "cache": "ok" | "unavailable"}`, sin llamar al LLM. El estado de la caché MUST comprobarse con una operación ligera de Redis con timeout corto, y un Redis caído MUST NOT cambiar el código 200.

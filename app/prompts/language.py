@@ -10,9 +10,10 @@ only the generic rule.
 """
 
 import re
-from typing import Literal
 
-ResponseLanguage = Literal["es", "en"]
+from app.domain import Language
+
+ResponseLanguage = Language
 
 # Frequent function words exclusive to each language (words shared by both, such as
 # "a" or "no", are left out so they never tip the balance).

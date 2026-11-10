@@ -1,0 +1,21 @@
+{#
+  Project metadata partial, v4 (S05 design D5). Facts agreed in previous turns of the
+  session, derived in code from the structured estimates (never by an extra LLM call).
+  English keys, one `key: value` line per field with a value; on the first turn the block
+  is empty. Values come from earlier model output and are printed verbatim: the rules
+  tell the model to treat the block as data. A partial so per-tier templates can reuse it.
+#}
+<project_metadata>
+{% if project_metadata.project_name %}
+project_name: {{ project_metadata.project_name }}
+{% endif %}
+{% if project_metadata.assumed_team_size is not none %}
+assumed_team_size: {{ project_metadata.assumed_team_size }}
+{% endif %}
+{% if project_metadata.mentioned_technologies %}
+mentioned_technologies: {{ project_metadata.mentioned_technologies | join(", ") }}
+{% endif %}
+{% if project_metadata.agreed_scope %}
+agreed_scope: {{ project_metadata.agreed_scope }}
+{% endif %}
+</project_metadata>

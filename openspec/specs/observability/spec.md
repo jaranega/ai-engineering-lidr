@@ -63,3 +63,37 @@ Ningún log del sistema, de la aplicación o de las librerías de terceros con e
 - **WHEN** se registra el fallo
 - **THEN** ningún log contiene `sk-test-visible-value`
 
+### Requirement: Eventos de los guardrails y de la salida estructurada
+El sistema SHALL registrar, sin contenido de la petición ni de la respuesta: `input_guardrail_blocked` (`reason`, `field`, `rule`), `moderation_checked` (`flagged`, número de textos, `latency_ms` y, si se marca, solo los nombres de las categorías), `moderation_failed` (`error_type`, `status_code`), `moderation_disabled` una vez al construir el moderador (`reason`: `config` o `no_openai_key`), `structured_output_retry` (`attempt`, número de errores, `error_locs` con las rutas de campo y el tipo de error, y `coherence_errors` con los mensajes fijos de los validadores de coherencia del schema; nunca el mensaje de Pydantic de un campo, que incluye valores), `structured_output_failed` (`reason`, `attempts`), `llm_call_started`/`llm_call_completed` con `mode = "structured"` y `attempts`, `cache_entry_invalid`, `estimation_out_of_scope` (`confidence_pct`) y `estimation_rendered` (`output_format`, `language`, `language_source` `detected` o `llm`).
+
+#### Scenario: Reintento sin valores
+- **GIVEN** una descripción con `DESCRIPCION-SECRETA-123` y un LLM que devuelve primero un objeto inválido que la repite
+- **WHEN** se genera la estimación
+- **THEN** se registra `structured_output_retry` y ningún log contiene `DESCRIPCION-SECRETA-123`
+
+#### Scenario: Moderación sin contenido
+- **GIVEN** una moderación que marca la descripción `TEXTO-MARCADO-789`
+- **WHEN** se procesa la petición
+- **THEN** se registran `moderation_checked` con `flagged = true` e `input_guardrail_blocked`, y ningún log contiene `TEXTO-MARCADO-789`
+
+### Requirement: Eventos de sesión y de adjuntos
+El sistema SHALL registrar, sin contenido: `session_created` (`session`, `sessions` con el total en el almacén), `session_evicted` (`session`, `turn_count`, `idle_s`), `session_not_found` (`session`), `session_busy` (`session`), `session_turn_completed` (`session`, `turn`, `history_messages` con los mensajes del historial enviados al LLM antes del nuevo `user`, `history_turns`, `attachments` con el número de adjuntos, `out_of_scope`, `language`, `metadata_updated`, `metadata_fields` con los nombres de los campos con valor y `technologies` con su número), `attachment_extracted` (`index`, `kind`, `size_bytes`, `chars`, `pages`), `attachment_rejected` (`index`, `reason` y, si se conocen, `kind`, `size_bytes` y `error_type`), `attachment_pii_masked` (`index` y los recuentos `email`, `phone` e `iban`, solo si hay alguno) y `estimation_requested` con `mode = "session"`, `attachments` e `history_messages`. El campo `session` MUST ser solo los 8 primeros caracteres del `session_id`, nunca el id completo. Durante un turno, todos los eventos (incluidos `llm_call_*`, `prompt_rendered` e `input_guardrail_blocked`) MUST llevar el campo `session`. Ningún evento MUST contener la transcripción, el texto ni el nombre de los adjuntos, los valores del `project_metadata`, los mensajes del historial ni el `session_id` completo.
+
+#### Scenario: Turno registrado
+- **GIVEN** una sesión con un turno previo
+- **WHEN** se completa un segundo turno con un adjunto
+- **THEN** se registran `attachment_extracted` con `index = 0` y `session_turn_completed` con `turn = 2`, `history_messages = 2` y `attachments = 1`, y `llm_call_completed` lleva el campo `session`
+
+#### Scenario: Sin contenido en los logs
+- **GIVEN** `LOG_LEVEL=DEBUG`, una transcripción con `TRANSCRIPCION-SECRETA-123` y un PDF llamado `NOMBRE-SECRETO.pdf` cuyo texto contiene `PDF-SECRETO-456`
+- **WHEN** se completa el turno y se envía un segundo turno a la misma sesión
+- **THEN** ningún log contiene `TRANSCRIPCION-SECRETA-123`, `NOMBRE-SECRETO`, `PDF-SECRETO-456` ni el `session_id` completo
+
+#### Scenario: Adjunto rechazado
+- **WHEN** se envía un PDF cifrado como segundo adjunto
+- **THEN** se registra `attachment_rejected` con `index = 1` y `reason = "encrypted"`, sin el nombre del fichero
+
+#### Scenario: Enmascarado registrado
+- **WHEN** se envía un adjunto con dos emails
+- **THEN** se registra `attachment_pii_masked` con `email = 2` y sin los emails
+

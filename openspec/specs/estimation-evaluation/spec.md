@@ -85,6 +85,19 @@ La evaluación SHALL leer importes y horas en formato español e inglés: ignora
 - **THEN** `score = 0.8`
 
 #### Scenario: Ejemplos de referencia
-- **WHEN** se evalúa la estimación de cada ejemplo de `ESTIMATION_EXAMPLES` renderizada por `examples.j2` en cada `output_format`
+- **WHEN** se evalúa el texto de cada ejemplo de `ESTIMATION_EXAMPLES` renderizado por `render_markdown` en cada `output_format`, nivel e idioma
 - **THEN** todas obtienen `score = 1.0`
+
+### Requirement: Evaluación del texto renderizado
+La evaluación SHALL aplicarse al `text` que renderiza el servidor a partir del resultado estructurado (también en los aciertos de caché), con las mismas comprobaciones por formato. Si la estimación está fuera de alcance (`result.out_of_scope = true`), `validation` MUST ser `null` y MUST registrarse `estimation_evaluated` con `skipped = "out_of_scope"`, porque un aviso sin tablas ni totales no se puede puntuar.
+
+#### Scenario: Estimación en alcance
+- **GIVEN** un LLM que devuelve un resultado válido en alcance
+- **WHEN** se hace POST a `/api/v1/estimate` con `evaluate = true`
+- **THEN** `validation.score = 1.0` y `validation.finish_ok = true`
+
+#### Scenario: Fuera de alcance sin evaluación
+- **GIVEN** un LLM que devuelve `confidence_pct = 10`
+- **WHEN** se hace POST a `/api/v1/estimate` con `evaluate = true`
+- **THEN** `validation = null` y el log contiene `estimation_evaluated` con `skipped = "out_of_scope"`
 

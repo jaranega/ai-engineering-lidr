@@ -279,64 +279,7 @@ def test_provider_resolution_matches_the_router_model_prefix():
     assert litellm.get_llm_provider("anthropic/claude-haiku-4-5")[0] == "claude-haiku-4-5"
 
 
-# --- Change s02-add-generation-knobs-and-evaluation: thinking and model override ---
-
-THINKING = {"type": "enabled", "budget_tokens": 2048}
-
-
-def test_openai_deployment_params_drop_thinking_instead_of_failing():
-    """Requirement: Razonamiento extendido / Scenario: Fallback a OpenAI con thinking (contrato).
-
-    Without `additional_drop_params`, LiteLLM raises `UnsupportedParamsError` for OpenAI;
-    `build_router` sets it on the OpenAI deployments, so an Anthropic primary that falls back
-    to OpenAI answers without thinking.
-    """
-    from app.config import Deployment
-    from app.services.llm_service import _router_deployment
-    from tests.conftest import make_settings
-
-    settings = make_settings()
-    params = _router_deployment("primary", Deployment("gpt-4o-mini", "openai"), settings)[
-        "litellm_params"
-    ]
-    kwargs = {"model": "gpt-4o-mini", "custom_llm_provider": "openai", "thinking": THINKING}
-    with pytest.raises(litellm.UnsupportedParamsError):
-        litellm.get_optional_params(**kwargs, max_tokens=4096)
-    optional = litellm.get_optional_params(
-        **kwargs, max_tokens=4096, additional_drop_params=params["additional_drop_params"]
-    )
-    assert "thinking" not in optional
-    assert optional["max_tokens"] == 4096
-
-
-def test_anthropic_accepts_thinking_with_the_summed_limit():
-    """Requirement: Razonamiento extendido / Scenario: Thinking con Anthropic (contrato)."""
-    optional = litellm.get_optional_params(
-        model="claude-haiku-4-5",
-        custom_llm_provider="anthropic",
-        thinking=THINKING,
-        max_tokens=4096,
-    )
-    assert optional["thinking"] == THINKING
-    assert optional["max_tokens"] == 4096
-
-
-def test_anthropic_primary_with_thinking_falls_back_to_openai_without_failing(make_provider):
-    """Requirement: Razonamiento extendido / Scenario: Fallback a OpenAI con thinking."""
-    from app.services.llm_service import LLMCallOptions
-
-    provider = make_provider(
-        primary="litellm.InternalServerError",
-        fallback="respuesta del respaldo OpenAI",
-        primary_model="claude-haiku-4-5",
-        fallback_model="gpt-4o-mini",
-    )
-    result = provider.generate(
-        SYSTEM, MESSAGES, LLMCallOptions(max_tokens=2048, thinking_budget=2048)
-    )
-    assert result.text == "respuesta del respaldo OpenAI"
-    assert result.fallback_used is True
-    assert (result.model, result.provider) == ("gpt-4o-mini", "openai")
+# --- Model override ---
 
 
 def test_override_is_answered_by_its_own_router_with_the_requested_model(make_provider):
@@ -370,3 +313,25 @@ def test_override_failure_does_not_fall_back_with_the_real_router(make_provider)
         list(provider.stream(SYSTEM, MESSAGES, options))
     # Without the override, the same provider does fall back (control).
     assert provider.generate(SYSTEM, MESSAGES).fallback_used is True
+
+
+# --- generate_structured ---
+
+
+def test_generate_structured_through_the_real_router(make_provider):
+    """Requirement: Generación estructurada (Router real de LiteLLM 1.106.x con `tools`).
+
+    `litellm.completion` imports its MCP handler whenever `tools` is present, and that handler
+    needs the optional `mcp` package; the provider must skip it (`_skip_mcp_handler`). A fake
+    Router never reaches that code, so only this contract test guards it.
+    """
+    from app.estimation.schema import response_model_for
+    from tests.conftest import valid_payload
+    from tests.test_structured_provider import tool_response
+
+    model = response_model_for("line_items", "medium")
+    provider = make_provider(primary=tool_response(valid_payload()))
+    result = provider.generate_structured(SYSTEM, MESSAGES, model)
+    assert result.value.model_dump() == model.model_validate(valid_payload()).model_dump()
+    assert result.attempts == 1
+    assert result.fallback_used is False
