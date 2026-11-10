@@ -10,7 +10,7 @@ Es el "Proyecto 1" del programa AI Engineering de LIDR y **evoluciona sesión a 
 | Sesión | Hito | Rama |
 |---|---|---|
 | S02 | Scaffolding FastAPI + arquitectura **CAG** (contexto estático en el prompt), `POST /api/v1/estimate`, `GET /health`, CI | `session-02` |
-| S03 | Cliente Streamlit (`streamlit_app.py`: chat multi-turno + streaming, in-process sobre `app/services`); en directo: wrapper de proveedores con fallback, caché exact-match, logging con structlog | `session-03` |
+| S03 | Cliente Streamlit (`streamlit_app.py`: chat multi-turno + streaming, in-process sobre `app/services`); en directo (puesta al día en `pre-session-04`): LiteLLM con fallback, caché exact-match en Redis, structlog, SSE y Docker | `session-03` |
 | S04 | Formulario tipado (Pydantic + enums), prompts Jinja2 versionados (`prompts/estimation/v1/`), tests de templates | `pre-session-04` / `session-04` |
 | S05+ | Contexto dinámico, memoria, prompts adaptativos, evaluación, RAG… | — |
 
@@ -70,7 +70,8 @@ Naming de changes: `sNN-<verbo>-<qué>` en kebab-case (p. ej. `s02-add-cag-estim
 
 - **Python 3.12** (mínimo 3.11), gestor **uv** (`uv add`, `uv run`; nunca `pip install`).
 - **FastAPI** + **uvicorn**, **Pydantic v2** y **pydantic-settings** para configuración desde `.env`.
-- Proveedores LLM: **OpenAI** (`gpt-4o-mini`) y **Anthropic** (`claude-haiku-4-5`), seleccionables con `LLM_PROVIDER`. Usar SDKs oficiales (`openai`, `anthropic`).
+- Proveedores LLM: **OpenAI** (`gpt-4o-mini`) y **Anthropic** (`claude-haiku-4-5`) vía **LiteLLM** (`litellm==1.106.4`, fijada), con modelo primario (`PRIMARY_MODEL`) y de respaldo (`FALLBACK_MODEL`). Solo `app/services` y `app/config.py` importan LiteLLM; no se usan los SDK directamente.
+- Caché exact-match en **Redis** (`REDIS_URL`, opcional) y logs con **structlog** (`structlog.get_logger(__name__)`); nunca se registran transcripciones, prompts, respuestas ni keys.
 - Calidad: **ruff** (lint + format) y **pytest**. Los tests **nunca** llaman a APIs reales (LLM mockeado).
 - CI: **GitHub Actions** en cada push/PR → `uv sync`, `ruff check`, `ruff format --check`, `pytest`, `openspec validate --all --strict`.
 
@@ -81,7 +82,7 @@ app/
 ├── main.py          # FastAPI app, routers, /health
 ├── config.py        # Settings (BaseSettings) + get_settings()
 ├── routers/         # HTTP: validación de entrada/salida, sin lógica de negocio
-├── services/        # Lógica de negocio: construcción de prompt y llamada al LLM
+├── services/        # Lógica de negocio: prompt, proveedor LiteLLM con fallback, caché Redis, coste
 └── context/         # Datos estáticos inyectados en el prompt (CAG)
 ```
 
@@ -94,6 +95,8 @@ app/
 ```bash
 uv sync                                   # instalar dependencias
 uv run uvicorn app.main:app --reload      # arrancar servidor (Swagger en /docs)
+uv run streamlit run streamlit_app.py     # UI (cliente HTTP de la API)
+docker compose up --build -d              # API + Redis en Docker
 uv run pytest                             # tests
 uv run ruff check . && uv run ruff format --check .
 openspec list / openspec validate --all --strict

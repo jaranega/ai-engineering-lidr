@@ -1,5 +1,7 @@
 """Unit tests for EstimationService (use case over the `llm-provider` interface)."""
 
+from dataclasses import replace
+
 import pytest
 
 from app.services.llm_service import (
@@ -19,7 +21,9 @@ def test_estimate_returns_result_with_cost(fake_provider_cls):
         text="out", model="gpt-4o-mini", input_tokens=1000, output_tokens=500
     )
     result = EstimationService(provider).estimate("transcript")
-    assert result == EstimationResult(
+    # Validation is on by default, so the result also carries the structural check.
+    assert result.validation is not None
+    assert replace(result, latency_ms=0, validation=None) == EstimationResult(
         text="out",
         model="gpt-4o-mini",
         provider="openai",

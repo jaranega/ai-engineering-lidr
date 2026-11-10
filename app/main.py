@@ -1,31 +1,35 @@
 """FastAPI application: routers, health check and fail-fast startup."""
 
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import structlog
 from fastapi import Depends, FastAPI
 from pydantic import ValidationError
 
 from app.config import Settings, configure_logging, format_config_error, get_settings
 from app.routers import estimations
+from app.schemas import HealthResponse
+from app.services.cache import ResponseCache, get_response_cache
 from app.services.llm_service import get_llm_provider
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         settings = get_settings()
-        get_llm_provider()
     except ValidationError as exc:
         message = format_config_error(exc)
-        logging.basicConfig(level=logging.ERROR)
-        logger.error(message)
+        configure_logging(Settings.model_construct(app_env="development", log_level="INFO"))
+        logger.error("config_invalid", message=message)
         raise RuntimeError(message) from None
     configure_logging(settings)
+    get_llm_provider()
+    if settings.fallback is None:
+        logger.warning("llm_fallback_disabled", reason=settings.fallback_disabled_reason)
     yield
 
 
@@ -39,11 +43,16 @@ app = FastAPI(
 app.include_router(estimations.router, prefix="/api/v1")
 
 
-@app.get("/health", tags=["health"], summary="Health check")
-def health(settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, str]:
-    return {
-        "status": "ok",
-        "env": settings.app_env,
-        "provider": settings.llm_provider,
-        "model": settings.effective_model,
-    }
+@app.get("/health", tags=["health"], summary="Health check", response_model=HealthResponse)
+def health(
+    settings: Annotated[Settings, Depends(get_settings)],
+    cache: Annotated[ResponseCache | None, Depends(get_response_cache)],
+) -> HealthResponse:
+    fallback = settings.fallback
+    return HealthResponse(
+        status="ok",
+        env=settings.app_env,
+        primary_model=settings.primary.model,
+        fallback_model=fallback.model if fallback else None,
+        cache="ok" if cache is not None and cache.ping() else "unavailable",
+    )
