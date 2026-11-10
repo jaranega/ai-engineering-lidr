@@ -227,6 +227,55 @@ jq -Rs '{transcription: .}' samples/reserva-restaurantes-en.txt \
   | curl -s -X POST http://localhost:8000/api/v1/estimate -H 'Content-Type: application/json' -d @- | jq
 ```
 
+### Formato de la estimación
+
+La estimación se devuelve en el idioma de la transcripción (etiquetas traducidas) con esta estructura. Las tarifas están fijadas en el prompt: **62,50 EUR/h** desarrollo, QA, despliegue y gestión, y **50 EUR/h** diseño UX/UI. Las horas van en múltiplos de 5, el coste de cada fila es horas × tarifa y los totales son la suma de las filas; los importes no llevan separador de miles.
+
+```markdown
+## Estimación: Integración Shopify-Odoo y reporting de ventas
+
+### Desglose de tareas
+| Tarea | Horas | Coste (EUR) |
+|---|---|---|
+| Análisis de las APIs y mapeo de datos (pedidos, clientes, productos) | 15 | 937,50 |
+| Sincronización de pedidos y clientes Shopify → Odoo (webhooks) | 30 | 1875 |
+| … | … | … |
+
+### Totales
+- **Total de horas:** 125
+- **Coste total:** 7812,50 EUR
+- **Equipo recomendado:** 1 desarrollador backend con experiencia en integraciones
+- **Duración estimada:** 4-5 semanas
+
+### Supuestos y riesgos
+- …
+```
+
+### Parámetros de generación
+
+`POST /api/v1/estimate` acepta, además de `transcription`, estos campos opcionales. Sin ellos la llamada es la de siempre (modelo primario con fallback, 2048 tokens, 3 ejemplos en Markdown). El SSE y el chat usan siempre los valores por defecto.
+
+| Campo | Valores | Por defecto | Efecto |
+|---|---|---|---|
+| `preprocessing` | `none` \| `inline_cleaning` \| `two_phase` | `none` | `inline_cleaning` añade al system prompt instrucciones para limpiar la transcripción; `two_phase` hace antes una llamada que extrae los requisitos y estima sobre ellos |
+| `example_format` | `markdown` \| `json` \| `narrative` | `markdown` | Cómo se inyectan los ejemplos CAG (la salida es siempre Markdown) |
+| `num_examples` | 0–3 | 3 | Cuántos ejemplos se incluyen (los primeros) |
+| `use_examples` | booleano | `true` | `false` equivale a `num_examples = 0` |
+| `model` | modelo de OpenAI o Anthropic con key configurada | — | Sustituye al modelo de la petición, **sin fallback**; 422 si no es válido |
+| `max_tokens` | 1–16384 | 2048 | Límite de salida |
+| `thinking_budget` | 1024–16384 | — | Razonamiento extendido, solo Anthropic (`max_tokens` efectivo = `max_tokens + thinking_budget`); con OpenAI se ignora y se avisa en el log |
+| `evaluate` | booleano | `true` | Ejecuta la evaluación estructural (`validation`) |
+
+```bash
+# Dos fases con ejemplos en JSON
+jq -Rs '{transcription: ., preprocessing: "two_phase", example_format: "json"}' samples/landing-hubspot-blog.txt \
+  | curl -s -X POST http://localhost:8000/api/v1/estimate -H 'Content-Type: application/json' -d @- | jq
+
+# Haiku con razonamiento extendido y sin ejemplos
+jq -Rs '{transcription: ., model: "claude-haiku-4-5", thinking_budget: 2048, use_examples: false}' samples/reserva-restaurantes-en.txt \
+  | curl -s -X POST http://localhost:8000/api/v1/estimate -H 'Content-Type: application/json' -d @- | jq '.validation'
+```
+
 ### Streaming (SSE)
 
 `POST /api/v1/estimate/stream` recibe la conversación completa (mensajes `user`/`assistant` alternos, empezando y terminando por `user`, cada uno de 1 a 20 000 caracteres tras recortar) y responde `text/event-stream`:
@@ -262,19 +311,47 @@ Ejemplo ilustrativo de la forma de la respuesta (los valores son de muestra, no 
   "truncated": false,
   "fallback_used": false,
   "cache_hit": false,
-  "latency_ms": 5400
+  "latency_ms": 5400,
+  "preprocessing": "none",
+  "extracted_requirements": null,
+  "preprocessing_input_tokens": 0,
+  "preprocessing_output_tokens": 0,
+  "preprocessing_cost_usd": null,
+  "validation": {
+    "has_title": true,
+    "has_breakdown_table": true,
+    "has_totals": true,
+    "has_team": true,
+    "has_duration": true,
+    "rows_parsed": 8,
+    "declared_total_hours": 125,
+    "sum_row_hours": 125,
+    "hours_match": true,
+    "declared_total_cost": 7812.5,
+    "sum_row_cost": 7812.5,
+    "cost_match": true,
+    "finish_ok": true,
+    "score": 1.0,
+    "issues": []
+  }
 }
 ```
 
-`cost_usd` es aproximado y vale `null` si el modelo no tiene precio conocido. `model` y `provider` son los **efectivos**: el modelo configurado (sin prefijo) del despliegue que respondió, primario o respaldo (`fallback_used`). `cache_hit` indica que la respuesta vino de la caché (sin llamar al LLM; tokens y coste son los de la generación original). `latency_ms` es el tiempo en el servidor. `truncated` vale `true` si la estimación se cortó por el límite de tokens de salida (2048); en ese caso el texto llega incompleto.
+`cost_usd` es aproximado y vale `null` si el modelo no tiene precio conocido. `model` y `provider` son los **efectivos**: el modelo configurado (sin prefijo) del despliegue que respondió, primario, respaldo (`fallback_used`) o el pedido en `model`. `cache_hit` indica que la respuesta vino de la caché (sin llamar al LLM; tokens y coste son los de la generación original). `latency_ms` es el tiempo total en el servidor, incluidas la fase previa y la evaluación. `truncated` vale `true` si la estimación se cortó por el límite de tokens de salida (`max_tokens`, 2048 por defecto); en ese caso el texto llega incompleto.
+
+Tokens y coste se refieren a la llamada de estimación. Con `two_phase`, la extracción de requisitos se informa aparte (`extracted_requirements` y `preprocessing_*`) y **no** se suma a `cost_usd`.
+
+`validation` (o `null` con `evaluate=false`) es una evaluación estructural sin LLM: comprueba título, tabla de desglose, totales, equipo y duración (etiquetas en español o inglés), que las horas de las filas sumen el total declarado (±1 h) y los costes también (±2 %), y que la respuesta no esté truncada. `score` es la fracción de las 8 comprobaciones superadas e `issues` describe las que fallan.
+
+**Limitación conocida**: gpt-4o-mini suele declarar totales de horas y coste que no coinciden con la suma de las filas (en la verificación manual, en casi todas las respuestas), así que su `score` típico es 0,75–0,875; con `claude-haiku-4-5` cuadran (`score` 1,0). Es justo lo que la evaluación debe hacer visible; los totales no se recalculan en el servidor para no cambiar el contrato.
 
 ### Códigos de estado
 
 | Código | Cuándo |
 |---|---|
 | 200 | Estimación generada |
-| 422 | Entrada inválida: falta `transcription`, está vacía (tras recortar espacios) o supera los 20 000 caracteres |
-| 502 | Fallan el primario y el respaldo (error de red, autenticación, límite de uso, etc.) |
+| 422 | Entrada inválida: falta `transcription`, está vacía (tras recortar espacios) o supera los 20 000 caracteres; un parámetro de generación fuera de rango; o `model` desconocido, de otro proveedor o sin key configurada |
+| 502 | Fallan el primario y el respaldo (error de red, autenticación, límite de uso, etc.), falla el modelo pedido en `model` o falla la fase previa de `two_phase` |
 
 ## Tests y calidad
 
@@ -296,10 +373,22 @@ Puesta al día con la rama del directo (`session_3_live`), con estas diferencias
 - **502 genérico** sin detalles del proveedor (la referencia devuelve 500 con el mensaje del error) y `cost_usd = null` para modelos sin precio (la referencia devuelve 0).
 - **Caché más estricta**: no guarda respuestas truncadas, vacías ni streams interrumpidos, y el streaming conserva tokens y coste.
 - **Key obligatoria del primario** (la referencia exige al menos una) y respaldo opcional.
-- Sin sobrescritura del modelo por petición (llega en un change posterior).
 - **SSE con historial multi-turno** y evento final `metrics` (la referencia solo recibe la transcripción y no envía métricas); evento `error` genérico; sin página de demo HTML ni CORS; Streamlit fuera del compose, como en la referencia; Redis sin persistencia y puertos en `127.0.0.1`.
 
-Detalle: [`openspec/changes/archive/2026-11-09-s03-add-llm-wrapper-cache-logging`](openspec/changes/archive/2026-11-09-s03-add-llm-wrapper-cache-logging/) y [`openspec/changes/s03-add-sse-streaming-and-docker`](openspec/changes/s03-add-sse-streaming-and-docker/).
+Detalle: [`openspec/changes/archive/2026-11-09-s03-add-llm-wrapper-cache-logging`](openspec/changes/archive/2026-11-09-s03-add-llm-wrapper-cache-logging/) y [`openspec/changes/archive/2026-11-10-s03-add-sse-streaming-and-docker`](openspec/changes/archive/2026-11-10-s03-add-sse-streaming-and-docker/).
+
+### S02 (directo: parámetros de generación y evaluación)
+
+Puesta al día con lo que la rama `session_3_live` trae del directo de S02, con estas diferencias:
+
+- **Idioma de la transcripción** en la respuesta, con etiquetas traducidas; la evaluación reconoce las etiquetas en español y en inglés (la referencia, solo en inglés).
+- **`model` validado**: solo modelos de OpenAI o Anthropic con key configurada (422 si no) y sin fallback; en la referencia cualquier nombre llega a LiteLLM.
+- **502 genérico** también en la fase previa de `two_phase`, y `cost_usd = null` para modelos sin precio.
+- **Coste de la fase previa por separado**, sin sumarlo a `cost_usd`.
+- Un único formato de salida (estructurado, con coste); sin el interruptor de prompt básico de la referencia.
+- Sin ejemplos (`num_examples = 0`) el prompt omite también la sección que explica cómo usarlos.
+
+Detalle: [`openspec/changes/archive/2026-11-10-s02-add-generation-knobs-and-evaluation`](openspec/changes/archive/2026-11-10-s02-add-generation-knobs-and-evaluation/).
 
 ### S03 (interfaz Streamlit)
 

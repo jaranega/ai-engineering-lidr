@@ -277,3 +277,96 @@ def test_provider_resolution_matches_the_router_model_prefix():
     assert litellm.get_llm_provider("gpt-4o-mini")[1] == "openai"
     assert litellm.get_llm_provider("claude-haiku-4-5")[1] == "anthropic"
     assert litellm.get_llm_provider("anthropic/claude-haiku-4-5")[0] == "claude-haiku-4-5"
+
+
+# --- Change s02-add-generation-knobs-and-evaluation: thinking and model override ---
+
+THINKING = {"type": "enabled", "budget_tokens": 2048}
+
+
+def test_openai_deployment_params_drop_thinking_instead_of_failing():
+    """Requirement: Razonamiento extendido / Scenario: Fallback a OpenAI con thinking (contrato).
+
+    Without `additional_drop_params`, LiteLLM raises `UnsupportedParamsError` for OpenAI;
+    `build_router` sets it on the OpenAI deployments, so an Anthropic primary that falls back
+    to OpenAI answers without thinking.
+    """
+    from app.config import Deployment
+    from app.services.llm_service import _router_deployment
+    from tests.conftest import make_settings
+
+    settings = make_settings()
+    params = _router_deployment("primary", Deployment("gpt-4o-mini", "openai"), settings)[
+        "litellm_params"
+    ]
+    kwargs = {"model": "gpt-4o-mini", "custom_llm_provider": "openai", "thinking": THINKING}
+    with pytest.raises(litellm.UnsupportedParamsError):
+        litellm.get_optional_params(**kwargs, max_tokens=4096)
+    optional = litellm.get_optional_params(
+        **kwargs, max_tokens=4096, additional_drop_params=params["additional_drop_params"]
+    )
+    assert "thinking" not in optional
+    assert optional["max_tokens"] == 4096
+
+
+def test_anthropic_accepts_thinking_with_the_summed_limit():
+    """Requirement: Razonamiento extendido / Scenario: Thinking con Anthropic (contrato)."""
+    optional = litellm.get_optional_params(
+        model="claude-haiku-4-5",
+        custom_llm_provider="anthropic",
+        thinking=THINKING,
+        max_tokens=4096,
+    )
+    assert optional["thinking"] == THINKING
+    assert optional["max_tokens"] == 4096
+
+
+def test_anthropic_primary_with_thinking_falls_back_to_openai_without_failing(make_provider):
+    """Requirement: Razonamiento extendido / Scenario: Fallback a OpenAI con thinking."""
+    from app.services.llm_service import LLMCallOptions
+
+    provider = make_provider(
+        primary="litellm.InternalServerError",
+        fallback="respuesta del respaldo OpenAI",
+        primary_model="claude-haiku-4-5",
+        fallback_model="gpt-4o-mini",
+    )
+    result = provider.generate(
+        SYSTEM, MESSAGES, LLMCallOptions(max_tokens=2048, thinking_budget=2048)
+    )
+    assert result.text == "respuesta del respaldo OpenAI"
+    assert result.fallback_used is True
+    assert (result.model, result.provider) == ("gpt-4o-mini", "openai")
+
+
+def test_override_is_answered_by_its_own_router_with_the_requested_model(make_provider):
+    """Requirement: Sobrescritura del modelo / Scenario: Modelo de otro proveedor (Router real)."""
+    from app.config import Deployment
+    from app.services.llm_service import LLMCallOptions
+
+    provider = make_provider(primary="respuesta del override", fallback="no debe llamarse")
+    options = LLMCallOptions(model=Deployment("claude-haiku-4-5", "anthropic"))
+    result = provider.generate(SYSTEM, MESSAGES, options)
+    assert result.text == "respuesta del override"
+    assert (result.model, result.provider, result.fallback_used) == (
+        "claude-haiku-4-5",
+        "anthropic",
+        False,
+    )
+
+
+def test_override_failure_does_not_fall_back_with_the_real_router(make_provider):
+    """Requirement: Sobrescritura del modelo / Scenario: Override sin fallback (Router real)."""
+    from app.config import Deployment
+    from app.services.llm_service import LLMCallOptions
+
+    provider = make_provider(
+        primary="litellm.InternalServerError", fallback="el respaldo no debe llamarse"
+    )
+    options = LLMCallOptions(model=Deployment("claude-haiku-4-5", "anthropic"))
+    with pytest.raises(LLMProviderError):
+        provider.generate(SYSTEM, MESSAGES, options)
+    with pytest.raises(LLMProviderError):
+        list(provider.stream(SYSTEM, MESSAGES, options))
+    # Without the override, the same provider does fall back (control).
+    assert provider.generate(SYSTEM, MESSAGES).fallback_used is True

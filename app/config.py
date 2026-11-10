@@ -50,18 +50,17 @@ class Deployment:
     provider: str
 
 
-def _resolve(var: str, model: str) -> Deployment:
+def _resolve(var: str, model: str, subject: str | None = None) -> Deployment:
+    subject = subject or f"{var}={model!r}"
     supported = ", ".join(sorted(_KEY_VARS))
     try:
         name, provider, _, _ = resolve_litellm_provider(model=model)
     except Exception:
         raise ValueError(
-            f"{var}={model!r} is not a recognized model. Supported providers: {supported}."
+            f"{subject} is not a recognized model. Supported providers: {supported}."
         ) from None
     if provider not in _KEY_VARS:
-        raise ValueError(
-            f"{var}={model!r} uses provider {provider!r}. Supported providers: {supported}."
-        )
+        raise ValueError(f"{subject} uses provider {provider!r}. Supported providers: {supported}.")
     return Deployment(model=name, provider=provider)
 
 
@@ -128,6 +127,16 @@ class Settings(BaseSettings):
         """Return the raw API key of a provider (for building LLM clients only)."""
         key = self._key(provider)
         return key.get_secret_value() if key else None
+
+    def resolve_request_model(self, name: str) -> Deployment:
+        """Resolve a per-request model override; raises ValueError if unusable."""
+        name = name.strip()
+        deployment = _resolve("model", name, subject=f"model {name!r}")
+        if self._key(deployment.provider) is None:
+            raise ValueError(
+                f"model {name!r} requires {_KEY_VARS[deployment.provider]}, which is not defined."
+            )
+        return deployment
 
     @property
     def primary(self) -> Deployment:

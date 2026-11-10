@@ -8,14 +8,17 @@ import pytest
 import redis
 from structlog.testing import capture_logs
 
-from app.config import get_settings
+from app.config import Deployment, get_settings
 from app.services import cache as cache_module
+from app.services import llm_service
 from app.services.cache import KEY_PREFIX, ResponseCache, build_redis_client, cache_key
 from app.services.llm_service import (
     MAX_TOKENS,
     CachedProvider,
     ChatMessage,
     EstimationService,
+    GenerationOptions,
+    LLMCallOptions,
     LLMProviderError,
 )
 from tests.conftest import FakeProvider
@@ -465,3 +468,138 @@ def test_redis_down_does_not_leak_connection_error_message(down_cache):
         "op",
         "error_type",
     }
+
+
+# --- Change s02-add-generation-knobs-and-evaluation: options in the key (response-cache delta) ---
+
+HAIKU = Deployment("claude-haiku-4-5", "anthropic")
+SAME_AS_PRIMARY = Deployment(MODEL, "openai")
+
+
+def key_with(options: LLMCallOptions | None, system: str = SYSTEM, model: str = MODEL) -> str:
+    return CachedProvider(FakeProvider(), None, model)._key(system, MESSAGES, options)
+
+
+def test_default_options_and_no_options_share_the_key():
+    """Requirement: Caché exact-match (sin opciones = valores por defecto)."""
+    assert key_with(None) == key_with(LLMCallOptions()) == key_for()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        LLMCallOptions(max_tokens=4000),
+        LLMCallOptions(thinking_budget=2048),
+        LLMCallOptions(thinking_budget=4096),
+        LLMCallOptions(model=HAIKU),
+        LLMCallOptions(model=SAME_AS_PRIMARY),
+    ],
+    ids=["max_tokens", "thinking_budget", "other-thinking_budget", "other-model", "same-model"],
+)
+def test_key_changes_with_each_call_option(options):
+    """Requirement: Caché / Scenario: Opciones distintas (max_tokens, thinking, modelo)."""
+    assert key_with(options) != key_with(None)
+
+
+def test_same_model_as_override_has_a_different_key_than_the_configured_primary():
+    """Requirement: Caché / Scenario: Opciones distintas (`model` = primario, como override)."""
+    # Same model name, but an override has no fallback: the response must not be shared.
+    override = LLMCallOptions(model=SAME_AS_PRIMARY)
+    assert key_with(override) != key_with(None)
+    assert key_with(override) == key_with(LLMCallOptions(model=SAME_AS_PRIMARY))
+
+
+def test_key_changes_with_the_system_prompt_of_each_example_format_and_preprocessing():
+    """Requirement: Caché / Scenario: Opciones distintas (formato, preprocesado, ejemplos)."""
+    prompts = {
+        "markdown": llm_service._system_prompt(3, "markdown"),
+        "json": llm_service._system_prompt(3, "json"),
+        "narrative": llm_service._system_prompt(3, "narrative"),
+        "cleaning": llm_service._system_prompt(3, "markdown", True),
+        "one-example": llm_service._system_prompt(1, "markdown"),
+        "no-examples": llm_service._system_prompt(0, "markdown"),
+    }
+    keys = {name: key_with(None, system=system) for name, system in prompts.items()}
+    assert len(set(keys.values())) == len(prompts)
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        LLMCallOptions(max_tokens=100),
+        LLMCallOptions(thinking_budget=1024),
+        LLMCallOptions(model=SAME_AS_PRIMARY),
+    ],
+    ids=["max_tokens", "thinking_budget", "override-of-the-primary"],
+)
+def test_other_options_miss_and_identical_options_hit(response_cache, other):
+    """Requirement: Caché / Scenarios: Segunda petición idéntica y Opciones distintas."""
+    inner = FakeProvider(model=MODEL)
+    provider = cached(inner, response_cache)
+    base = LLMCallOptions(max_tokens=200)
+    provider.generate(SYSTEM, MESSAGES, base)
+    assert provider.generate(SYSTEM, MESSAGES, base).cache_hit is True
+    assert inner.call_count == 1
+    assert provider.generate(SYSTEM, MESSAGES, other).cache_hit is False
+    assert inner.call_count == 2
+
+
+def test_stream_respects_the_options_in_the_key(response_cache):
+    """Requirement: Caché / Scenario: Opciones distintas (streaming)."""
+    inner = FakeProvider(model=MODEL)
+    provider = cached(inner, response_cache)
+    list(provider.stream(SYSTEM, MESSAGES, LLMCallOptions(max_tokens=100)))
+    hit = provider.stream(SYSTEM, MESSAGES, LLMCallOptions(max_tokens=100))
+    list(hit)
+    assert hit.result.cache_hit is True
+    miss = provider.stream(SYSTEM, MESSAGES, LLMCallOptions(max_tokens=101))
+    list(miss)
+    assert miss.result.cache_hit is False
+    assert inner.call_count == 2
+
+
+def test_evaluation_is_not_part_of_the_key(response_cache):
+    """Requirement: Caché / Scenario: Evaluación fuera de la clave."""
+    inner = FakeProvider(model=MODEL)
+    service = EstimationService(cached(inner, response_cache))
+    first = service.estimate("T", GenerationOptions(evaluate=True))
+    second = service.estimate("T", GenerationOptions(evaluate=False))
+    assert (first.cache_hit, second.cache_hit) == (False, True)
+    assert first.validation is not None
+    assert second.validation is None
+    assert inner.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        GenerationOptions(max_tokens=100),
+        GenerationOptions(thinking_budget=1024),
+        GenerationOptions(example_format="json"),
+        GenerationOptions(example_format="narrative"),
+        GenerationOptions(num_examples=1),
+        GenerationOptions(use_examples=False),
+        GenerationOptions(preprocessing="inline_cleaning"),
+        GenerationOptions(model=MODEL),
+    ],
+    ids=[
+        "max_tokens",
+        "thinking_budget",
+        "json",
+        "narrative",
+        "num_examples",
+        "use_examples",
+        "inline_cleaning",
+        "override-of-the-primary",
+    ],
+)
+def test_estimation_with_other_options_is_not_served_from_the_cache(response_cache, options):
+    """Requirement: Caché / Scenario: Opciones distintas (a través del servicio)."""
+    inner = FakeProvider(model=MODEL)
+    service = EstimationService(
+        cached(inner, response_cache), resolve_model=lambda name: Deployment(name, "openai")
+    )
+    assert service.estimate("T").cache_hit is False
+    assert service.estimate("T", options).cache_hit is False
+    assert service.estimate("T", options).cache_hit is True  # same options: now a hit
+    assert inner.call_count == 2

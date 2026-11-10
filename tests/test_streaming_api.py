@@ -16,6 +16,7 @@ import pytest
 import uvicorn
 from structlog.testing import capture_logs
 
+from app.config import get_settings
 from app.context.examples import ESTIMATION_EXAMPLES
 from app.main import app
 from app.routers import estimations
@@ -259,10 +260,23 @@ def test_metrics_payload_has_exact_fields_and_no_estimation(client):
     assert isinstance(payload["latency_ms"], int)
 
 
+RESPONSE_ONLY_FIELDS = {
+    "preprocessing",
+    "extracted_requirements",
+    "preprocessing_input_tokens",
+    "preprocessing_output_tokens",
+    "preprocessing_cost_usd",
+    "validation",
+}
+
+
 def test_metrics_fields_match_the_estimation_response_minus_estimation():
     """Requirement: Formato de los eventos (campos de `EstimationResponse` salvo `estimation`)."""
     assert set(EstimationMetrics.model_fields) == METRICS_FIELDS
-    assert set(EstimationResponse.model_fields) == METRICS_FIELDS | {"estimation"}
+    # Fields added to EstimationResponse only (S02 generation-options change): the SSE
+    # `metrics` contract (EstimationMetrics) stays unchanged.
+    response_only = {"estimation", *RESPONSE_ONLY_FIELDS}
+    assert set(EstimationResponse.model_fields) == METRICS_FIELDS | response_only
     for name, field in EstimationMetrics.model_fields.items():
         assert EstimationResponse.model_fields[name].annotation == field.annotation
 
@@ -491,7 +505,9 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def test_real_http_disconnect_closes_the_provider_stream_and_logs_cancellation(monkeypatch):
+def test_real_http_disconnect_closes_the_provider_stream_and_logs_cancellation(
+    monkeypatch, settings
+):
     """Requirement: Desconexión del cliente / Scenario: Cliente que se desconecta (corte HTTP
     real contra uvicorn); Observability / Scenario: Cancelación registrada."""
     # Loopback only: the suite-wide network guard is lifted for this one test.
@@ -499,6 +515,7 @@ def test_real_http_disconnect_closes_the_provider_stream_and_logs_cancellation(m
         monkeypatch.setattr(owner, name, original)
     provider = ClosableProvider(fragments=[f"f{i} " for i in range(200)], delay=0.02)
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
+    app.dependency_overrides[get_settings] = lambda: settings
     port = _free_port()
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", lifespan="off")
@@ -567,7 +584,10 @@ def test_context_first_turn_matches_the_endpoint_prompt(client):
     body = response.json()
     assert set(body) == {"system_prompt", "examples", "max_message_chars"}
     assert body["system_prompt"] == llm_service._system_prompt()
-    assert body["examples"] == [dict(e) for e in ESTIMATION_EXAMPLES]
+    assert body["examples"] == [
+        {"meeting_summary": e["meeting_summary"], "estimation": e["estimation"]}
+        for e in ESTIMATION_EXAMPLES
+    ]
     assert body["max_message_chars"] == 20000 == MAX_TRANSCRIPTION_CHARS
 
 

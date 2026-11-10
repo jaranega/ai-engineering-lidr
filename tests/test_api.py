@@ -32,6 +32,15 @@ CONTRACT_FIELDS = {
     "cache_hit",
     "latency_ms",
 }
+GENERATION_FIELDS = {
+    "preprocessing",
+    "extracted_requirements",
+    "preprocessing_input_tokens",
+    "preprocessing_output_tokens",
+    "preprocessing_cost_usd",
+    "validation",
+}
+RESPONSE_FIELDS = CONTRACT_FIELDS | GENERATION_FIELDS
 
 
 # --- Requirement: Health check ---
@@ -106,7 +115,7 @@ def test_estimate_returns_full_contract_matching_settings(client, settings, prov
     response = client.post(ESTIMATE, json={"transcription": "Necesitamos una web de reservas."})
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == CONTRACT_FIELDS
+    assert set(body) == RESPONSE_FIELDS
     assert body["estimation"] == provider.result.text
     assert body["provider"] == settings.primary.provider == "openai"
     assert body["model"] == settings.primary.model == "gpt-4o"
@@ -116,6 +125,11 @@ def test_estimate_returns_full_contract_matching_settings(client, settings, prov
     assert body["fallback_used"] is False
     assert body["cache_hit"] is False
     assert body["latency_ms"] >= 0
+    assert body["preprocessing"] == "none"
+    assert body["extracted_requirements"] is None
+    assert (body["preprocessing_input_tokens"], body["preprocessing_output_tokens"]) == (0, 0)
+    assert body["preprocessing_cost_usd"] is None
+    assert body["validation"] is not None
     assert provider.call_count == 1
     assert provider.calls[0][1] == [{"role": "user", "content": "Necesitamos una web de reservas."}]
 
@@ -237,13 +251,13 @@ def test_openapi_documents_route_schemas_and_responses(client):
     schemas = spec["components"]["schemas"]
     assert {"EstimationRequest", "EstimationResponse"} <= set(schemas)
     properties = schemas["EstimationResponse"]["properties"]
-    assert set(properties) == CONTRACT_FIELDS
+    assert set(properties) == RESPONSE_FIELDS
     assert properties["truncated"]["type"] == "boolean"
     for field in ("fallback_used", "cache_hit"):
         assert properties[field]["type"] == "boolean"
     assert properties["latency_ms"]["type"] == "integer"
     assert properties["provider"]["type"] == "string"  # a free string: no longer an enum
-    assert set(schemas["EstimationResponse"]["required"]) >= CONTRACT_FIELDS
+    assert set(schemas["EstimationResponse"]["required"]) >= RESPONSE_FIELDS
     health = schemas["HealthResponse"]["properties"]
     assert {"status", "env", "primary_model", "fallback_model", "cache"} == set(health)
     assert spec["info"]["title"]

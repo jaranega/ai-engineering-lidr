@@ -9,6 +9,7 @@ import copy
 import logging
 import socket
 from collections.abc import Callable, Generator, Iterator, Sequence
+from functools import partial
 
 import fakeredis
 import litellm
@@ -28,9 +29,11 @@ from app.services.llm_service import (
     PRIMARY_GROUP,
     ChatMessage,
     LiteLLMProvider,
+    LLMCallOptions,
     LLMProviderError,
     LLMResult,
     LLMStream,
+    build_override_router,
     build_router,
 )
 
@@ -138,6 +141,7 @@ class FakeProvider:
         truncated: bool = False,
         fallback_used: bool = False,
         cache_hit: bool = False,
+        responses: Sequence[LLMResult | LLMProviderError] | None = None,
     ) -> None:
         self.result = LLMResult(
             text=text,
@@ -154,19 +158,42 @@ class FakeProvider:
         self.error_after = error_after
         # (system, messages) received by generate() and stream(), in call order.
         self.calls: list[tuple[str, list[ChatMessage]]] = []
+        # `LLMCallOptions` received by each call (None when the caller passed none), aligned
+        # with `calls`. The service omits default options, so the default paths record None.
+        self.options: list[LLMCallOptions | None] = []
+        # Optional per-call script for `generate()` (e.g. two_phase): the i-th call returns
+        # (or raises) the i-th item; once exhausted, the usual `result`/`error` apply.
+        self._responses = list(responses) if responses is not None else []
 
     @property
     def call_count(self) -> int:
         return len(self.calls)
 
-    def generate(self, system: str, messages: Sequence[ChatMessage]) -> LLMResult:
+    def generate(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        options: LLMCallOptions | None = None,
+    ) -> LLMResult:
         self.calls.append((system, list(messages)))
+        self.options.append(options)
+        if self._responses:
+            scripted = self._responses.pop(0)
+            if isinstance(scripted, LLMProviderError):
+                raise scripted
+            return scripted
         if self.error is not None:
             raise self.error
         return self.result
 
-    def stream(self, system: str, messages: Sequence[ChatMessage]) -> LLMStream:
+    def stream(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        options: LLMCallOptions | None = None,
+    ) -> LLMStream:
         self.calls.append((system, list(messages)))
+        self.options.append(options)
         return LLMStream(self._stream())
 
     def _stream(self) -> Generator[str, None, LLMResult]:
@@ -302,10 +329,12 @@ def make_provider(monkeypatch: pytest.MonkeyPatch) -> Callable[..., LiteLLMProvi
         with_fallback: bool = True,
         retries: int = 0,
         custom: dict[str, CustomLLM] | None = None,
+        **settings_kwargs,
     ) -> LiteLLMProvider:
         settings = make_settings(
             llm_retries=retries,
             anthropic_api_key="sk-ant-fake" if with_fallback else None,
+            **settings_kwargs,
         )
         mocks = {PRIMARY_GROUP: primary, FALLBACK_GROUP: fallback}
 
@@ -326,7 +355,13 @@ def make_provider(monkeypatch: pytest.MonkeyPatch) -> Callable[..., LiteLLMProvi
             ]
         router = build_router(settings)
         assert (settings.fallback is not None) is with_fallback
-        return LiteLLMProvider(router, settings.primary, settings.fallback)
+        # The override Router goes through the same (mocked) `Router` constructor.
+        return LiteLLMProvider(
+            router,
+            settings.primary,
+            settings.fallback,
+            router_factory=partial(build_override_router, settings),
+        )
 
     yield factory
     litellm.custom_provider_map = original_providers
