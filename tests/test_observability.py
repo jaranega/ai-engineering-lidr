@@ -18,10 +18,11 @@ from app.services.llm_service import (
     LiteLLMProvider,
     LLMProviderError,
 )
-from tests.conftest import make_settings
+from tests.conftest import make_input, make_settings, valid_body
 from tests.test_llm_provider import PRIMARY, FakeRouter, FakeStream, chunk, response, usage_chunk
 
-SENTINEL = "TRANSCRIPCION-SECRETA-123"
+SENTINEL = "DESCRIPCION-SECRETA-123"
+REFERENCE_SENTINEL = "REFERENCIA-SECRETA-456"
 API_KEY = "sk-test-visible-value"
 MESSAGES: list[ChatMessage] = [{"role": "user", "content": SENTINEL}]
 
@@ -253,13 +254,28 @@ def test_logs_never_contain_the_request_content_with_cache_miss_and_hit(capsys, 
     _production_stderr(capsys)
     provider = stack(FakeRouter(response(text="respuesta")), response_cache)
     service = EstimationService(provider)
-    service.estimate(SENTINEL)  # miss
-    service.estimate(SENTINEL)  # hit
-    stream = EstimationService(provider).stream_chat(MESSAGES)  # hit in streaming
-    list(stream)
+    request = make_input(description=SENTINEL)
+    service.estimate(request)  # miss
+    service.estimate(request)  # hit
     logged = capsys.readouterr().err
     assert "cache_miss" in logged and "cache_hit" in logged  # the pipeline really logged
+    assert "prompt_rendered" in logged
     assert SENTINEL not in logged
+
+
+def test_logs_never_contain_reference_projects(capsys, response_cache):
+    """Requirement: Datos que nunca se registran / Scenario: Log sin proyectos de referencia."""
+    _production_stderr(capsys)
+    provider = stack(FakeRouter(response(text="respuesta")), response_cache)
+    service = EstimationService(provider)
+    request = make_input(
+        reference_projects=[{"name": REFERENCE_SENTINEL, "summary": "Resumen del proyecto"}]
+    )
+    service.estimate(request)  # miss
+    service.estimate(request)  # hit
+    logged = capsys.readouterr().err
+    assert "prompt_rendered" in logged
+    assert REFERENCE_SENTINEL not in logged
 
 
 def test_logs_never_contain_the_content_on_stream_and_failures(capsys, response_cache):
@@ -313,7 +329,7 @@ def test_real_router_failure_does_not_leak_key_through_litellm_loggers(capsys, m
     assert SENTINEL not in logged
 
 
-def test_http_request_logs_through_the_app_never_include_the_transcription(
+def test_http_request_logs_through_the_app_never_include_the_description(
     capsys, monkeypatch, response_cache
 ):
     """Requirement: Log sin contenido de la petición (extremo a extremo por la API)."""
@@ -326,11 +342,18 @@ def test_http_request_logs_through_the_app_never_include_the_transcription(
     try:
         with TestClient(app) as client:
             for _ in range(2):  # miss, then hit
-                body = client.post("/api/v1/estimate", json={"transcription": SENTINEL}).json()
-                assert body["estimation"] == "respuesta"
+                body = client.post(
+                    "/api/v1/estimate",
+                    json=valid_body(
+                        description=SENTINEL,
+                        reference_projects=[{"name": REFERENCE_SENTINEL, "summary": "Resumen"}],
+                    ),
+                ).json()
+                assert body["text"] == "respuesta"
     finally:
         app.dependency_overrides.clear()
     logged = capsys.readouterr().err
     assert "cache_hit" in logged
     assert SENTINEL not in logged
+    assert REFERENCE_SENTINEL not in logged
     assert API_KEY not in logged

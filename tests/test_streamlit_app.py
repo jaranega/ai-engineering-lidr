@@ -1,18 +1,18 @@
-"""Tests for the Streamlit chat UI (spec: chat-ui) run without a browser via AppTest.
+"""Tests for the Streamlit estimation form (spec: estimation-form-ui), without a browser.
 
-The UI is an HTTP client of the API. `httpx.Client` is patched with a factory (design D7):
-`httpx.MockTransport` for the protocol cases and `TestClient(app)` (ASGI transport) for the
-end-to-end ones. No network, no real server, no real LLM.
+The UI is an HTTP client of the API, run with `streamlit.testing.v1.AppTest`. `httpx.Client` is
+patched with a factory (design D12): `httpx.MockTransport` for the protocol cases and
+`TestClient(app)` (ASGI transport) for the end-to-end ones. No network, no real server and no
+real LLM.
 
-Manual checks (task 7.2, not automatable with AppTest): scenarios "Arranque de la interfaz",
-"Texto incremental" (the incremental rendering; AppTest only sees the final text) and
-"Generación interrumpida" / "Panel visible tras interrumpir" with a real Stop button (here only
-approximated by a BaseException raised mid-stream).
+Manual checks (not automatable with AppTest): scenario "Arranque de la interfaz" with
+`uv run streamlit run streamlit_app.py` (layout, native character counter) and the optional
+screenshot of task 7.5.
 """
 
 import ast
 import json
-from collections.abc import Callable, Iterator
+import os
 from pathlib import Path
 
 import httpx
@@ -21,18 +21,26 @@ from fastapi.testclient import TestClient
 from streamlit.testing.v1 import AppTest
 from structlog.testing import capture_logs
 
+from app import domain
 from app.config import get_settings
 from app.main import app
+from app.prompts.loader import DEFAULT_PROMPT_VERSION, PROMPT_VERSIONS
 from app.services import llm_service
 from app.services.cache import get_response_cache
-from app.services.llm_service import prompt_context
-from tests.conftest import FakeProvider, make_settings
+from tests.conftest import FakeProvider, example_estimates, make_settings
 
 APP_PATH = Path(__file__).resolve().parent.parent / "streamlit_app.py"
 BASE_URL = "http://api.test"
+ESTIMATE_URL = f"{BASE_URL}/api/v1/estimate"
 GENERIC_ERROR = "No se pudo generar la estimación. Inténtalo de nuevo en unos instantes."
+TRUNCATED = (
+    "La estimación está incompleta: se cortó por el límite de longitud. "
+    "Prueba con un nivel de detalle menor."
+)
 FAKE_OPENAI_KEY = "sk-fake-ui-SECRET-123"
 FAKE_ANTHROPIC_KEY = "sk-ant-fake-ui-SECRET-456"
+DESCRIPTION = "Una app móvil para reservar clases de un gimnasio y gestionar las cuotas."
+SECRET = "DESCRIPCION-SECRETA-123"
 REAL_CLIENT = httpx.Client
 
 HEALTH = {
@@ -42,7 +50,28 @@ HEALTH = {
     "fallback_model": "claude-haiku-4-5",
     "cache": "ok",
 }
-METRICS = {
+VALIDATION = {
+    "output_format": "line_items",
+    "checks_total": 8,
+    "has_title": True,
+    "has_breakdown_table": True,
+    "has_totals": True,
+    "has_team": False,
+    "has_duration": False,
+    "rows_parsed": 3,
+    "declared_total_hours": 120.0,
+    "sum_row_hours": 120.0,
+    "hours_match": True,
+    "declared_total_cost": 7500.0,
+    "sum_row_cost": 7500.0,
+    "cost_match": True,
+    "finish_ok": True,
+    "score": 0.75,
+    "issues": ["missing recommended team", "missing estimated duration in weeks"],
+}
+RESPONSE = {
+    "text": "## Estimación: Gimnasio\n\nTEXTO-DE-LA-ESTIMACION",
+    "prompt_version": "v1",
     "model": "gpt-4o-mini",
     "provider": "openai",
     "input_tokens": 1200,
@@ -52,41 +81,8 @@ METRICS = {
     "fallback_used": False,
     "cache_hit": False,
     "latency_ms": 900,
+    "validation": VALIDATION,
 }
-
-
-# --- SSE builders ---
-
-
-def token(text: str) -> str:
-    return f"event: token\ndata: {json.dumps(text)}\n\n"
-
-
-def metrics_event(**overrides) -> str:
-    return f"event: metrics\ndata: {json.dumps({**METRICS, **overrides})}\n\n"
-
-
-def error_event() -> str:
-    return 'event: error\ndata: {"detail": "LLM provider error"}\n\n'
-
-
-PING = ": ping\n\n"
-
-
-class BrokenStream(httpx.SyncByteStream):
-    """Delivers `head` and then fails; records `close()` (the connection being released)."""
-
-    def __init__(self, head: str, failure: BaseException) -> None:
-        self.head = head
-        self.failure = failure
-        self.closed = False
-
-    def __iter__(self) -> Iterator[bytes]:
-        yield self.head.encode()
-        raise self.failure
-
-    def close(self) -> None:
-        self.closed = True
 
 
 class FakeApi:
@@ -94,59 +90,38 @@ class FakeApi:
 
     def __init__(self) -> None:
         self.health: dict | None = dict(HEALTH)
-        self.context_status = 200
-        self.max_chars: int | None = 20000
         self.down = False  # every request raises ConnectError
-        self.stream_down = False  # only the stream raises ConnectError
-        self.stream_status = 200
-        self.stream_body: str | httpx.SyncByteStream | Callable[[], str] = token("E") + (
-            metrics_event()
-        )
+        self.estimate_down = False  # only POST /estimate raises ConnectError
+        self.estimate_error: Exception | None = None  # raised by POST /estimate
+        self.status = 200
+        self.json_body: object = dict(RESPONSE)
+        self.raw_body: bytes | None = None  # overrides `json_body`
         self.requests: list[httpx.Request] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if self.down:
             raise httpx.ConnectError("connection refused", request=request)
-        path = request.url.path
-        if path == "/health":
+        if request.url.path == "/health":
             if self.health is None:
                 return httpx.Response(503)
             return httpx.Response(200, json=self.health)
-        if path == "/api/v1/context":
-            if self.context_status != 200:
-                return httpx.Response(self.context_status, json={"detail": "boom"})
-            count = int(request.url.params.get("message_count", "1"))
-            ctx = prompt_context(count)
-            return httpx.Response(
-                200,
-                json={
-                    "system_prompt": ctx.system_prompt,
-                    "examples": [dict(e) for e in ctx.examples],
-                    "max_message_chars": self.max_chars,
-                },
-            )
-        if path == "/api/v1/estimate/stream":
-            if self.stream_down:
+        if request.url.path == "/api/v1/estimate":
+            if self.estimate_down:
                 raise httpx.ConnectError("connection refused", request=request)
-            if self.stream_status != 200:
-                return httpx.Response(self.stream_status, json={"detail": "SECRET-DETAIL"})
-            body = self.stream_body() if callable(self.stream_body) else self.stream_body
-            headers = {"content-type": "text/event-stream"}
-            if isinstance(body, str):
-                return httpx.Response(200, content=body.encode(), headers=headers)
-            return httpx.Response(200, stream=body, headers=headers)
+            if self.estimate_error is not None:
+                raise self.estimate_error
+            if self.raw_body is not None:
+                return httpx.Response(self.status, content=self.raw_body)
+            return httpx.Response(self.status, json=self.json_body)
         return httpx.Response(404)
 
-    def calls(self, path: str) -> list[httpx.Request]:
-        return [r for r in self.requests if r.url.path == path]
-
     @property
-    def stream_calls(self) -> list[httpx.Request]:
-        return self.calls("/api/v1/estimate/stream")
+    def estimates(self) -> list[httpx.Request]:
+        return [r for r in self.requests if r.url.path == "/api/v1/estimate"]
 
-    def sent_messages(self, index: int = -1) -> list[dict]:
-        return json.loads(self.stream_calls[index].content)["messages"]
+    def last_body(self) -> dict:
+        return json.loads(self.estimates[-1].content)
 
 
 @pytest.fixture
@@ -165,19 +140,27 @@ def run_app() -> AppTest:
     return AppTest.from_file(str(APP_PATH), default_timeout=10).run()
 
 
-def send(at: AppTest, text: str) -> AppTest:
-    at.chat_input[0].set_value(text).run()
+def submit(
+    at: AppTest,
+    description: str = DESCRIPTION,
+    *,
+    project_type: str | None = None,
+    detail_level: str | None = None,
+    output_format: str | None = None,
+    prompt_version: str | None = None,
+) -> AppTest:
+    """Fill the form and press "Estimar" in the same run (a run in between loses the text)."""
+    at.text_area[0].set_value(description)
+    if project_type is not None:
+        at.selectbox[0].set_value(project_type)
+    if detail_level is not None:
+        at.radio[0].set_value(detail_level)
+    if output_format is not None:
+        at.selectbox[1].set_value(output_format)
+    if prompt_version is not None:
+        at.selectbox[2].set_value(prompt_version)
+    at.button[0].click().run()
     return at
-
-
-def history(at: AppTest) -> list[tuple[str, str]]:
-    return [(m["role"], m["content"]) for m in at.session_state["messages"]]
-
-
-def sidebar_text(at: AppTest) -> str:
-    chunks = [e.value for e in at.sidebar.markdown] + [e.value for e in at.sidebar.caption]
-    chunks += [e.value for e in at.sidebar.text_area] + [e.value for e in at.sidebar.warning]
-    return "\n".join(chunks)
 
 
 def all_text(at: AppTest) -> str:
@@ -185,7 +168,7 @@ def all_text(at: AppTest) -> str:
 
     def walk(block) -> None:
         for child in block.children.values():
-            for attr in ("value", "label"):
+            for attr in ("value", "label", "body"):
                 value = getattr(child, attr, None)
                 if isinstance(value, str):
                     chunks.append(value)
@@ -197,12 +180,17 @@ def all_text(at: AppTest) -> str:
     return "\n".join(chunks)
 
 
+def sidebar_text(at: AppTest) -> str:
+    chunks = [e.value for e in at.sidebar.markdown] + [e.value for e in at.sidebar.warning]
+    return "\n".join(chunks)
+
+
+def warnings(at: AppTest) -> list[str]:
+    return [e.value for e in at.warning]
+
+
 def errors(at: AppTest) -> list[str]:
     return [e.value for e in at.error]
-
-
-def sent_text_of_logs(logs: list[dict]) -> str:
-    return json.dumps(logs, default=str)
 
 
 def unavailable(url: str = BASE_URL) -> str:
@@ -212,51 +200,112 @@ def unavailable(url: str = BASE_URL) -> str:
     )
 
 
-# --- Requirement: Aplicación Streamlit de chat ---
+def load_ui_namespace() -> dict:
+    """Execute `streamlit_app.py` without its final `main()` call, to read constants and helpers."""
+    source = APP_PATH.read_text(encoding="utf-8").rstrip()
+    assert source.endswith("\nmain()")
+    namespace: dict = {"__name__": "streamlit_app_under_test"}
+    exec(compile(source.removesuffix("main()"), str(APP_PATH), "exec"), namespace)  # noqa: S102
+    return namespace
 
 
-def test_app_runs_without_exceptions_and_shows_chat_input(api):
-    """Requirement: Aplicación Streamlit de chat (arranque sin errores en AppTest)."""
+# --- Requirement: Aplicación Streamlit con formulario tipado ---
+
+
+def test_app_starts_with_the_form_defaults_and_no_chat(api):
+    """Requirement: Aplicación Streamlit con formulario tipado / Scenario: Arranque (AppTest)."""
     at = run_app()
     assert not at.exception
-    assert len(at.chat_input) == 1
     assert at.title[0].value == "Estimador de software"
+    assert len(at.chat_input) == 0
+    assert len(at.chat_message) == 0
+    assert at.text_area[0].value == ""
+    assert at.selectbox[0].label == "Tipo de proyecto"
+    assert at.radio[0].label == "Nivel de detalle"
+    assert at.radio[0].value == "medium"
+    assert at.selectbox[1].label == "Formato de salida"
+    assert at.selectbox[1].value == "line_items"
+    assert at.button[0].label == "Estimar"
+    assert at.expander[0].label == "Opciones avanzadas"
+    assert at.selectbox[2].value == "v1"
+    assert at.session_state["last_result"] is None
+    assert api.estimates == []
 
 
-def test_transcription_gets_an_assistant_answer_in_history(api):
-    """Requirement: Aplicación Streamlit de chat / Scenario: Estimación de una transcripción."""
-    api.stream_body = token("ESTIMACION-1") + metrics_event()
-    at = send(run_app(), "Necesitamos una web")
-    assert not at.exception
-    assert history(at) == [("user", "Necesitamos una web"), ("assistant", "ESTIMACION-1")]
-    shown = [(m.name, m.markdown[0].value) for m in at.chat_message]
-    assert shown == [("user", "Necesitamos una web"), ("assistant", "ESTIMACION-1")]
-
-
-def test_request_is_posted_to_the_stream_endpoint_with_the_first_message(api):
-    """Requirement: Aplicación Streamlit de chat / Scenario: Petición enviada a la API (turno 1)."""
-    send(run_app(), "T")
-    assert len(api.stream_calls) == 1
-    request = api.stream_calls[0]
-    assert request.method == "POST"
-    assert str(request.url) == f"{BASE_URL}/api/v1/estimate/stream"
-    assert json.loads(request.content) == {"messages": [{"role": "user", "content": "T"}]}
-
-
-def test_adjustment_posts_the_three_messages_in_order(api):
-    """Requirement: Aplicación Streamlit de chat / Scenario: Petición enviada a la API."""
-    api.stream_body = token("E") + metrics_event()
-    at = send(run_app(), "T")
-    send(at, "quita la sección de blog")
-    assert api.sent_messages() == [
-        {"role": "user", "content": "T"},
-        {"role": "assistant", "content": "E"},
-        {"role": "user", "content": "quita la sección de blog"},
+def test_the_selectors_offer_the_expected_labels(api):
+    """Requirement: Aplicación Streamlit con formulario tipado (opciones de los selectores)."""
+    at = run_app()
+    assert list(at.selectbox[0].options) == [
+        "App móvil",
+        "SaaS web",
+        "Herramienta interna",
+        "Pipeline de datos",
     ]
+    assert list(at.radio[0].options) == ["Resumen", "Medio", "Detallado"]
+    assert list(at.selectbox[1].options) == ["Tabla por fases", "Partidas", "Narrativa"]
+    assert list(at.selectbox[2].options) == ["v1", "v2"]
 
 
-def test_streamlit_app_has_no_service_or_llm_imports():
-    """Requirement: Aplicación Streamlit de chat / Scenario: Sin imports del servicio."""
+def test_the_form_exposes_only_the_agreed_widgets(api):
+    """Requirement: Aplicación Streamlit (sin reference_projects ni parámetros de generación)."""
+    at = run_app()
+    assert len(at.text_area) == 1
+    assert len(at.selectbox) == 3
+    assert len(at.radio) == 1
+    assert len(at.button) == 1
+    for empty in (at.text_input, at.number_input, at.slider, at.checkbox, at.toggle):
+        assert len(empty) == 0
+
+
+def test_submit_posts_the_typed_json_with_exact_enum_values_and_the_trimmed_text(api):
+    """Requirement: Aplicación Streamlit con formulario tipado / Scenario: Envío tipado."""
+    at = submit(
+        run_app(),
+        f"  {DESCRIPTION}\n ",
+        project_type="mobile_app",
+        detail_level="detailed",
+        output_format="phases_table",
+    )
+    assert not at.exception
+    assert len(api.estimates) == 1
+    request = api.estimates[0]
+    assert request.method == "POST"
+    assert str(request.url) == f"{ESTIMATE_URL}?prompt_version=v1"
+    assert json.loads(request.content) == {
+        "description": DESCRIPTION,
+        "project_type": "mobile_app",
+        "detail_level": "detailed",
+        "output_format": "phases_table",
+    }
+
+
+def test_defaults_are_sent_when_only_the_description_is_filled(api):
+    """Requirement: Aplicación Streamlit con formulario tipado (valores por defecto)."""
+    submit(run_app())
+    assert api.last_body() == {
+        "description": DESCRIPTION,
+        "project_type": "mobile_app",
+        "detail_level": "medium",
+        "output_format": "line_items",
+    }
+
+
+def test_prompt_version_v2_goes_in_the_query(api):
+    """Requirement: Aplicación Streamlit con formulario tipado / Scenario: Versión del prompt."""
+    submit(run_app(), prompt_version="v2")
+    request = api.estimates[0]
+    assert request.url.params["prompt_version"] == "v2"
+    assert "prompt_version" not in json.loads(request.content)
+
+
+def test_request_never_carries_reference_projects_or_generation_parameters(api):
+    """Requirement: Aplicación Streamlit (no expone reference_projects ni parámetros)."""
+    submit(run_app())
+    assert set(api.last_body()) == {"description", "project_type", "detail_level", "output_format"}
+
+
+def test_streamlit_app_imports_nothing_from_the_service_nor_llm_libraries():
+    """Requirement: Aplicación Streamlit con formulario tipado / Scenario: Sin dependencias."""
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     imported: set[str] = set()
     for node in ast.walk(tree):
@@ -269,7 +318,7 @@ def test_streamlit_app_has_no_service_or_llm_imports():
 
 
 def test_module_level_httpx_helpers_are_not_used():
-    """Design D6: only `httpx.Client` in a `with`, never `httpx.get`/`httpx.stream`/`post`."""
+    """Design D12: only `httpx.Client` in a `with`, never `httpx.get`/`httpx.post`."""
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
     used = {
         node.attr
@@ -281,431 +330,287 @@ def test_module_level_httpx_helpers_are_not_used():
     assert not used & {"get", "post", "stream", "request", "put", "delete"}
 
 
-# --- Requirement: Historial de la conversación (spec vigente) ---
+def test_ui_values_and_limits_match_the_api_domain():
+    """Requirement: Aplicación Streamlit con formulario tipado / Scenario: Valores alineados."""
+    ui = load_ui_namespace()
+    assert list(ui["PROJECT_TYPE_LABELS"]) == [t.value for t in domain.ProjectType]
+    assert list(ui["DETAIL_LEVEL_LABELS"]) == [t.value for t in domain.DetailLevel]
+    assert list(ui["OUTPUT_FORMAT_LABELS"]) == [t.value for t in domain.OutputFormat]
+    assert tuple(ui["PROMPT_VERSIONS"]) == tuple(PROMPT_VERSIONS)
+    assert ui["DEFAULT_PROMPT_VERSION"] == DEFAULT_PROMPT_VERSION
+    assert ui["MIN_DESCRIPTION_CHARS"] == domain.MIN_DESCRIPTION_CHARS == 20
+    assert ui["MAX_DESCRIPTION_CHARS"] == domain.MAX_DESCRIPTION_CHARS == 2000
+    assert ui["DEFAULT_DETAIL_LEVEL"] == domain.DetailLevel.MEDIUM.value
+    assert ui["DEFAULT_OUTPUT_FORMAT"] == domain.OutputFormat.LINE_ITEMS.value
 
 
-def test_several_messages_in_a_row_are_rendered_in_order(api):
-    """Requirement: Historial de la conversación / Scenario: Varios mensajes seguidos."""
-    at = send(run_app(), "T")
-    api.stream_body = token("E2") + metrics_event()
-    send(at, "ajuste")
-    shown = [(m.name, m.markdown[0].value) for m in at.chat_message]
-    assert shown == [("user", "T"), ("assistant", "E"), ("user", "ajuste"), ("assistant", "E2")]
+# --- Requirement: Validación en el cliente ---
 
 
-def test_new_session_starts_with_empty_history(api):
-    """Requirement: Historial de la conversación / Scenario: Sesión nueva."""
-    send(run_app(), "T")
-    fresh = run_app()
-    assert fresh.session_state["messages"] == []
-    assert len(fresh.chat_message) == 0
-
-
-def test_new_conversation_clears_history_and_metrics_and_next_send_is_single(api):
-    """Requirement: Nueva conversación / Scenario: Empezar de cero."""
-    at = send(run_app(), "T")
-    assert at.session_state["last_metrics"] is not None
-    calls_before = len(api.stream_calls)
-    at.sidebar.button[0].click().run()
-    assert at.sidebar.button[0].label == "Nueva conversación"
-    assert at.session_state["messages"] == []
-    assert at.session_state["last_metrics"] is None
-    assert len(at.chat_message) == 0
-    assert "Aún no hay métricas" in sidebar_text(at)
-    assert len(api.stream_calls) == calls_before
-    send(at, "T2")
-    assert api.sent_messages() == [{"role": "user", "content": "T2"}]
-
-
-# --- Requirement: Respuesta en streaming ---
-
-
-def test_saved_message_is_the_concatenation_of_all_fragments(api):
-    """Requirement: Respuesta en streaming / Scenario: Texto incremental (texto guardado)."""
-    api.stream_body = token("## Esti") + token("mación: ") + token("web") + metrics_event()
-    at = send(run_app(), "T")
-    assert history(at)[1] == ("assistant", "## Estimación: web")
-
-
-def test_multiline_fragment_is_saved_intact(api):
-    """Requirement: Respuesta en streaming (fragmento multilínea decodificado del JSON)."""
-    api.stream_body = token("## Título\n\n| A | B |") + token("\n| 1 | 2 |") + metrics_event()
-    at = send(run_app(), "T")
-    assert history(at)[1] == ("assistant", "## Título\n\n| A | B |\n| 1 | 2 |")
-
-
-def test_keep_alive_comments_do_not_change_the_answer(api):
-    """Requirement: Respuesta en streaming / Scenario: Keep-alive."""
-    plain = send(run_app(), "T")
-    expected = history(plain)
-    api.stream_body = PING + token("E") + PING + PING + metrics_event() + PING
-    at = send(run_app(), "T")
-    assert history(at) == expected
-    assert not errors(at)
-
-
-def test_unknown_events_are_ignored(api):
-    """Requirement: Respuesta en streaming (eventos desconocidos ignorados)."""
-    api.stream_body = "event: weird\ndata: {}\n\n" + token("E") + metrics_event()
-    at = send(run_app(), "T")
-    assert history(at) == [("user", "T"), ("assistant", "E")]
-
-
-# --- Requirement: Validación del mensaje del usuario ---
-
-
-def test_message_is_trimmed_before_sending_and_saving(api):
-    """Requirement: Validación del mensaje / Scenario: Espacios alrededor del mensaje."""
-    at = send(run_app(), "  T  \n")
-    assert api.sent_messages() == [{"role": "user", "content": "T"}]
-    assert history(at)[0] == ("user", "T")
-
-
-def test_message_over_the_api_limit_is_rejected_without_calling_the_stream(api):
-    """Requirement: Validación del mensaje / Scenario: Mensaje demasiado largo."""
-    at = send(run_app(), "x" * 20001)
-    assert [w.value for w in at.warning] == [
-        "El mensaje supera el límite de 20000 caracteres (20001)."
-    ]
-    assert api.stream_calls == []
-    assert history(at) == []
-
-
-def test_message_over_limit_after_a_turn_keeps_history_unchanged(api):
-    """Requirement: Validación del mensaje / Scenario: Mensaje demasiado largo (con historial)."""
-    at = send(run_app(), "T")
-    before = history(at)
-    calls = len(api.stream_calls)
-    send(at, "x" * 20001)
-    assert history(at) == before
-    assert len(api.stream_calls) == calls
-
-
-def test_limit_follows_what_the_api_reports(api):
-    """Requirement: Validación del mensaje (límite obtenido de `max_message_chars`)."""
-    api.max_chars = 10
-    at = send(run_app(), "x" * 11)
-    assert api.stream_calls == []
-    assert "límite de 10 caracteres (11)" in at.warning[0].value
-    send(at, "x" * 10)
-    assert len(api.stream_calls) == 1
-
-
-@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
-def test_blank_message_is_rejected_without_calling_the_stream(api, blank):
-    """Requirement: Validación del mensaje / Scenario: Mensaje en blanco."""
-    at = send(run_app(), blank)
-    assert [w.value for w in at.warning] == ["El mensaje está vacío."]
-    assert api.stream_calls == []
-    assert history(at) == []
-
-
-def test_without_the_limit_only_empty_messages_are_rejected_and_the_api_decides(api):
-    """Requirement: Validación del mensaje (sin `max_message_chars`, el límite lo pone la API)."""
-    api.context_status = 500
-    api.stream_status = 422
-    at = run_app()
-    send(at, "   ")
-    assert api.stream_calls == []
-    send(at, "x" * 20001)
-    assert len(api.stream_calls) == 1
-    assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == []
-
-
-# --- Requirement: Errores del proveedor en la interfaz ---
-
-
-def test_error_event_shows_generic_error_and_keeps_history(api):
-    """Requirement: Errores del proveedor / Scenario: Proveedor caído."""
-    api.stream_body = error_event()
-    with capture_logs() as logs:
-        at = send(run_app(), "T")
-    assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == []
+@pytest.mark.parametrize(
+    "description",
+    ["0123456789", "   corta   ", "a" * 19, " " + "a" * 19 + "  ", "   \n  "],
+    ids=["10", "padded-short", "19", "19-padded", "blank"],
+)
+def test_short_description_warns_and_sends_nothing(api, description):
+    """Requirement: Validación en el cliente / Scenario: Descripción corta."""
+    at = submit(run_app(), description)
     assert not at.exception
-    assert [e["reason"] for e in logs if e["event"] == "api_stream_failed"] == ["error_event"]
-    assert len(at.chat_input) == 1
+    assert api.estimates == []
+    assert any("al menos 20 caracteres" in w for w in warnings(at))
+    assert at.session_state["last_result"] is None
+    assert at.text_area[0].value == description  # the form keeps its values
 
 
-def test_failure_mid_stream_saves_neither_user_message_nor_partial_text(api):
-    """Requirement: Errores del proveedor / Scenario: Fallo a mitad del streaming."""
-    api.stream_body = token("parcial ") + token("otro") + error_event()
-    at = send(run_app(), "T")
-    assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == []
-
-
-def test_failed_call_keeps_previous_history_and_metrics(api):
-    """Requirement: Métricas / Scenario: Llamada fallida; Errores / reenvío del mensaje."""
-    api.stream_body = token("E") + metrics_event(input_tokens=1234)
-    at = send(run_app(), "T")
-    before = history(at)
-    api.stream_body = token("parcial") + error_event()
-    send(at, "ajuste")
-    assert history(at) == before
-    assert "1234" in sidebar_text(at)
-    assert at.session_state["last_metrics"].input_tokens == 1234
-    api.stream_body = token("E2") + metrics_event()
-    send(at, "ajuste")
-    assert history(at)[-2:] == [("user", "ajuste"), ("assistant", "E2")]
-
-
-def test_stream_without_terminal_event_shows_generic_error_and_saves_nothing(api):
-    """Requirement: Errores del proveedor / Scenario: Stream sin evento terminal."""
-    api.stream_body = token("a") + PING + token("b")
-    with capture_logs() as logs:
-        at = send(run_app(), "T")
-    assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == []
-    assert [e["reason"] for e in logs if e["event"] == "api_stream_failed"] == ["no_terminal_event"]
-
-
-@pytest.mark.parametrize("status", [500, 422, 502])
-def test_http_error_status_shows_generic_error_without_details(api, status):
-    """Requirement: Errores del proveedor / Scenario: Estado HTTP de error."""
-    api.stream_status = status
-    with capture_logs() as logs:
-        at = send(run_app(), "T")
-    assert errors(at) == [GENERIC_ERROR]
-    assert "SECRET-DETAIL" not in all_text(at)
-    assert history(at) == []
-    assert [e["reason"] for e in logs if e["event"] == "api_stream_failed"] == ["http_status"]
-    assert "SECRET-DETAIL" not in sent_text_of_logs(logs)
-
-
-def test_connection_cut_mid_stream_is_a_generic_error(api):
-    """Requirement: Errores del proveedor (se corta la conexión a mitad)."""
-    api.stream_body = BrokenStream(token("parcial"), httpx.ReadError("cut"))
-    with capture_logs() as logs:
-        at = send(run_app(), "T")
-    assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == []
-    assert [e["reason"] for e in logs if e["event"] == "api_stream_failed"] == ["transport_error"]
-
-
-def test_malformed_event_is_a_generic_error(api):
-    """Design D6: a `token` with invalid JSON counts as a failed stream (`malformed_event`)."""
-    api.stream_body = "event: token\ndata: not-json\n\n" + metrics_event()
-    with capture_logs() as logs:
-        at = send(run_app(), "T")
-    assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == []
-    assert [e["reason"] for e in logs if e["event"] == "api_stream_failed"] == ["malformed_event"]
-
-
-@pytest.mark.parametrize(
-    "body", [metrics_event(), token("   ") + token("\n") + metrics_event()], ids=["none", "blank"]
-)
-def test_empty_reply_shows_generic_error_and_keeps_state(api, body):
-    """Requirement: Errores del proveedor / Scenario: Respuesta sin texto."""
-    at = send(run_app(), "T")
-    before_history, before_metrics = history(at), at.session_state["last_metrics"]
-    api.stream_body = body
-    with capture_logs() as logs:
-        send(at, "ajuste")
-    assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == before_history
-    assert at.session_state["last_metrics"] == before_metrics
-    assert "ajuste" not in sent_text_of_logs(logs)
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        pytest.param(metrics_event(), id="no-token-events"),
-        pytest.param(token("   ") + token("\n") + metrics_event(), id="blank-tokens"),
-    ],
-)
-def test_empty_reply_is_logged_as_empty_llm_reply(api, body):
-    """Requirement: Observability (`empty_llm_reply` con modelo y proveedor, sin contenido)."""
-    api.stream_body = body
-    with capture_logs() as logs:
-        send(run_app(), "mensaje-secreto")
-    empty = [e for e in logs if e["event"] == "empty_llm_reply"]
-    assert len(empty) == 1
-    assert empty[0]["model"] == "gpt-4o-mini" and empty[0]["provider"] == "openai"
-    assert not [e for e in logs if e["event"] == "api_stream_failed"]
-
-
-def test_empty_reply_on_first_turn_leaves_no_history_or_metrics(api):
-    """Requirement: Errores del proveedor / Scenario: Respuesta sin texto (primer turno)."""
-    api.stream_body = metrics_event()
-    at = send(run_app(), "T")
-    assert history(at) == []
-    assert at.session_state["last_metrics"] is None
-    assert "Aún no hay métricas" in sidebar_text(at)
-
-
-class Interrupted(BaseException):
-    """Stand-in for the user pressing Stop (Streamlit stops a script via a BaseException)."""
-
-
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_interruption_mid_stream_persists_nothing_closes_the_connection_and_keeps_sidebar(api):
-    """Requirement: Errores / Scenario: Generación interrumpida; Panel / Scenario: Panel visible
-    tras interrumpir (approximation: AppTest cannot press Stop, so the stream raises a
-    BaseException; the real Stop stays manual, task 7.2)."""
-    api.stream_body = token("E") + metrics_event(input_tokens=1234)
-    at = send(run_app(), "T")
-    before = history(at)
-    broken = BrokenStream(token("parcial"), Interrupted())
-    api.stream_body = broken
-    send(at, "ajuste")
-    assert history(at) == before
-    assert broken.closed is True
-    assert "1234" in sidebar_text(at)
-    assert [t for t in at.sidebar.text_area if t.value == prompt_context(3).system_prompt]
-
-
-# --- Requirement: Panel de contexto CAG ---
-
-
-def test_sidebar_shows_models_cache_prompt_and_examples(api):
-    """Requirement: Panel de contexto CAG / Scenario: Contexto visible."""
+def test_long_description_is_limited_by_the_widget_and_the_client_message_names_the_limit(api):
+    """Requirement: Validación en el cliente (máximo de 2000: lo impone el widget y el aviso)."""
+    message = load_ui_namespace()["validate_description"]("a" * 2001)
+    assert message is not None and "2000" in message
+    # Streamlit truncates the text area to `max_chars`: more than 2000 never reaches the API.
     at = run_app()
-    text = sidebar_text(at)
-    assert "**Modelo primario:** `gpt-4o-mini`  \n" in text
-    assert "**Modelo de respaldo:** `claude-haiku-4-5`" in text
-    assert "**Caché:** disponible" in text
-    ctx = prompt_context(1)
-    assert [t.value for t in at.sidebar.text_area] == [ctx.system_prompt]
-    assert at.sidebar.text_area[0].disabled
-    for example in ctx.examples:
-        assert example["meeting_summary"] in text
-        assert example["estimation"] in text
-    assert api.calls("/health") and api.calls("/api/v1/context")
-    assert api.calls("/api/v1/context")[0].url.params["message_count"] == "1"
+    at.text_area[0].set_value("a" * 2001)
+    at.button[0].click().run()
+    assert all(len(json.loads(r.content)["description"]) <= 2000 for r in api.estimates)
 
 
-def test_sidebar_says_there_is_no_fallback(api):
-    """Requirement: Panel de contexto CAG / Scenario: Sin respaldo."""
-    api.health = {**HEALTH, "fallback_model": None}
-    text = sidebar_text(run_app())
-    assert "**Modelo de respaldo:** Sin respaldo" in text
+@pytest.mark.parametrize("length", [20, 2000])
+def test_description_at_the_limits_is_sent(api, length):
+    """Requirement: Validación en el cliente (20 y 2000 caracteres tras recortar son válidos)."""
+    padding = "  " if length == 20 else ""  # the widget itself caps the raw text at 2000
+    submit(run_app(), padding + "a" * length + padding)
+    assert len(api.estimates) == 1
+    assert api.last_body()["description"] == "a" * length
 
 
-def test_sidebar_says_the_cache_is_unavailable(api):
-    """Requirement: Panel de contexto CAG / Scenario: Caché no disponible."""
-    api.health = {**HEALTH, "cache": "unavailable"}
-    assert "**Caché:** no disponible" in sidebar_text(run_app())
+def test_validate_description_is_the_mirror_of_the_api():
+    """Requirement: Validación en el cliente (función pura)."""
+    validate = load_ui_namespace()["validate_description"]
+    assert validate("a" * 19) is not None
+    assert validate("a" * 20) is None
+    assert validate("a" * 2000) is None
+    assert validate("a" * 2001) is not None
 
 
-def test_sidebar_asks_for_message_count_3_after_the_first_reply(api):
-    """Requirement: Panel de contexto CAG / Scenario: Prompt tras la primera respuesta."""
-    at = send(run_app(), "T")
-    assert api.calls("/api/v1/context")[-1].url.params["message_count"] == "3"
-    assert [t.value for t in at.sidebar.text_area] == [prompt_context(3).system_prompt]
-    assert prompt_context(3).system_prompt != prompt_context(1).system_prompt
+# --- Requirement: Resultado de la estimación ---
 
 
-def test_sidebar_returns_to_endpoint_prompt_on_new_conversation(api):
-    """Requirement: Panel de contexto CAG (el prompt vuelve al del primer turno)."""
-    at = send(run_app(), "T")
-    at.sidebar.button[0].click().run()
-    assert [t.value for t in at.sidebar.text_area] == [prompt_context(1).system_prompt]
-
-
-# --- Requirement: Métricas de la última llamada ---
-
-
-def test_sidebar_says_there_are_no_metrics_before_the_first_call(api):
-    """Requirement: Métricas / Scenario: Antes de la primera llamada."""
-    assert "Aún no hay métricas" in sidebar_text(run_app())
-
-
-def test_metrics_come_from_the_metrics_event_plus_client_timings(api):
-    """Requirement: Métricas / Scenario: Métricas tras una respuesta."""
-    at = send(run_app(), "T")
-    text = sidebar_text(at)
+def test_full_result_shows_text_version_metrics_and_validation(api):
+    """Requirement: Resultado de la estimación / Scenario: Resultado completo."""
+    api.json_body = {**RESPONSE, "prompt_version": "v2"}
+    at = submit(run_app(), prompt_version="v2")
+    assert not at.exception
+    text = all_text(at)
+    assert "TEXTO-DE-LA-ESTIMACION" in text
+    assert "Versión del prompt: v2" in text
     assert "Modelo: `gpt-4o-mini`" in text
     assert "Proveedor: `openai`" in text
     assert "Respaldo: no" in text
     assert "Desde caché: no" in text
     assert "Tokens de entrada: 1200" in text
     assert "Tokens de salida: 300" in text
-    assert "Tiempo total: " in text and "Tiempo hasta el primer fragmento: " in text
     assert "Coste estimado: $0.000540" in text
-    assert "Respuesta cortada: no" in text
-    metrics = at.session_state["last_metrics"]
-    assert 0 <= metrics.ttft_s <= metrics.total_s
+    assert "Latencia del servidor: 900 ms" in text
+    assert "Tiempo total en el cliente:" in text
+    assert "Comprobaciones superadas: **6/8**" in text
+    assert warnings(at) == VALIDATION["issues"]
+    assert not at.error
 
 
-def test_metrics_of_a_fallback_answer(api):
-    """Requirement: Métricas / Scenario: Métricas de una respuesta del respaldo."""
-    api.stream_body = token("E") + metrics_event(
-        model="claude-haiku-4-5", provider="anthropic", fallback_used=True
-    )
-    text = sidebar_text(send(run_app(), "T"))
-    assert "Modelo: `claude-haiku-4-5`" in text
+def test_result_is_kept_in_session_state_and_survives_reruns(api):
+    """Requirement: Resultado de la estimación (conservado en el estado de la sesión)."""
+    at = submit(run_app())
+    stored = at.session_state["last_result"]
+    assert stored["data"] == RESPONSE
+    assert stored["client_total_s"] >= 0
+    at.run()  # an unrelated rerun
+    assert "TEXTO-DE-LA-ESTIMACION" in all_text(at)
+    assert len(api.estimates) == 1
+
+
+def test_truncated_response_shows_the_incomplete_warning_with_the_text(api):
+    """Requirement: Resultado de la estimación / Scenario: Respuesta truncada."""
+    api.json_body = {**RESPONSE, "truncated": True}
+    at = submit(run_app())
+    assert TRUNCATED in warnings(at)
+    assert "TEXTO-DE-LA-ESTIMACION" in all_text(at)
+
+
+def test_untruncated_response_has_no_incomplete_warning(api):
+    """Requirement: Resultado de la estimación (aviso solo si truncated)."""
+    at = submit(run_app())
+    assert TRUNCATED not in warnings(at)
+
+
+def test_null_validation_shows_text_and_metrics_without_error(api):
+    """Requirement: Resultado de la estimación / Scenario: Sin validación."""
+    api.json_body = {**RESPONSE, "validation": None}
+    at = submit(run_app())
+    assert not at.exception
+    text = all_text(at)
+    assert "TEXTO-DE-LA-ESTIMACION" in text
+    assert "Tokens de entrada: 1200" in text
+    assert "Comprobaciones superadas" not in text
+    assert not at.error
+
+
+def test_unknown_cost_is_shown_as_not_available(api):
+    """Requirement: Resultado de la estimación (coste `null` es "no disponible")."""
+    api.json_body = {**RESPONSE, "cost_usd": None}
+    at = submit(run_app())
+    assert "Coste estimado: no disponible" in all_text(at)
+
+
+def test_fallback_and_cache_flags_are_shown(api):
+    """Requirement: Resultado de la estimación (respaldo y caché en las métricas)."""
+    api.json_body = {**RESPONSE, "fallback_used": True, "cache_hit": True}
+    text = all_text(submit(run_app()))
     assert "Respaldo: sí" in text
+    assert "Desde caché: sí" in text
 
 
-def test_metrics_of_a_cache_hit(api):
-    """Requirement: Métricas / Scenario: Métricas de una respuesta desde la caché."""
-    api.stream_body = token("E") + metrics_event(cache_hit=True)
-    assert "Desde caché: sí" in sidebar_text(send(run_app(), "T"))
+def test_a_new_result_replaces_the_previous_one(api):
+    """Requirement: Resultado de la estimación (el último resultado sustituye al anterior)."""
+    at = submit(run_app())
+    api.json_body = {**RESPONSE, "text": "## Estimación: SEGUNDA"}
+    submit(at)
+    text = all_text(at)
+    assert "SEGUNDA" in text
+    assert "TEXTO-DE-LA-ESTIMACION" not in text
 
 
-def test_metrics_of_a_truncated_answer_and_warning_under_the_reply(api):
-    """Requirement: Métricas / Scenario: Métricas de una respuesta truncada."""
-    api.stream_body = token("E") + metrics_event(truncated=True)
-    at = send(run_app(), "T")
-    assert "Respuesta cortada: sí" in sidebar_text(at)
-    assert len(at.warning) == 1
-    assert "límite de longitud" in at.warning[0].value
+def test_pure_formatters():
+    """Requirement: Resultado de la estimación (puntuación como aprobadas/total, coste)."""
+    ui = load_ui_namespace()
+    assert ui["format_score"]({"score": 0.75, "checks_total": 8}) == "6/8"
+    assert ui["format_score"]({"score": 0.8, "checks_total": 5}) == "4/5"
+    assert ui["format_score"]({"score": 1.0, "checks_total": 5}) == "5/5"
+    assert ui["format_cost"](None) == "no disponible"
+    assert ui["format_cost"](0.5) == "$0.500000"
 
 
-def test_truncation_warning_persists_and_only_under_the_truncated_reply(api):
-    """Requirement: Respuesta truncada (aviso persistente bajo la respuesta cortada)."""
-    api.stream_body = token("E") + metrics_event(truncated=True)
-    at = send(run_app(), "T")
-    api.stream_body = token("E2") + metrics_event()
-    send(at, "ajuste")
-    assert len(at.warning) == 1
-    assert at.chat_message[1].warning
-    assert not at.chat_message[3].warning
-    assert api.sent_messages()[1] == {"role": "assistant", "content": "E"}
+# --- Requirement: Errores de la API en la interfaz ---
 
 
-def test_new_conversation_removes_truncation_warnings(api):
-    """Requirement: Nueva conversación (sin avisos de truncado)."""
-    api.stream_body = token("E") + metrics_event(truncated=True)
-    at = send(run_app(), "T")
-    at.sidebar.button[0].click().run()
-    assert len(at.warning) == 0
+def validation_error(*locs: list) -> dict:
+    return {"detail": [{"loc": loc, "msg": "bad", "type": "x", "input": SECRET} for loc in locs]}
 
 
-def test_cost_is_nd_when_the_event_has_no_price(api):
-    """Requirement: Métricas (coste `n/d` si `cost_usd` es null)."""
-    api.stream_body = token("E") + metrics_event(cost_usd=None)
-    assert "Coste estimado: n/d" in sidebar_text(send(run_app(), "T"))
+def test_422_names_the_rejected_fields_and_never_the_input(api):
+    """Requirement: Errores de la API en la interfaz / Scenario: Error de validación."""
+    api.status = 422
+    api.json_body = validation_error(["body", "description"], ["query", "prompt_version"])
+    at = submit(run_app(), f"{SECRET} una app de reservas")
+    assert not at.exception
+    shown = warnings(at)
+    assert len(shown) == 1
+    assert "`description`" in shown[0] and "`prompt_version`" in shown[0]
+    shown = "\n".join(
+        e.value for e in [*at.warning, *at.error, *at.markdown, *at.caption, *at.info]
+    )
+    assert SECRET not in shown  # only the form field itself (kept below) holds the text
+    assert at.text_area[0].value == f"{SECRET} una app de reservas"  # values are kept
+    assert at.session_state["last_result"] is None
 
 
-def test_metrics_are_kept_between_reruns_until_the_next_call(api):
-    """Requirement: Métricas (se conservan entre reruns)."""
-    at = send(run_app(), "T")
-    first = at.session_state["last_metrics"]
-    at.run()
-    assert at.session_state["last_metrics"] == first
-    assert "Tokens de entrada: 1200" in sidebar_text(at)
+def test_422_with_an_unreadable_body_is_still_a_warning(api):
+    """Requirement: Errores de la API en la interfaz (422 sin campos legibles)."""
+    api.status = 422
+    api.raw_body = b"not json"
+    at = submit(run_app())
+    assert not at.exception
+    assert len(warnings(at)) == 1
+    assert not at.error
+
+
+def test_rejected_fields_uses_only_loc():
+    """Requirement: Errores de la API en la interfaz (nombres de `loc`, nunca `input`)."""
+    rejected = load_ui_namespace()["rejected_fields"]
+    response = httpx.Response(422, json=validation_error(["body", "description"], ["body", "x"]))
+    assert rejected(response) == ["description", "x"]
+    assert rejected(httpx.Response(422, content=b"[")) == []
+
+
+@pytest.mark.parametrize("status", [502, 500, 503, 404])
+def test_provider_or_other_status_shows_the_generic_error_without_details(api, status):
+    """Requirement: Errores de la API en la interfaz / Scenario: Fallo del proveedor."""
+    api.status = status
+    api.json_body = {"detail": "SECRET-DETAIL Traceback sk-leak"}
+    at = submit(run_app())
+    assert not at.exception
+    assert errors(at) == [GENERIC_ERROR]
+    assert "SECRET-DETAIL" not in all_text(at)
+    assert "Traceback" not in all_text(at)
+    assert at.session_state["last_result"] is None
+
+
+def test_provider_failure_shows_no_new_result_and_keeps_the_previous_one(api):
+    """Requirement: Errores de la API / Scenario: Fallo del proveedor (sin resultado nuevo)."""
+    at = submit(run_app())
+    api.status = 502
+    submit(at)
+    assert errors(at) == [GENERIC_ERROR]
+    assert at.session_state["last_result"]["data"] == RESPONSE
+    assert at.text_area[0].value == DESCRIPTION
+
+
+@pytest.mark.parametrize(
+    "body", [b"not json at all", b"[1, 2]", b'{"no_text": true}', b'{"text": 5}'], ids=str
+)
+def test_invalid_json_is_the_generic_error_and_is_logged(api, body):
+    """Requirement: Errores de la API (JSON inválido) / Logs (reason invalid_payload)."""
+    api.raw_body = body
+    with capture_logs() as logs:
+        at = submit(run_app())
+    assert errors(at) == [GENERIC_ERROR]
+    assert [(e["event"], e["reason"]) for e in logs if e["event"] == "api_request_failed"] == [
+        ("api_request_failed", "invalid_payload")
+    ]
+
+
+def test_read_timeout_is_the_generic_error_and_is_logged(api):
+    """Requirement: Errores de la API (tiempo de lectura agotado) / Logs (reason timeout)."""
+    api.estimate_error = httpx.ReadTimeout("timed out")
+    with capture_logs() as logs:
+        at = submit(run_app())
+    assert errors(at) == [GENERIC_ERROR]
+    assert any(e["event"] == "api_request_failed" and e["reason"] == "timeout" for e in logs)
+    assert not any(e["event"] == "api_unreachable" for e in logs)
+
+
+def test_transport_error_is_the_generic_error_and_is_logged(api):
+    """Requirement: Errores de la API / Logs (reason transport_error)."""
+    api.estimate_error = httpx.RemoteProtocolError("peer closed")
+    with capture_logs() as logs:
+        at = submit(run_app())
+    assert errors(at) == [GENERIC_ERROR]
+    assert any(
+        e["event"] == "api_request_failed" and e["reason"] == "transport_error" for e in logs
+    )
+
+
+def test_the_read_timeout_is_120_seconds():
+    """Requirement: Errores de la API en la interfaz (tiempo de lectura de 120 segundos)."""
+    timeout = load_ui_namespace()["ESTIMATE_TIMEOUT"]
+    assert timeout.read == 120.0
 
 
 # --- Requirement: URL del servicio por configuración ---
 
 
 def test_default_url_is_localhost_8000(api, monkeypatch):
-    """Requirement: URL del servicio / Scenario: URL por defecto."""
+    """Requirement: URL del servicio por configuración / Scenario: URL por defecto."""
     monkeypatch.delenv("ESTIMATOR_API_BASE_URL")
-    send(run_app(), "T")
-    assert str(api.stream_calls[0].url) == "http://localhost:8000/api/v1/estimate/stream"
+    submit(run_app())
+    assert str(api.estimates[0].url) == "http://localhost:8000/api/v1/estimate?prompt_version=v1"
 
 
 def test_configured_url_from_the_environment(api, monkeypatch):
-    """Requirement: URL del servicio / Scenario: URL configurada."""
+    """Requirement: URL del servicio por configuración / Scenario: URL configurada."""
     monkeypatch.setenv("ESTIMATOR_API_BASE_URL", "http://api.local:9000")
-    send(run_app(), "T")
-    assert str(api.stream_calls[0].url) == "http://api.local:9000/api/v1/estimate/stream"
+    submit(run_app())
+    assert api.estimates[0].url.scheme == "http"
+    assert (api.estimates[0].url.host, api.estimates[0].url.port) == ("api.local", 9000)
+    assert api.estimates[0].url.path == "/api/v1/estimate"
     assert all(r.url.host == "api.local" for r in api.requests)
 
 
@@ -718,90 +623,160 @@ def test_url_is_read_from_the_env_file_only_for_that_key_and_keys_stay_out_of_th
         "ESTIMATOR_API_BASE_URL=http://from-dotenv:7000\n"
         f"OPENAI_API_KEY={FAKE_OPENAI_KEY}\nANTHROPIC_API_KEY={FAKE_ANTHROPIC_KEY}\n"
     )
-    at = send(run_app(), "T")
-    assert str(api.stream_calls[0].url) == "http://from-dotenv:7000/api/v1/estimate/stream"
+    at = submit(run_app())
+    assert api.estimates[0].url.host == "from-dotenv"
     text = all_text(at)
     assert FAKE_OPENAI_KEY not in text and FAKE_ANTHROPIC_KEY not in text
     assert "SECRET" not in text
 
 
-def test_environment_wins_over_the_env_file(api, monkeypatch, tmp_path):
+def test_environment_wins_over_the_env_file(api, tmp_path):
     """Requirement: URL del servicio (el entorno tiene precedencia sobre `.env`)."""
     (tmp_path / ".env").write_text("ESTIMATOR_API_BASE_URL=http://from-dotenv:7000\n")
-    send(run_app(), "T")
-    assert api.stream_calls[0].url.host == "api.test"
+    submit(run_app())
+    assert api.estimates[0].url.host == "api.test"
 
 
-def test_app_does_not_load_provider_keys_into_the_environment(api, monkeypatch, tmp_path):
+def test_app_does_not_load_provider_keys_into_the_environment(api, tmp_path):
     """Requirement: URL del servicio (la app no carga las API keys de los proveedores)."""
     (tmp_path / ".env").write_text(f"OPENAI_API_KEY={FAKE_OPENAI_KEY}\n")
     run_app()
-    import os
-
     assert "OPENAI_API_KEY" not in os.environ
 
 
 # --- Requirement: API no disponible ---
 
 
-def test_opening_with_the_api_down_warns_and_keeps_the_chat_visible(api):
+def test_opening_with_the_api_down_warns_in_the_sidebar_and_keeps_the_form_visible(api):
     """Requirement: API no disponible / Scenario: Abrir la app con la API parada."""
     api.down = True
     at = run_app()
     assert not at.exception
-    assert [w.value for w in at.sidebar.warning] == [unavailable()]
-    assert len(at.chat_input) == 1
-    assert at.sidebar.button[0].label == "Nueva conversación"
+    assert unavailable() in [w.value for w in at.sidebar.warning]
+    assert len(at.text_area) == 1
+    assert at.button[0].label == "Estimar"
 
 
 def test_unavailable_warning_uses_the_configured_url(api, monkeypatch):
-    """Requirement: API no disponible (el aviso incluye la URL configurada)."""
-    monkeypatch.setenv("ESTIMATOR_API_BASE_URL", "http://api.local:9000/")
+    """Requirement: API no disponible (aviso con la URL configurada)."""
     api.down = True
+    monkeypatch.setenv("ESTIMATOR_API_BASE_URL", "http://api.local:9000/")
     at = run_app()
-    assert [w.value for w in at.sidebar.warning] == [unavailable("http://api.local:9000")]
+    assert unavailable("http://api.local:9000") in [w.value for w in at.sidebar.warning]
 
 
-def test_sending_with_the_api_down_warns_saves_nothing_and_recovers_without_reload(api):
-    """Requirement: API no disponible / Scenario: Envío con la API parada; Observability /
-    Scenario: API inaccesible desde la UI."""
-    at = send(run_app(), "T")
-    before = history(at)
+def test_sending_with_the_api_down_warns_keeps_values_and_recovers_without_reload(api):
+    """Requirement: API no disponible / Scenario: Envío con la API parada."""
     api.down = True
     with capture_logs() as logs:
-        send(at, "mensaje-secreto-ajuste")
+        at = submit(run_app(), project_type="data_pipeline", detail_level="summary")
     assert not at.exception
-    assert history(at) == before
-    assert unavailable() in [w.value for w in at.warning]
-    assert not errors(at)
-    assert [m.markdown[0].value for m in at.chat_message[:2]] == [before[0][1], before[1][1]]
-    assert len(at.chat_input) == 1
-    unreachable = [e for e in logs if e["event"] == "api_unreachable"]
-    assert len(unreachable) == 1
-    assert unreachable[0]["error_type"] == "ConnectError"
-    assert "mensaje-secreto-ajuste" not in sent_text_of_logs(logs)
-    assert "connection refused" not in sent_text_of_logs(logs)
+    assert unavailable() in warnings(at)
+    assert not at.error
+    assert at.session_state["last_result"] is None
+    assert at.text_area[0].value == DESCRIPTION
+    assert (at.selectbox[0].value, at.radio[0].value) == ("data_pipeline", "summary")
+    assert any(e["event"] == "api_unreachable" for e in logs)
 
-    api.down = False
-    api.stream_body = token("E2") + metrics_event()
-    send(at, "mensaje-secreto-ajuste")
-    assert history(at)[-2:] == [("user", "mensaje-secreto-ajuste"), ("assistant", "E2")]
+    api.down = False  # the API comes back; no page reload
+    at.button[0].click().run()
+    assert not at.exception
+    assert "TEXTO-DE-LA-ESTIMACION" in all_text(at)
+    assert api.last_body()["project_type"] == "data_pipeline"
 
 
-def test_send_with_health_up_but_stream_refused_shows_unavailable(api):
-    """Requirement: API no disponible (conexión rechazada solo en el stream)."""
-    api.stream_down = True
-    at = send(run_app(), "T")
-    assert unavailable() in [w.value for w in at.warning]
-    assert history(at) == []
+def test_send_with_health_up_but_estimate_refused_shows_unavailable(api):
+    """Requirement: API no disponible (conexión rechazada solo en el POST)."""
+    api.estimate_down = True
+    at = submit(run_app())
+    assert unavailable() in warnings(at)
+    assert not at.sidebar.warning
 
 
-def test_unhealthy_health_but_working_context_does_not_show_the_unavailable_warning(api):
-    """Design D6: the warning appears only if the API cannot be reached for both reads."""
+def test_connect_timeout_counts_as_unavailable(api):
+    """Requirement: API no disponible (timeout de conexión)."""
+    api.estimate_error = httpx.ConnectTimeout("connect timed out")
+    at = submit(run_app())
+    assert unavailable() in warnings(at)
+
+
+def test_sidebar_shows_the_health_of_the_api(api):
+    """Requirement: API no disponible (panel lateral con /health: modelos y caché)."""
+    at = run_app()
+    text = sidebar_text(at)
+    assert "**Modelo primario:** `gpt-4o-mini`" in text
+    assert "**Modelo de respaldo:** `claude-haiku-4-5`" in text
+    assert "**Caché:** disponible" in text
+    assert not at.sidebar.warning
+
+
+def test_sidebar_says_there_is_no_fallback_and_the_cache_is_unavailable(api):
+    """Requirement: API no disponible (estado de /health sin respaldo ni caché)."""
+    api.health = {**HEALTH, "fallback_model": None, "cache": "unavailable"}
+    text = sidebar_text(run_app())
+    assert "Sin respaldo" in text
+    assert "**Caché:** no disponible" in text
+
+
+def test_unhealthy_health_endpoint_shows_the_unavailable_warning(api):
+    """Requirement: API no disponible (si /health no responde 200 se muestra el aviso)."""
     api.health = None
     at = run_app()
-    assert not at.sidebar.warning
-    assert [t.value for t in at.sidebar.text_area] == [prompt_context(1).system_prompt]
+    assert unavailable() in [w.value for w in at.sidebar.warning]
+
+
+def test_sidebar_has_only_health_no_context_panel_history_or_new_conversation(api):
+    """Requirement: API no disponible (la barra lateral solo tiene /health)."""
+    at = run_app()
+    assert len(at.sidebar.text_area) == 0
+    assert len(at.sidebar.button) == 0
+    assert [r.url.path for r in api.requests] == ["/health"]
+
+
+# --- Requirement: Logs de la interfaz ---
+
+
+def test_failure_is_logged_with_reason_and_status_without_content(api):
+    """Requirement: Logs de la interfaz / Scenario: Fallo registrado sin contenido."""
+    api.status = 502
+    api.json_body = {"detail": "SECRET-DETAIL"}
+    with capture_logs() as logs:
+        at = submit(run_app(), f"{SECRET} app de reservas")
+    assert errors(at) == [GENERIC_ERROR]
+    failed = [e for e in logs if e["event"] == "api_request_failed"]
+    assert len(failed) == 1
+    assert (failed[0]["reason"], failed[0]["status_code"]) == ("http_status", 502)
+    dumped = json.dumps(logs, default=str)
+    assert SECRET not in dumped
+    assert "SECRET-DETAIL" not in dumped
+
+
+def test_422_is_logged_as_http_status_without_the_input(api):
+    """Requirement: Logs de la interfaz (reason http_status con el código 422)."""
+    api.status = 422
+    api.json_body = validation_error(["body", "description"])
+    with capture_logs() as logs:
+        submit(run_app(), f"{SECRET} app de reservas")
+    failed = [e for e in logs if e["event"] == "api_request_failed"]
+    assert [(e["reason"], e["status_code"]) for e in failed] == [("http_status", 422)]
+    assert SECRET not in json.dumps(logs, default=str)
+
+
+def test_unreachable_is_logged_with_the_error_type_only(api):
+    """Requirement: Logs de la interfaz (`api_unreachable` con el tipo de error)."""
+    api.down = True
+    with capture_logs() as logs:
+        submit(run_app(), f"{SECRET} app de reservas")
+    unreachable = [e for e in logs if e["event"] == "api_unreachable"]
+    assert [e["error_type"] for e in unreachable] == ["ConnectError"]
+    assert SECRET not in json.dumps(logs, default=str)
+
+
+def test_successful_estimation_logs_no_failure_events(api):
+    """Requirement: Logs de la interfaz (solo se registran fallos)."""
+    with capture_logs() as logs:
+        submit(run_app())
+    assert not [e for e in logs if e["event"] in {"api_unreachable", "api_request_failed"}]
 
 
 # --- End to end: UI -> API -> service (TestClient as httpx.Client) ---
@@ -811,7 +786,7 @@ def test_unhealthy_health_but_working_context_does_not_show_the_unavailable_warn
 def e2e(monkeypatch: pytest.MonkeyPatch, response_cache):
     """Patch `httpx.Client` with an ASGI-backed TestClient over the real app and a FakeProvider."""
     provider = FakeProvider(
-        fragments=["## Estimación\n\n", "| A | B |"], model="gpt-4o-mini", input_tokens=1200
+        text=example_estimates("line_items")[0], model="gpt-4o-mini", input_tokens=1200
     )
     settings = make_settings(anthropic_api_key="sk-ant-fake")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-lifespan")
@@ -830,51 +805,55 @@ def e2e(monkeypatch: pytest.MonkeyPatch, response_cache):
         app.dependency_overrides.clear()
 
 
-def test_e2e_first_turn_and_adjustment_through_the_real_api(e2e):
-    """Requirement: Aplicación Streamlit de chat / Scenarios: Estimación y Petición enviada;
-    Panel de contexto (contenido real de la API); Tests sin red / Streamlit sin API real."""
+def test_e2e_submit_reaches_the_service_with_rendered_prompts(e2e):
+    """Requirement: Envío tipado y Resultado completo (de extremo a extremo con la API real)."""
     at = run_app()
     assert not at.exception
     assert "**Modelo de respaldo:** `claude-haiku-4-5`" in sidebar_text(at)
-    assert "**Caché:** disponible" in sidebar_text(at)
-    assert [t.value for t in at.sidebar.text_area] == [prompt_context(1).system_prompt]
-
-    send(at, "  Necesitamos una web  ")
+    submit(at, f"  {DESCRIPTION}  ", detail_level="detailed", output_format="line_items")
     assert not at.exception
-    assert history(at) == [
-        ("user", "Necesitamos una web"),
-        ("assistant", "## Estimación\n\n| A | B |"),
-    ]
     system, messages = e2e.calls[0]
-    assert messages == [{"role": "user", "content": "Necesitamos una web"}]
-    assert system == prompt_context(1).system_prompt
-    assert "Tokens de entrada: 1200" in sidebar_text(at)
-    assert [t.value for t in at.sidebar.text_area] == [prompt_context(3).system_prompt]
+    assert f"<project_description>\n{DESCRIPTION}\n</project_description>" in messages[0]["content"]
+    assert "<project_type>mobile_app</project_type>" in messages[0]["content"]
+    assert "Lista los supuestos de cada fase" in system
+    assert DESCRIPTION not in system
+    text = all_text(at)
+    assert "Versión del prompt: v1" in text
+    assert "Comprobaciones superadas: **8/8**" in text
+    assert "Tokens de entrada: 1200" in text
 
-    send(at, "quita el blog")
-    system, messages = e2e.calls[1]
-    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
-    assert system == prompt_context(3).system_prompt
-    assert len(history(at)) == 4
+
+def test_e2e_prompt_version_v2_reaches_the_service(e2e):
+    """Requirement: Versión del prompt (de extremo a extremo)."""
+    at = submit(run_app(), prompt_version="v2")
+    assert "Versión del prompt: v2" in all_text(at)
+    assert "concisas" in e2e.calls[0][0]
 
 
 def test_e2e_provider_failure_reaches_the_ui_as_the_generic_error(e2e):
-    """Requirement: Errores del proveedor / Scenario: Proveedor caído (de extremo a extremo)."""
+    """Requirement: Errores de la API / Scenario: Fallo del proveedor (de extremo a extremo)."""
     e2e.error = llm_service.LLMProviderError("openai")
-    e2e.error_after = 1
-    at = send(run_app(), "T")
+    at = submit(run_app())
     assert errors(at) == [GENERIC_ERROR]
-    assert history(at) == []
+    assert at.session_state["last_result"] is None
     assert "Traceback" not in all_text(at)
 
 
 def test_e2e_cache_hit_is_reported_in_the_ui(e2e, response_cache):
-    """Requirement: Métricas / Scenario: Respuesta desde la caché (UI -> API -> caché)."""
+    """Requirement: Resultado de la estimación (métricas: caché) de extremo a extremo."""
     cached = llm_service.CachedProvider(e2e, response_cache, "gpt-4o-mini")
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: cached
-    first = send(run_app(), "T")
-    assert "Desde caché: no" in sidebar_text(first)
-    second = send(run_app(), "T")
-    assert "Desde caché: sí" in sidebar_text(second)
-    assert history(second)[1] == ("assistant", "## Estimación\n\n| A | B |")
+    first = submit(run_app())
+    assert "Desde caché: no" in all_text(first)
+    second = submit(run_app())
+    assert "Desde caché: sí" in all_text(second)
     assert e2e.call_count == 1
+
+
+def test_e2e_logs_never_contain_the_description(e2e, capsys):
+    """Requirement: Datos que nunca se registran (UI + API: la descripción no llega a los logs)."""
+    e2e.error = llm_service.LLMProviderError("openai")
+    with capture_logs() as logs:
+        submit(run_app(), f"{SECRET} una app de reservas con pagos")
+    assert SECRET not in json.dumps(logs, default=str)
+    assert SECRET not in capsys.readouterr().err

@@ -1,0 +1,25 @@
+{#
+  Estimation user message. Language-neutral wrapper (only tags and values), so the only
+  natural language in the message is the user's. The description goes last, verbatim and
+  unescaped. Reference projects are user data too: never in the system prompt.
+#}
+<project_type>{{ project_type }}</project_type>
+{% if reference_projects %}
+<reference_projects>
+{% for project in reference_projects %}
+<reference_project>
+<name>{{ project.name }}</name>
+<summary>{{ project.summary }}</summary>
+{% if project.actual_hours is not none %}
+<actual_hours>{{ project.actual_hours }}</actual_hours>
+{% endif %}
+{% if project.duration_weeks is not none %}
+<duration_weeks>{{ project.duration_weeks }}</duration_weeks>
+{% endif %}
+</reference_project>
+{% endfor %}
+</reference_projects>
+{% endif %}
+<project_description>
+{{ description }}
+</project_description>

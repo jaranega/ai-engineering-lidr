@@ -83,7 +83,7 @@ Cada llamada al LLM, en modo normal o en streaming, MUST usar como límite de to
 - **THEN** se registra el mismo warning, el texto entregado se conserva y el resultado tiene `truncated = true`
 
 #### Scenario: Límite por defecto
-- **WHEN** se solicita una generación sin opciones de llamada (chat, SSE o `POST /api/v1/estimate` sin `max_tokens`)
+- **WHEN** se solicita una generación sin opciones de llamada (por ejemplo, `POST /api/v1/estimate` sin `max_tokens`)
 - **THEN** la llamada usa `max_tokens = 2048`
 
 #### Scenario: Límite de la petición
@@ -153,7 +153,7 @@ El sistema SHALL llamar primero al modelo primario (`PRIMARY_MODEL`) y, solo si 
 - **THEN** la iteración termina con el error de dominio y el respaldo no se llama
 
 ### Requirement: Opciones por llamada
-La interfaz de proveedor SHALL aceptar, en `generate` y en `stream`, unas opciones de llamada opcionales: modelo destino (sustituye al primario y desactiva el fallback), `max_tokens` y presupuesto de razonamiento. Sin opciones, el comportamiento MUST ser el de los valores por defecto, de modo que el chat, el endpoint SSE y los dobles de prueba existentes no cambien.
+La interfaz de proveedor SHALL aceptar, en `generate` y en `stream`, unas opciones de llamada opcionales: modelo destino (sustituye al primario y desactiva el fallback), `max_tokens` y presupuesto de razonamiento. Sin opciones, el comportamiento MUST ser el de los valores por defecto, de modo que los llamadores sin opciones y los dobles de prueba existentes no cambien. El streaming (`stream`) se mantiene en la interfaz aunque ningún endpoint lo exponga desde S04.
 
 #### Scenario: Sin opciones
 - **WHEN** se llama a `generate(system, messages)` sin opciones

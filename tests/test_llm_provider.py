@@ -27,7 +27,7 @@ from app.services.llm_service import (
     build_override_router,
     build_router,
 )
-from tests.conftest import make_settings
+from tests.conftest import make_input, make_settings
 
 PRIMARY = Deployment("gpt-4o-mini", "openai")
 FALLBACK = Deployment("claude-haiku-4-5", "anthropic")
@@ -234,7 +234,7 @@ def test_snapshot_model_is_priced_like_the_alias():
 def test_fallback_answer_is_priced_with_fallback_model():
     """Requirement: Coste estimado / Scenario: Coste del respaldo."""
     router = FakeRouter(response(usage=(1000, 500), model_id=FALLBACK_GROUP))
-    estimation = EstimationService(make_provider(router)).estimate("T")
+    estimation = EstimationService(make_provider(router)).estimate(make_input())
     assert estimation.model == "claude-haiku-4-5"
     assert estimation.cost_usd == 0.0035
 

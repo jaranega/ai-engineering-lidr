@@ -1,41 +1,40 @@
 """HTTP contract schemas."""
 
-from typing import Annotated, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field, StringConstraints, model_validator
+from pydantic import BaseModel, Field
 
+from app.domain import (
+    DetailLevel,
+    EstimationInput,
+    OutputFormat,
+    ProjectType,
+    ReferenceProject,
+)
 from app.services.llm_service import (
     MAX_MODEL_NAME_CHARS,
     MAX_OUTPUT_TOKENS,
     MAX_THINKING_BUDGET,
     MAX_TOKENS,
-    MAX_TRANSCRIPTION_CHARS,
     MIN_THINKING_BUDGET,
     NUM_EXAMPLES,
-    ChatMessage,
-    ExampleFormat,
-    Preprocessing,
 )
 
-MessageText = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_TRANSCRIPTION_CHARS),
+__all__ = [
+    "DetailLevel",
+    "EstimationInput",
+    "EstimationMetrics",
+    "EstimationRequest",
+    "EstimationResponse",
+    "HealthResponse",
+    "OutputFormat",
+    "ProjectType",
+    "ReferenceProject",
+    "StructureCheckResponse",
 ]
 
 
-class EstimationRequest(BaseModel):
-    transcription: MessageText = Field(
-        description="Transcript of the client meeting (1 to 20 000 characters, after trimming).",
-        examples=["Cliente: queremos una web para gestionar reservas de nuestras pistas de pádel."],
-    )
-    preprocessing: Preprocessing = Field(
-        default="none",
-        description="Input strategy: none, inline_cleaning (prompt block) or two_phase "
-        "(requirements extraction first).",
-    )
-    example_format: ExampleFormat = Field(
-        default="markdown", description="Format of the CAG examples in the system prompt."
-    )
+class EstimationRequest(EstimationInput):
     num_examples: int = Field(
         default=NUM_EXAMPLES,
         ge=0,
@@ -69,33 +68,6 @@ class EstimationRequest(BaseModel):
     )
 
 
-class ConversationMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: MessageText = Field(
-        description="Message text (1 to 20 000 characters, after trimming)."
-    )
-
-
-class StreamEstimationRequest(BaseModel):
-    messages: list[ConversationMessage] = Field(
-        description="Whole conversation: first and last message from `user`, roles alternating."
-    )
-
-    @model_validator(mode="after")
-    def _check_structure(self) -> "StreamEstimationRequest":
-        roles = [message.role for message in self.messages]
-        if not roles:
-            raise ValueError("messages must not be empty")
-        if roles[0] != "user" or roles[-1] != "user":
-            raise ValueError("the first and the last message must come from the user")
-        if any(a == b for a, b in zip(roles, roles[1:], strict=False)):
-            raise ValueError("roles must alternate between user and assistant")
-        return self
-
-    def chat_messages(self) -> list[ChatMessage]:
-        return [{"role": m.role, "content": m.content} for m in self.messages]
-
-
 class EstimationMetrics(BaseModel):
     model: str = Field(
         description="Effective model: the configured model of the deployment that answered.",
@@ -120,8 +92,12 @@ class EstimationMetrics(BaseModel):
 
 
 class StructureCheckResponse(BaseModel):
+    output_format: str = Field(description="Output format the check was applied to.")
+    checks_total: int = Field(description="Number of checks applicable to the format.")
     has_title: bool
-    has_breakdown_table: bool
+    has_breakdown_table: bool | None = Field(
+        description="Null when the format has no breakdown table (narrative)."
+    )
     has_totals: bool
     has_team: bool
     has_duration: bool
@@ -138,30 +114,11 @@ class StructureCheckResponse(BaseModel):
 
 
 class EstimationResponse(EstimationMetrics):
-    estimation: str = Field(description="Software estimation in Markdown.")
-    preprocessing: Preprocessing = Field(description="Preprocessing strategy applied.")
-    extracted_requirements: str | None = Field(
-        description="Requirements extracted in the first phase; only with two_phase."
-    )
-    preprocessing_input_tokens: int = Field(description="Prompt tokens of the first phase.")
-    preprocessing_output_tokens: int = Field(description="Completion tokens of the first phase.")
-    preprocessing_cost_usd: float | None = Field(
-        description="Approximate cost of the first phase in USD; not included in cost_usd."
-    )
+    text: str = Field(description="Software estimation in Markdown.")
+    prompt_version: str = Field(description="Prompt version effectively rendered.")
     validation: StructureCheckResponse | None = Field(
         description="Structural check of the estimation; null if evaluate is false."
     )
-
-
-class ExampleContext(BaseModel):
-    meeting_summary: str
-    estimation: str
-
-
-class ContextResponse(BaseModel):
-    system_prompt: str = Field(description="System prompt a request with N messages would use.")
-    examples: list[ExampleContext] = Field(description="Static CAG examples, in order.")
-    max_message_chars: int = Field(description="Maximum characters per message, after trimming.")
 
 
 class HealthResponse(BaseModel):

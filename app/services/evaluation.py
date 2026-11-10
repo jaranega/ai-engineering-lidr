@@ -1,16 +1,24 @@
-"""Structural evaluation of an estimation (design D6).
+"""Structural evaluation of an estimation (S02 design D6, S04 design D11).
 
-Pure: regular expressions over the Markdown, no LLM and no network. Labels are accepted
-in Spanish and English (also "Hours total" / "Cost total"), case-insensitive and ignoring
-bold/italic markers, without detecting the language. `issues` are fixed English phrases
-with numbers only, never text from the estimation, so they can be logged.
+Pure: regular expressions over the Markdown, no LLM and no network. The checks depend on
+the requested output format: `line_items` (task table), `phases_table` (phase table with
+a confidence column) and `narrative` (prose, no table and no arithmetic checks). Labels
+are accepted in Spanish and English (also "Hours total" / "Cost total"), case-insensitive
+and ignoring bold/italic markers, without detecting the language. `issues` are fixed
+English phrases with numbers only, never text from the estimation, so they can be logged.
 """
 
 import re
 from dataclasses import dataclass
 
-# Number of checks behind `score`.
-CHECK_COUNT = 8
+from app.domain import OutputFormat
+
+# Number of checks behind `score`, per output format (S04 design D11).
+CHECK_COUNTS: dict[OutputFormat, int] = {
+    OutputFormat.LINE_ITEMS: 8,
+    OutputFormat.PHASES_TABLE: 8,
+    OutputFormat.NARRATIVE: 5,
+}
 # Tolerances of the arithmetic checks: absolute hours, and a fraction of the declared cost
 # (the reference implementation's 2 %).
 HOURS_TOLERANCE = 1.0
@@ -19,8 +27,10 @@ COST_TOLERANCE_RATIO = 0.02
 
 @dataclass(frozen=True)
 class StructureCheck:
+    output_format: str  # value of `OutputFormat`
+    checks_total: int  # denominator of `score` (CHECK_COUNTS of the format)
     has_title: bool
-    has_breakdown_table: bool
+    has_breakdown_table: bool | None  # None in `narrative` (not applicable)
     has_totals: bool
     has_team: bool
     has_duration: bool
@@ -54,8 +64,26 @@ _DURATION = re.compile(
 )
 
 _TASK_HEADER = re.compile(r"^(tareas?|tasks?)\b", re.IGNORECASE)
+_PHASE_HEADER = re.compile(r"^(fases?|phases?)\b", re.IGNORECASE)
 _HOURS_HEADER = re.compile(r"^(horas|hours)\b", re.IGNORECASE)
 _COST_HEADER = re.compile(r"^(coste|costo|cost)\b", re.IGNORECASE)
+# "Confianza", "Confianza (%)", "Confidence (%)"...
+_CONFIDENCE_HEADER = re.compile(r"^(confianza|confidence)\b", re.IGNORECASE)
+
+# Header patterns of the breakdown table of each tabular format. The first one is the
+# identifier column (where `Total` rows are skipped); hours and cost are second and third.
+# Extra patterns are only required for the table to be recognized (the confidence is
+# informative and not validated row by row).
+_TABLE_HEADERS: dict[OutputFormat, tuple[re.Pattern[str], ...]] = {
+    OutputFormat.LINE_ITEMS: (_TASK_HEADER, _HOURS_HEADER, _COST_HEADER),
+    OutputFormat.PHASES_TABLE: (_PHASE_HEADER, _HOURS_HEADER, _COST_HEADER, _CONFIDENCE_HEADER),
+}
+_MISSING_TABLE_ISSUES: dict[OutputFormat, str] = {
+    OutputFormat.LINE_ITEMS: "missing breakdown table with task, hours and cost columns",
+    OutputFormat.PHASES_TABLE: (
+        "missing phase breakdown table with phase, hours, cost and confidence columns"
+    ),
+}
 _SEPARATOR = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
 _TOTAL_ROW = re.compile(r"^total", re.IGNORECASE)
 _NUMBER_NOISE = re.compile(r"(eur|€|h|\s| |\*)", re.IGNORECASE)
@@ -95,25 +123,32 @@ def _cells(line: str) -> list[str]:
     return [cell.strip() for cell in stripped.split("|")]
 
 
-def _header_columns(cells: list[str]) -> tuple[int, int, int] | None:
-    """Column indexes of task, hours and cost, or `None` if this is not the header."""
-    indexes: list[int | None] = [None, None, None]
+def _header_columns(
+    cells: list[str], patterns: tuple[re.Pattern[str], ...]
+) -> tuple[int, int, int] | None:
+    """Column indexes of identifier, hours and cost, or `None` if this is not the header.
+
+    Every pattern must match a column; only the first three indexes are returned.
+    """
+    indexes: list[int | None] = [None] * len(patterns)
     for index, cell in enumerate(cells):
-        for slot, pattern in enumerate((_TASK_HEADER, _HOURS_HEADER, _COST_HEADER)):
+        for slot, pattern in enumerate(patterns):
             if indexes[slot] is None and pattern.match(cell):
                 indexes[slot] = index
     if any(index is None for index in indexes):
         return None
-    task, hours, cost = indexes
-    return task, hours, cost  # type: ignore[return-value]
+    ident, hours, cost = indexes[:3]
+    return ident, hours, cost  # type: ignore[return-value]
 
 
-def _parse_table(lines: list[str]) -> tuple[bool, list[tuple[float, float]]]:
+def _parse_table(
+    lines: list[str], patterns: tuple[re.Pattern[str], ...]
+) -> tuple[bool, list[tuple[float, float]]]:
     """Find the breakdown table; return whether it exists and its (hours, cost) rows."""
     for index, line in enumerate(lines[:-1]):
         if not line.strip().startswith("|"):
             continue
-        columns = _header_columns(_cells(line))
+        columns = _header_columns(_cells(line), patterns)
         if columns is None or not _SEPARATOR.match(lines[index + 1].strip()):
             continue
         task_col, hours_col, cost_col = columns
@@ -140,19 +175,31 @@ def _fmt(value: float) -> str:
     return str(int(value)) if value.is_integer() else f"{value:.2f}"
 
 
-def evaluate_estimation(text: str, truncated: bool) -> StructureCheck:
-    """Check the structure and arithmetic of an estimation in Markdown.
+def evaluate_estimation(
+    text: str,
+    truncated: bool,
+    output_format: OutputFormat | str = OutputFormat.LINE_ITEMS,
+) -> StructureCheck:
+    """Check the structure and arithmetic of an estimation in Markdown, per format.
 
-    Eight checks: title, breakdown table, both totals, team, duration, hours sum, cost
-    sum and not truncated. `score` is passed / 8 rounded to 3 decimals; an arithmetic
-    check without data (`None`) counts as failed. One issue per failed check.
+    `line_items` and `phases_table`: eight checks (title, breakdown table, both totals,
+    team, duration, hours sum, cost sum and not truncated). `narrative`: five checks
+    (title, totals, team, duration and not truncated); the table and arithmetic fields
+    are `None` and `rows_parsed` is 0. `score` is passed / `CHECK_COUNTS[format]` rounded
+    to 3 decimals; an arithmetic check without data (`None`) counts as failed in the
+    tabular formats. One issue per failed check. Raise `ValueError` for an unknown format.
     """
+    fmt = OutputFormat(output_format)
+    tabular = fmt in _TABLE_HEADERS
     # Bold/italic markers removed so labels match with or without `**`.
     plain = re.sub(r"[*_]", "", text)
     lines = plain.splitlines()
 
     has_title = bool(_TITLE.search(plain))
-    has_table, rows = _parse_table(lines)
+    has_table: bool | None = None
+    rows: list[tuple[float, float]] = []
+    if tabular:
+        has_table, rows = _parse_table(lines, _TABLE_HEADERS[fmt])
     declared_hours = _declared(_TOTAL_HOURS, plain)
     declared_cost = _declared(_TOTAL_COST, plain)
     has_totals = declared_hours is not None and declared_cost is not None
@@ -179,8 +226,8 @@ def evaluate_estimation(text: str, truncated: bool) -> StructureCheck:
     issues: list[str] = []
     if not has_title:
         issues.append("missing title ('Estimación:' / 'Estimate:' heading)")
-    if not has_table:
-        issues.append("missing breakdown table with task, hours and cost columns")
+    if tabular and not has_table:
+        issues.append(_MISSING_TABLE_ISSUES[fmt])
     if not has_totals:
         missing = [
             name
@@ -192,28 +239,25 @@ def evaluate_estimation(text: str, truncated: bool) -> StructureCheck:
         issues.append("missing recommended team")
     if not has_duration:
         issues.append("missing estimated duration in weeks")
-    if hours_match is None:
-        issues.append("hours check not possible: missing table rows or declared total hours")
-    elif not hours_match and hours_issue:
-        issues.append(hours_issue)
-    if cost_match is None:
-        issues.append("cost check not possible: missing table rows or declared total cost")
-    elif not cost_match and cost_issue:
-        issues.append(cost_issue)
+    if tabular:
+        if hours_match is None:
+            issues.append("hours check not possible: missing table rows or declared total hours")
+        elif not hours_match and hours_issue:
+            issues.append(hours_issue)
+        if cost_match is None:
+            issues.append("cost check not possible: missing table rows or declared total cost")
+        elif not cost_match and cost_issue:
+            issues.append(cost_issue)
     if not finish_ok:
         issues.append("response truncated at the output token limit")
 
-    checks = (
-        has_title,
-        has_table,
-        has_totals,
-        has_team,
-        has_duration,
-        hours_match is True,
-        cost_match is True,
-        finish_ok,
-    )
+    checks = [has_title, has_totals, has_team, has_duration, finish_ok]
+    if tabular:
+        checks += [has_table is True, hours_match is True, cost_match is True]
+    checks_total = CHECK_COUNTS[fmt]
     return StructureCheck(
+        output_format=fmt.value,
+        checks_total=checks_total,
         has_title=has_title,
         has_breakdown_table=has_table,
         has_totals=has_totals,
@@ -227,6 +271,6 @@ def evaluate_estimation(text: str, truncated: bool) -> StructureCheck:
         sum_row_cost=sum_cost,
         cost_match=cost_match,
         finish_ok=finish_ok,
-        score=round(sum(checks) / CHECK_COUNT, 3),
+        score=round(sum(checks) / checks_total, 3),
         issues=tuple(issues),
     )

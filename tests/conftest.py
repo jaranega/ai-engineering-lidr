@@ -7,6 +7,7 @@ import app.config  # noqa: F401
 # isort: split
 import copy
 import logging
+import re
 import socket
 from collections.abc import Callable, Generator, Iterator, Sequence
 from functools import partial
@@ -20,7 +21,10 @@ from litellm import CustomLLM
 from litellm import Router as RealRouter
 
 from app.config import LITELLM_LOGGERS, Settings, get_settings
+from app.domain import EstimationInput
 from app.main import app
+from app.prompts import loader as prompt_loader
+from app.prompts.loader import render_estimation_prompt
 from app.services import cache as cache_module
 from app.services import llm_service
 from app.services.cache import ResponseCache
@@ -42,8 +46,7 @@ def _clear_caches() -> None:
     get_settings.cache_clear()
     llm_service.get_llm_provider.cache_clear()
     cache_module.get_response_cache.cache_clear()
-    llm_service._system_prompt.cache_clear()
-    llm_service._chat_system_prompt.cache_clear()
+    prompt_loader._environment.cache_clear()
 
 
 CONFIG_ENV_VARS = (
@@ -119,6 +122,36 @@ def _clear_cached_state():
     _clear_caches()
 
 
+DESCRIPTION = (
+    "A web platform to book clinic appointments, with patient records, "
+    "reminders and an admin panel."
+)
+
+
+def valid_body(**overrides) -> dict:
+    """Smallest valid body of `POST /api/v1/estimate`; overrides replace or add fields."""
+    return {
+        "description": DESCRIPTION,
+        "project_type": "web_saas",
+        "detail_level": "medium",
+        "output_format": "line_items",
+        **overrides,
+    }
+
+
+def make_input(**overrides) -> EstimationInput:
+    """Typed estimation input built from `valid_body` (extra keys are ignored)."""
+    return EstimationInput.model_validate(valid_body(**overrides))
+
+
+def example_estimates(output_format: str, version: str = "v1") -> list[str]:
+    """The estimation of each CAG example as rendered by `examples.j2` for the format."""
+    system, _ = render_estimation_prompt(
+        make_input(output_format=output_format), version, num_examples=3
+    )
+    return re.findall(r"<example_estimate>\n(.*?)\n</example_estimate>", system, re.S)
+
+
 class FakeProvider:
     """In-memory LLMProvider: counts calls, records what it receives, optionally fails.
 
@@ -141,7 +174,6 @@ class FakeProvider:
         truncated: bool = False,
         fallback_used: bool = False,
         cache_hit: bool = False,
-        responses: Sequence[LLMResult | LLMProviderError] | None = None,
     ) -> None:
         self.result = LLMResult(
             text=text,
@@ -161,9 +193,6 @@ class FakeProvider:
         # `LLMCallOptions` received by each call (None when the caller passed none), aligned
         # with `calls`. The service omits default options, so the default paths record None.
         self.options: list[LLMCallOptions | None] = []
-        # Optional per-call script for `generate()` (e.g. two_phase): the i-th call returns
-        # (or raises) the i-th item; once exhausted, the usual `result`/`error` apply.
-        self._responses = list(responses) if responses is not None else []
 
     @property
     def call_count(self) -> int:
@@ -177,11 +206,6 @@ class FakeProvider:
     ) -> LLMResult:
         self.calls.append((system, list(messages)))
         self.options.append(options)
-        if self._responses:
-            scripted = self._responses.pop(0)
-            if isinstance(scripted, LLMProviderError):
-                raise scripted
-            return scripted
         if self.error is not None:
             raise self.error
         return self.result

@@ -9,8 +9,8 @@ import redis
 from structlog.testing import capture_logs
 
 from app.config import Deployment, get_settings
+from app.prompts.loader import render_estimation_prompt
 from app.services import cache as cache_module
-from app.services import llm_service
 from app.services.cache import KEY_PREFIX, ResponseCache, build_redis_client, cache_key
 from app.services.llm_service import (
     MAX_TOKENS,
@@ -21,7 +21,7 @@ from app.services.llm_service import (
     LLMCallOptions,
     LLMProviderError,
 )
-from tests.conftest import FakeProvider
+from tests.conftest import FakeProvider, make_input
 
 SYSTEM = "SYSTEM-PROMPT"
 MESSAGES: list[ChatMessage] = [{"role": "user", "content": "Necesitamos una web de reservas"}]
@@ -270,8 +270,9 @@ def test_estimation_service_reports_cache_hit_and_cost_from_stored_tokens(respon
     """Requirement: Contenido del acierto (coste con los tokens guardados)."""
     inner = FakeProvider(model="claude-haiku-4-5", input_tokens=1000, output_tokens=500)
     service = EstimationService(cached(inner, response_cache))
-    service.estimate("transcripción")
-    hit = service.estimate("transcripción")
+    request = make_input()
+    service.estimate(request)
+    hit = service.estimate(request)
     assert hit.cache_hit is True
     assert hit.cost_usd == 0.0035
     assert inner.call_count == 1
@@ -358,12 +359,11 @@ def test_response_is_shared_between_generate_and_stream(response_cache):
     """Requirement: Caché en streaming / Scenario: Compartida entre modos."""
     inner = FakeProvider(text="estimación de la API", fragments=["estimación de la API"])
     provider = cached(inner, response_cache)
-    # API: `EstimationService.estimate` sends the endpoint prompt and one user message.
-    EstimationService(provider).estimate("Necesitamos una web")
-    # Chat: first turn of the conversation, same system prompt and the same single message.
-    stream = EstimationService(provider).stream_chat(
-        [{"role": "user", "content": "Necesitamos una web"}]
-    )
+    # `EstimationService.estimate` sends the rendered system and one user message.
+    request = make_input()
+    EstimationService(provider).estimate(request)
+    system, user = render_estimation_prompt(request, "v1")
+    stream = provider.stream(system, [{"role": "user", "content": user}])
     assert "".join(stream) == "estimación de la API"
     assert stream.result.cache_hit is True
     assert inner.call_count == 1
@@ -509,18 +509,28 @@ def test_same_model_as_override_has_a_different_key_than_the_configured_primary(
     assert key_with(override) == key_with(LLMCallOptions(model=SAME_AS_PRIMARY))
 
 
-def test_key_changes_with_the_system_prompt_of_each_example_format_and_preprocessing():
-    """Requirement: Caché / Scenario: Opciones distintas (formato, preprocesado, ejemplos)."""
-    prompts = {
-        "markdown": llm_service._system_prompt(3, "markdown"),
-        "json": llm_service._system_prompt(3, "json"),
-        "narrative": llm_service._system_prompt(3, "narrative"),
-        "cleaning": llm_service._system_prompt(3, "markdown", True),
-        "one-example": llm_service._system_prompt(1, "markdown"),
-        "no-examples": llm_service._system_prompt(0, "markdown"),
+def test_key_changes_with_the_rendered_system_prompt_of_each_prompt_option():
+    """Requirement: Caché / Scenario: Opciones distintas (prompt y ejemplos)."""
+    variants = {
+        "base": ("v1", 3, {}),
+        "v2": ("v2", 3, {}),
+        "phases_table": ("v1", 3, {"output_format": "phases_table"}),
+        "narrative": ("v1", 3, {"output_format": "narrative"}),
+        "detailed": ("v1", 3, {"detail_level": "detailed"}),
+        "summary": ("v1", 3, {"detail_level": "summary"}),
+        "mobile_app": ("v1", 3, {"project_type": "mobile_app"}),
+        "one-example": ("v1", 1, {}),
+        "no-examples": ("v1", 0, {}),
     }
-    keys = {name: key_with(None, system=system) for name, system in prompts.items()}
-    assert len(set(keys.values())) == len(prompts)
+    keys = {}
+    for name, (version, count, overrides) in variants.items():
+        system, user = render_estimation_prompt(
+            make_input(**overrides), version, num_examples=count
+        )
+        keys[name] = CachedProvider(FakeProvider(), None, MODEL)._key(
+            system, [{"role": "user", "content": user}]
+        )
+    assert len(set(keys.values())) == len(variants)
 
 
 @pytest.mark.parametrize(
@@ -562,8 +572,9 @@ def test_evaluation_is_not_part_of_the_key(response_cache):
     """Requirement: Caché / Scenario: Evaluación fuera de la clave."""
     inner = FakeProvider(model=MODEL)
     service = EstimationService(cached(inner, response_cache))
-    first = service.estimate("T", GenerationOptions(evaluate=True))
-    second = service.estimate("T", GenerationOptions(evaluate=False))
+    request = make_input()
+    first = service.estimate(request, GenerationOptions(evaluate=True))
+    second = service.estimate(request, GenerationOptions(evaluate=False))
     assert (first.cache_hit, second.cache_hit) == (False, True)
     assert first.validation is not None
     assert second.validation is None
@@ -571,35 +582,66 @@ def test_evaluation_is_not_part_of_the_key(response_cache):
 
 
 @pytest.mark.parametrize(
-    "options",
+    ("options", "overrides"),
     [
-        GenerationOptions(max_tokens=100),
-        GenerationOptions(thinking_budget=1024),
-        GenerationOptions(example_format="json"),
-        GenerationOptions(example_format="narrative"),
-        GenerationOptions(num_examples=1),
-        GenerationOptions(use_examples=False),
-        GenerationOptions(preprocessing="inline_cleaning"),
-        GenerationOptions(model=MODEL),
+        (GenerationOptions(max_tokens=100), {}),
+        (GenerationOptions(thinking_budget=1024), {}),
+        (GenerationOptions(num_examples=1), {}),
+        (GenerationOptions(use_examples=False), {}),
+        (GenerationOptions(model=MODEL), {}),
+        (GenerationOptions(prompt_version="v2"), {}),
+        (GenerationOptions(), {"output_format": "phases_table"}),
+        (GenerationOptions(), {"detail_level": "detailed"}),
+        (GenerationOptions(), {"project_type": "mobile_app"}),
+        (GenerationOptions(), {"description": "Una descripción distinta de la base"}),
+        (
+            GenerationOptions(),
+            {"reference_projects": [{"name": "Ref", "summary": "Resumen de la referencia"}]},
+        ),
     ],
     ids=[
         "max_tokens",
         "thinking_budget",
-        "json",
-        "narrative",
         "num_examples",
         "use_examples",
-        "inline_cleaning",
         "override-of-the-primary",
+        "prompt_version-v2",
+        "output_format",
+        "detail_level",
+        "project_type",
+        "description",
+        "reference_projects",
     ],
 )
-def test_estimation_with_other_options_is_not_served_from_the_cache(response_cache, options):
-    """Requirement: Caché / Scenario: Opciones distintas (a través del servicio)."""
+def test_estimation_with_other_options_is_not_served_from_the_cache(
+    response_cache, options, overrides
+):
+    """Requirement: Caché / Scenarios: Petición distinta y Opciones distintas (servicio)."""
     inner = FakeProvider(model=MODEL)
     service = EstimationService(
         cached(inner, response_cache), resolve_model=lambda name: Deployment(name, "openai")
     )
-    assert service.estimate("T").cache_hit is False
-    assert service.estimate("T", options).cache_hit is False
-    assert service.estimate("T", options).cache_hit is True  # same options: now a hit
+    assert service.estimate(make_input()).cache_hit is False
+    other = make_input(**overrides)
+    assert service.estimate(other, options).cache_hit is False
+    assert service.estimate(other, options).cache_hit is True  # same request: now a hit
     assert inner.call_count == 2
+
+
+def test_description_differing_in_one_character_is_a_miss(response_cache):
+    """Requirement: Caché / Scenario: Petición distinta (un solo carácter)."""
+    inner = FakeProvider(model=MODEL)
+    service = EstimationService(cached(inner, response_cache))
+    assert service.estimate(make_input(description="x" * 30)).cache_hit is False
+    assert service.estimate(make_input(description="x" * 29 + "y")).cache_hit is False
+    assert inner.call_count == 2
+
+
+def test_cache_hit_reports_the_prompt_version_of_the_current_request(response_cache):
+    """Requirement: Endpoint de estimación / Scenario: Estimación desde la caché (versión)."""
+    inner = FakeProvider(model=MODEL)
+    service = EstimationService(cached(inner, response_cache))
+    request = make_input()
+    service.estimate(request, GenerationOptions(prompt_version="v1"))
+    hit = service.estimate(request, GenerationOptions(prompt_version="v1"))
+    assert (hit.cache_hit, hit.prompt_version) == (True, "v1")

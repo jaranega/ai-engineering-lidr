@@ -4,7 +4,7 @@ Contexto persistente para todas las sesiones de Claude Code en este repositorio.
 
 ## Qué es este proyecto
 
-Servicio que recibe la **transcripción de una reunión con cliente** y devuelve una **estimación de software** generada por un LLM.
+Servicio que recibe la **descripción tipada de un proyecto** (desde S04, desde un formulario; hasta S03, la transcripción de una reunión con cliente) y devuelve una **estimación de software** generada por un LLM.
 Es el "Proyecto 1" del programa AI Engineering de LIDR y **evoluciona sesión a sesión** en este mismo repo:
 
 | Sesión | Hito | Rama |
@@ -41,7 +41,7 @@ La sesión principal actúa como **orquestadora**: aplica el flujo de OpenSpec y
 | Agente | Modelo | Rutas que le pertenecen | Cuándo |
 |---|---|---|---|
 | `architect` | opus | solo `openspec/changes/**/design.md` | tras `/opsx:propose` y en cambios transversales |
-| `backend-engineer` | sonnet | `pyproject.toml`, `app/{main,config,schemas}.py`, `app/routers/`, `.github/workflows/` | `/opsx:apply` |
+| `backend-engineer` | sonnet | `pyproject.toml`, `app/{main,config,domain,schemas}.py`, `app/routers/`, `.github/workflows/` | `/opsx:apply` |
 | `ai-engineer` | opus | `app/services/`, `app/context/`, `app/prompts/` | `/opsx:apply` y revisión de la calidad de los prompts |
 | `frontend-engineer` | sonnet | `streamlit_app.py`, `.streamlit/` | `/opsx:apply`, interfaz Streamlit (desde S03) |
 | `qa-engineer` | sonnet | `tests/`, `samples/` | `/opsx:apply`, de escenarios a tests |
@@ -81,14 +81,18 @@ Naming de changes: `sNN-<verbo>-<qué>` en kebab-case (p. ej. `s02-add-cag-estim
 app/
 ├── main.py          # FastAPI app, routers, /health
 ├── config.py        # Settings (BaseSettings) + get_settings()
+├── domain.py        # Enums y entrada tipada (EstimationInput); sin imports de app
+├── schemas.py       # Contrato HTTP (EstimationRequest hereda de EstimationInput)
 ├── routers/         # HTTP: validación de entrada/salida, sin lógica de negocio
-├── services/        # Lógica de negocio: prompt, proveedor LiteLLM con fallback, caché Redis, coste
+├── services/        # Lógica de negocio: render del prompt, proveedor LiteLLM con fallback, caché Redis, coste, evaluación
+├── prompts/         # loader.py + templates Jinja2 versionados (estimation/v1, v2)
 └── context/         # Datos estáticos inyectados en el prompt (CAG)
 ```
 
 - Routers **no** llaman a SDKs de LLM directamente; dependen de `services/` vía `Depends` (facilita mocks en tests).
 - Secrets solo vía variables de entorno; nunca en código, logs ni respuestas.
-- Patrón de mensajes: `system` (instrucciones + ejemplos CAG) → `user` (transcripción). En Anthropic el system va en el parámetro `system`, no como mensaje.
+- Patrón de mensajes: `system` (render de `system.j2`: instrucciones + ejemplos CAG) → `user` (render de `user.j2`: descripción tipada del proyecto). En Anthropic el system va en el parámetro `system`, no como mensaje.
+- Una versión de prompt publicada (`app/prompts/estimation/vN/`) no se edita: los cambios van en una versión nueva.
 
 ## Comandos habituales
 
