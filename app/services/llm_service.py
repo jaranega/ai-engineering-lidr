@@ -167,13 +167,49 @@ def _chat_system_prompt() -> str:
     return build_chat_system_prompt(ESTIMATION_EXAMPLES)
 
 
+def _system_prompt_for_count(message_count: int) -> str:
+    """Turn rule (design D5, S03 decision 16), the single place that picks the prompt.
+
+    One message (the transcription): exactly the endpoint prompt. More messages: the
+    endpoint prompt plus the conversation section. Raise `ValueError` below one message.
+    """
+    if message_count < 1:
+        raise ValueError(f"message_count must be >= 1, got {message_count}")
+    return _system_prompt() if message_count == 1 else _chat_system_prompt()
+
+
 def system_prompt_for(messages: Sequence[ChatMessage]) -> str:
     """System prompt sent for this conversation (design D5, S03 decision 16).
 
     First turn (a single message, the transcription): exactly the endpoint prompt.
     Later turns: the endpoint prompt plus the conversation section.
+    Raise `ValueError` for an empty conversation.
     """
-    return _system_prompt() if len(messages) == 1 else _chat_system_prompt()
+    return _system_prompt_for_count(len(messages))
+
+
+@dataclass(frozen=True)
+class PromptContext:
+    """CAG context a request with a given number of messages would use (design D5).
+
+    `examples` are the static CAG examples, in order, each with `meeting_summary` and
+    `estimation` (the shape of `ContextResponse.examples`).
+    """
+
+    system_prompt: str
+    examples: tuple[EstimationExample, ...]
+
+
+def prompt_context(message_count: int) -> PromptContext:
+    """Context for a conversation of `message_count` messages, the next turn included.
+
+    Same turn rule as `system_prompt_for`. Pure: no I/O and no LLM call. Raise
+    `ValueError` if `message_count < 1`.
+    """
+    return PromptContext(
+        system_prompt=_system_prompt_for_count(message_count),
+        examples=tuple(ESTIMATION_EXAMPLES),
+    )
 
 
 def build_estimation_prompt(transcription: str) -> tuple[str, list[ChatMessage]]:

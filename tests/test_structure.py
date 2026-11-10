@@ -22,12 +22,15 @@ REQUIRED_FILES = [
     ".gitignore",
     "pyproject.toml",
     "README.md",
+    "Dockerfile",
+    ".dockerignore",
+    "docker-compose.yml",
 ]
 
 
 @pytest.mark.parametrize("relative_path", REQUIRED_FILES)
 def test_required_file_exists(relative_path):
-    """Requirement: Validación de la estructura / Scenarios: fichero obligatorio y app Streamlit."""
+    """Requirement: Validación de la estructura / Scenarios: fichero, Streamlit, Docker."""
     assert (REPO_ROOT / relative_path).is_file(), f"Missing required file: {relative_path}"
 
 
@@ -93,3 +96,49 @@ def test_provider_adapters_of_the_sdks_are_gone():
     assert not hasattr(llm_service, "OpenAIProvider")
     assert not hasattr(llm_service, "AnthropicProvider")
     assert not hasattr(llm_service, "build_provider_by_name")
+
+
+def test_streamlit_app_imports_nothing_from_the_service_nor_llm_libraries():
+    """chat-ui / Scenario: Sin imports del servicio (AST: `app`, litellm, redis, SDKs)."""
+    roots = _imported_roots(REPO_ROOT / "streamlit_app.py")
+    assert not roots & {"app", "litellm", "redis", "openai", "anthropic"}
+
+
+def test_dockerignore_is_an_allowlist():
+    """container-runtime / Requirement: Contexto de build en lista blanca."""
+    lines = [
+        line.strip()
+        for line in (REPO_ROOT / ".dockerignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert lines[0] == "*"
+    allowed = {line.removeprefix("!") for line in lines if line.startswith("!")}
+    assert allowed == {"pyproject.toml", "uv.lock", "app/"}
+    assert "**/__pycache__" in lines
+
+
+def test_dockerfile_follows_the_image_requirements():
+    """container-runtime / Requirement: Imagen Docker de la API (estática, sin construir)."""
+    text = (REPO_ROOT / "Dockerfile").read_text()
+    assert "--locked" in text and "--no-default-groups" in text
+    assert "USER " in text and "USER root" not in text
+    assert "EXPOSE 8000" in text
+    assert "HEALTHCHECK" in text and "/health" in text
+    assert "uvicorn" in text and "app.main:app" in text
+    uv_images = [line for line in text.splitlines() if "astral-sh/uv:" in line]
+    assert uv_images and all(":latest" not in line for line in uv_images)
+    assert "streamlit" not in text
+    assert ".env" not in text.replace(".env.example", "")
+
+
+def test_compose_has_api_and_redis_with_local_ports_and_no_streamlit():
+    """container-runtime / Requirement: docker-compose con Redis (estático, sin Docker)."""
+    text = (REPO_ROOT / "docker-compose.yml").read_text()
+    assert "streamlit" not in text.lower()
+    assert "env_file" in text and "redis://redis:6379/0" in text
+    assert "service_healthy" in text and "healthcheck" in text
+    assert "redis:7.4-alpine" in text
+    assert '"--save", ""' in text and '"--appendonly", "no"' in text
+    assert '"127.0.0.1:8000:8000"' in text
+    assert '"127.0.0.1:6379:6379"' in text
+    assert text.count("ports:") == 2  # no other published port

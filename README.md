@@ -17,7 +17,7 @@ Usa **CAG (Context-Augmented Generation)**: el contexto estático (ejemplos de e
 app/
 ├── main.py          # FastAPI app, lifespan (fail fast), /health
 ├── config.py        # Settings (pydantic-settings) + get_settings() + configure_logging()
-├── schemas.py       # Contratos HTTP (EstimationRequest / EstimationResponse)
+├── schemas.py       # Contratos HTTP (estimación, stream SSE, métricas y contexto)
 ├── routers/         # HTTP: validación de E/S y mapeo de errores; sin lógica de negocio
 │   └── estimations.py
 ├── services/        # Lógica de negocio: prompt, proveedor LiteLLM con fallback, caché, coste
@@ -27,26 +27,28 @@ app/
 └── context/         # Datos estáticos inyectados en el prompt (CAG)
     └── examples.py
 tests/               # pytest, con el LLM simulado
-streamlit_app.py     # Interfaz conversacional (Streamlit), cliente in-process de app/services
+streamlit_app.py     # Interfaz conversacional (Streamlit), cliente HTTP de la API
 .streamlit/          # Configuración de Streamlit
+Dockerfile           # Imagen de la API (multi-stage con uv, usuario no root)
+docker-compose.yml   # API + Redis (sin persistencia, puertos en 127.0.0.1)
 samples/             # Transcripciones de prueba
 ```
 
 Los routers dependen de los servicios mediante `Depends` y nunca importan LiteLLM, Redis ni los SDK de los LLM, lo que permite sustituir el proveedor en los tests.
 
-La interfaz Streamlit (`streamlit_app.py`, en la raíz) es un cliente **in-process** de la misma capa de servicios: no llama a la API HTTP ni necesita uvicorn arrancado, y tampoco importa LiteLLM ni Redis. Reutiliza la configuración, el proveedor (con fallback y caché), el system prompt CAG y el cálculo de coste.
+La interfaz Streamlit (`streamlit_app.py`, en la raíz) es un **cliente HTTP** de la API: envía la conversación al endpoint SSE `POST /api/v1/estimate/stream` y pinta los fragmentos según llegan; la barra lateral sale de `GET /health` y `GET /api/v1/context`. No importa nada de `app/`, así que necesita la API levantada (local o en Docker).
 
 ```mermaid
 flowchart TB
     user_http(["Cliente HTTP<br/>curl / Swagger /docs"])
     user_ui(["Usuario en el navegador"])
 
-    subgraph ST["streamlit_app.py · chat Streamlit (in-process)"]
+    subgraph ST["streamlit_app.py · chat Streamlit (cliente HTTP, httpx)"]
         direction TB
-        st_main["main()<br/>load_config → init_state"]
+        st_main["main()<br/>ESTIMATOR_API_BASE_URL → init_state"]
         st_sidebar["render_sidebar<br/>primario/respaldo · métricas · system prompt · ejemplos CAG"]
         st_chat["render_history + chat_input<br/>validate_input (strip, ≤ 20 000)"]
-        st_handle["handle_user_message<br/>st.write_stream + timed_fragments (TTFT)"]
+        st_handle["handle_user_message<br/>parser SSE + st.write_stream (TTFT en el cliente)"]
         st_state[("st.session_state<br/>messages · last_metrics · truncated_turns")]
         st_main --> st_sidebar --> st_chat --> st_handle
         st_handle <--> st_state
@@ -55,8 +57,8 @@ flowchart TB
     subgraph API["FastAPI (uvicorn)"]
         direction TB
         main["app/main.py<br/>GET /health · include_router /api/v1"]
-        router["app/routers/estimations.py<br/>POST /api/v1/estimate<br/>LLMProviderError → 502"]
-        schemas["app/schemas.py<br/>EstimationRequest / EstimationResponse<br/>(tokens, cost_usd, truncated, fallback_used, cache_hit, latency_ms)"]
+        router["app/routers/estimations.py<br/>POST /api/v1/estimate (502 si falla)<br/>POST /api/v1/estimate/stream (SSE: token · metrics · error)<br/>GET /api/v1/context"]
+        schemas["app/schemas.py<br/>EstimationRequest · StreamEstimationRequest<br/>EstimationMetrics · EstimationResponse · ContextResponse"]
         main --> router
         router -. valida con .-> schemas
     end
@@ -103,13 +105,11 @@ flowchart TB
     user_http -->|HTTP JSON| main
     user_ui --> ST
     router -->|Depends get_estimation_service| service
-    st_handle -->|llamada directa, sin HTTP| service
-    st_sidebar -. lee .-> examples
-    st_sidebar -. lee .-> prompt
+    st_handle -->|POST /api/v1/estimate/stream · SSE| router
+    st_sidebar -->|GET /health · GET /api/v1/context| main
     prompt -. inyecta .-> examples
     settings -->|get_llm_provider / build_provider| proto
     main -. Depends .-> settings
-    st_main -. load_config .-> settings
     cache -->|get / set| redis
     litellm_p -->|primario · max_tokens 2048 · LLM_TIMEOUT · LLM_RETRIES| oai
     litellm_p -.->|respaldo si el primario falla| ant
@@ -117,7 +117,7 @@ flowchart TB
 
 - El router no tiene lógica: recibe el servicio con `Depends`, valida con los schemas y traduce `LLMProviderError` a 502.
 - El primario siempre va primero; el respaldo solo se usa si el primario falla tras sus reintentos y antes de entregar el primer fragmento. Ni los routers ni la interfaz tienen condicionales de proveedor.
-- En el chat, el primer turno usa exactamente el prompt del endpoint y los siguientes añaden la sección de conversación.
+- En el chat, el primer turno usa exactamente el prompt del endpoint y los siguientes añaden la sección de conversación (lo aplica el servidor en el endpoint SSE).
 - Las API keys solo llegan desde `.env` (o variables de entorno) a través de `Settings`.
 
 El proveedor expone dos modos con la misma entrada (system prompt + lista de mensajes `user`/`assistant`): `generate` (respuesta completa, la usa la API) y `stream` (fragmentos de texto a medida que llegan y, al terminar, tokens, coste, modelo efectivo, `fallback_used`, `cache_hit` y latencia; lo usa el chat). Los dos comparten la caché.
@@ -127,13 +127,16 @@ El proveedor expone dos modos con la misma entrada (system prompt + lista de men
 - Python 3.11 o superior (el proyecto fija 3.12 en `.python-version`)
 - [uv](https://docs.astral.sh/uv/)
 - API key del proveedor del modelo primario (la del respaldo es opcional; sin ella no hay fallback)
-- Redis, opcional (sin él no hay caché): `docker run --rm -p 6379:6379 redis:7-alpine`
+- Redis, opcional (sin él no hay caché): lo levanta `docker compose up`, o suelto con `docker run --rm -p 127.0.0.1:6379:6379 redis:7.4-alpine`
+- Docker, solo para la opción con contenedores
 
 ## Instalación
 
 ```bash
 uv sync
 ```
+
+`uv sync` instala también los grupos `dev` (pytest, ruff, fakeredis) y `ui` (Streamlit y httpx). La imagen Docker de la API instala solo las dependencias de la API (`--no-default-groups`).
 
 ## Configuración
 
@@ -154,6 +157,7 @@ cp .env.example .env
 | `CACHE_TTL` | No | `86400` | Segundos que dura cada respuesta en la caché |
 | `APP_ENV` | No | `development` | Entorno de ejecución; `production` emite los logs en JSON |
 | `LOG_LEVEL` | No | `DEBUG` | `DEBUG`, `INFO`, `WARNING`, `ERROR` o `CRITICAL` |
+| `ESTIMATOR_API_BASE_URL` | No | `http://localhost:8000` | URL de la API para la interfaz Streamlit (solo la lee la UI) |
 
 Las variables de entorno prevalecen sobre `.env`. Las keys vacías se tratan como no definidas y nunca se registran en logs ni en respuestas.
 
@@ -169,9 +173,22 @@ Las variables de entorno prevalecen sobre `.env`. Las keys vacías se tratan com
 
 ## Arranque
 
+Opción 1, en local (dos terminales, desde la raíz):
+
 ```bash
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload       # API en http://localhost:8000
+uv run streamlit run streamlit_app.py      # UI en http://localhost:8501
 ```
+
+Opción 2, API y Redis en Docker y la UI en local:
+
+```bash
+docker compose up --build -d               # API en 127.0.0.1:8000 + Redis (lee .env)
+uv run streamlit run streamlit_app.py
+docker compose down                        # para y borra los contenedores
+```
+
+El Redis del compose no guarda nada en disco (`--save "" --appendonly no`): la caché se pierde al pararlo, a propósito, porque contiene texto derivado de reuniones de clientes. Los puertos se publican solo en `127.0.0.1`. La imagen no incluye `.env` (el compose lo pasa como variables de entorno), corre con un usuario sin privilegios y tiene healthcheck sobre `/health`.
 
 - Swagger UI: <http://localhost:8000/docs>
 - Salud: `GET http://localhost:8000/health` → `{"status": "ok", "env", "primary_model", "fallback_model" (o null), "cache": "ok" | "unavailable"}`
@@ -180,17 +197,11 @@ uv run uvicorn app.main:app --reload
 
 ## Interfaz conversacional (Streamlit)
 
-Desde la raíz del repo (para que se lea `.env`):
-
-```bash
-uv run streamlit run streamlit_app.py
-```
-
-Se abre en <http://localhost:8501>. Usa la misma configuración que la API (`.env`); si falta la key del proveedor del modelo primario, la interfaz muestra el error y cómo resolverlo, sin abrir el chat.
+Se abre en <http://localhost:8501> (ver **Arranque**). La interfaz no lee la configuración del LLM ni las API keys: solo la URL de la API (`ESTIMATOR_API_BASE_URL`, desde el entorno o `.env`). Si la API no está levantada, la barra lateral y el envío muestran un aviso con la URL y cómo arrancarla, y el chat sigue abierto con su historial.
 
 - **Chat**: pega una transcripción y la estimación se escribe en streaming. Después puedes pedir ajustes ("quita el blog", "¿y con dos desarrolladores?") y el asistente responde con la estimación completa actualizada, en el idioma de la transcripción. Todo el historial se envía al modelo en cada turno.
-- **Panel lateral**: modelos primario y de respaldo, botón **Nueva conversación**, métricas de la última llamada (modelo y proveedor efectivos, si respondió el respaldo, si vino de la caché, tokens de entrada y salida, tiempo total, tiempo hasta el primer fragmento y coste estimado), el system prompt que se enviará en el siguiente turno (solo lectura) y los ejemplos CAG inyectados.
-- Los mensajes se recortan y tienen el mismo límite de 20 000 caracteres que la API. Si el proveedor falla o no devuelve texto, se muestra un error genérico y el mensaje no queda en el historial, para que puedas reenviarlo. Si una respuesta se corta por el límite de longitud, se guarda con un aviso debajo y las métricas lo indican.
+- **Panel lateral**: modelos primario y de respaldo y estado de la caché (de `/health`), botón **Nueva conversación**, métricas de la última llamada (modelo y proveedor efectivos, si respondió el respaldo, si vino de la caché, tokens de entrada y salida, tiempo total, tiempo hasta el primer fragmento y coste estimado), el system prompt que se enviará en el siguiente turno (solo lectura) y los ejemplos CAG inyectados (de `/api/v1/context`). El tiempo hasta el primer fragmento lo mide la interfaz; el resto de métricas llega en el evento `metrics`.
+- Los mensajes se recortan y tienen el mismo límite de 20 000 caracteres que la API (la interfaz lo obtiene de `/api/v1/context`). Al pulsar Stop se cierra la conexión y el servidor cancela la generación sin guardarla en la caché. Si el proveedor falla o no devuelve texto, se muestra un error genérico y el mensaje no queda en el historial, para que puedas reenviarlo. Si una respuesta se corta por el límite de longitud, se guarda con un aviso debajo y las métricas lo indican.
 
 En el primer turno el chat envía exactamente el system prompt del endpoint; a partir del segundo le añade al final una sección que explica cómo tratar los mensajes de seguimiento. Se hace así porque, con cualquier texto añadido, gpt-4o-mini respondía en español a la mitad de las transcripciones en inglés (medido con llamadas reales; detalle en el design del change). `.streamlit/config.toml` desactiva la telemetría de Streamlit.
 
@@ -215,6 +226,26 @@ jq -Rs '{transcription: .}' samples/landing-hubspot-blog.txt \
 jq -Rs '{transcription: .}' samples/reserva-restaurantes-en.txt \
   | curl -s -X POST http://localhost:8000/api/v1/estimate -H 'Content-Type: application/json' -d @- | jq
 ```
+
+### Streaming (SSE)
+
+`POST /api/v1/estimate/stream` recibe la conversación completa (mensajes `user`/`assistant` alternos, empezando y terminando por `user`, cada uno de 1 a 20 000 caracteres tras recortar) y responde `text/event-stream`:
+
+| Evento | `data` |
+|---|---|
+| `token` | El fragmento como string JSON (`"## Estimación\n"`; los acentos llegan escapados, `\u00f3`) |
+| `metrics` | Último evento si todo va bien: los campos de la respuesta de `/estimate` sin `estimation` |
+| `error` | Último evento si falla el proveedor: `{"detail": "LLM provider error"}` (siempre con status 200) |
+
+No hay evento `done`: el stream termina tras `metrics` o `error`, y si se corta sin ninguno de los dos es un fallo. Un body inválido responde 422 antes de abrir el stream. Se envía `: ping` cada 15 s sin eventos.
+
+```bash
+curl -N -X POST http://localhost:8000/api/v1/estimate/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Cliente: queremos una web de reservas para 3 pistas de pádel con pagos online."}]}'
+```
+
+`GET /api/v1/context?message_count=N` devuelve, sin llamar al LLM, el `system_prompt` que se usaría con una conversación de `N` mensajes (1: el del endpoint; 2 o más: con la sección de conversación), los `examples` CAG y `max_message_chars`.
 
 ### Contrato de respuesta
 
@@ -253,7 +284,7 @@ uv run ruff check . && uv run ruff format --check .
 openspec validate --all --strict
 ```
 
-Los tests no usan API keys reales ni hacen llamadas de red: el proveedor se sustituye por un doble mediante `dependency_overrides` en la API, y en la app Streamlit, que se ejecuta sin navegador con `streamlit.testing.v1.AppTest`, sustituyendo la factoría de proveedores. El proveedor LiteLLM se prueba con un doble del Router y con tests de contrato sobre un `Router` real con `mock_response`; Redis se sustituye por `fakeredis`. Un fixture bloquea cualquier conexión de red y los tests no leen el `.env` local. La CI (`.github/workflows/ci.yml`) ejecuta en cada push y PR: `uv sync --locked`, ruff (lint y formato), pytest y `openspec validate --all --strict`.
+Los tests no usan API keys reales ni hacen llamadas de red: el proveedor se sustituye por un doble mediante `dependency_overrides` en la API, y en la app Streamlit, que se ejecuta sin navegador con `streamlit.testing.v1.AppTest`, con `httpx.Client` sustituido por un transporte simulado (y algún test de extremo a extremo contra la API en memoria). El proveedor LiteLLM se prueba con un doble del Router y con tests de contrato sobre un `Router` real con `mock_response`; Redis se sustituye por `fakeredis`. Un fixture bloquea cualquier conexión de red y los tests no leen el `.env` local. La CI (`.github/workflows/ci.yml`) ejecuta en cada push y PR: `uv sync --locked`, ruff (lint y formato), pytest y `openspec validate --all --strict`, y en paralelo un job `docker` con `docker build` y `docker compose config`.
 
 ## Desviaciones respecto al enunciado
 
@@ -266,8 +297,9 @@ Puesta al día con la rama del directo (`session_3_live`), con estas diferencias
 - **Caché más estricta**: no guarda respuestas truncadas, vacías ni streams interrumpidos, y el streaming conserva tokens y coste.
 - **Key obligatoria del primario** (la referencia exige al menos una) y respaldo opcional.
 - Sin sobrescritura del modelo por petición (llega en un change posterior).
+- **SSE con historial multi-turno** y evento final `metrics` (la referencia solo recibe la transcripción y no envía métricas); evento `error` genérico; sin página de demo HTML ni CORS; Streamlit fuera del compose, como en la referencia; Redis sin persistencia y puertos en `127.0.0.1`.
 
-Detalle: [`openspec/changes/s03-add-llm-wrapper-cache-logging`](openspec/changes/s03-add-llm-wrapper-cache-logging/).
+Detalle: [`openspec/changes/archive/2026-11-09-s03-add-llm-wrapper-cache-logging`](openspec/changes/archive/2026-11-09-s03-add-llm-wrapper-cache-logging/) y [`openspec/changes/s03-add-sse-streaming-and-docker`](openspec/changes/s03-add-sse-streaming-and-docker/).
 
 ### S03 (interfaz Streamlit)
 

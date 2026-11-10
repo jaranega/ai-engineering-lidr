@@ -95,6 +95,8 @@ app/
 ```bash
 uv sync                                   # instalar dependencias
 uv run uvicorn app.main:app --reload      # arrancar servidor (Swagger en /docs)
+uv run streamlit run streamlit_app.py     # UI (cliente HTTP de la API)
+docker compose up --build -d              # API + Redis en Docker
 uv run pytest                             # tests
 uv run ruff check . && uv run ruff format --check .
 openspec list / openspec validate --all --strict

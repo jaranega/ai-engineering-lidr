@@ -35,3 +35,17 @@ jobs:
 
       - name: Validate OpenSpec
         run: npx --yes @fission-ai/openspec@1.4.1 validate --all --strict
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create empty .env (required by env_file)
+        run: touch .env
+
+      - name: Build image
+        run: docker build .
+
+      - name: Validate compose file
+        run: docker compose config --quiet

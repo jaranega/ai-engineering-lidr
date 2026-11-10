@@ -8,7 +8,6 @@ dependencies = [
     "pydantic-settings>=2.16.1",
     "python-dotenv>=1.2.4",
     "redis>=8.1.0",
-    "streamlit>=1.66.1",
     "structlog>=26.1.0",
     "uvicorn[standard]>=0.54.0",
 ]
@@ -26,7 +25,13 @@ pythonpath = ["."]
 [dependency-groups]
 dev = [
     "fakeredis>=2.40.0",
-    "httpx>=0.28.1",
     "pytest>=9.1.1",
     "ruff>=0.17.1",
 ]
+ui = [
+    "httpx>=0.28.1",
+    "streamlit>=1.66.1",
+]
+
+[tool.uv]
+default-groups = ["dev", "ui"]
