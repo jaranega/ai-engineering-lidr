@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.attachments import AttachmentErrorReason
 from app.domain import (
     DetailLevel,
     EstimationInput,
@@ -14,11 +15,12 @@ from app.domain import (
 from app.services.llm_service import (
     MAX_MODEL_NAME_CHARS,
     MAX_OUTPUT_TOKENS,
-    MAX_THINKING_BUDGET,
     MAX_TOKENS,
-    MIN_THINKING_BUDGET,
     NUM_EXAMPLES,
+    ComputedEstimate,
+    GuardrailReason,
 )
+from app.sessions import ProjectMetadata
 
 __all__ = [
     "DetailLevel",
@@ -26,10 +28,22 @@ __all__ = [
     "EstimationMetrics",
     "EstimationRequest",
     "EstimationResponse",
+    "GuardrailError",
+    "GuardrailErrorResponse",
     "HealthResponse",
     "OutputFormat",
+    "ProjectMetadata",
     "ProjectType",
     "ReferenceProject",
+    "AttachmentErrorDetail",
+    "AttachmentErrorResponse",
+    "SessionCreated",
+    "SessionError",
+    "SessionErrorResponse",
+    "SessionEstimateResponse",
+    "SessionGuardrailError",
+    "SessionGuardrailErrorResponse",
+    "SessionInfo",
     "StructureCheckResponse",
 ]
 
@@ -57,12 +71,6 @@ class EstimationRequest(EstimationInput):
         le=MAX_OUTPUT_TOKENS,
         description="Output token limit of the estimation call.",
     )
-    thinking_budget: int | None = Field(
-        default=None,
-        ge=MIN_THINKING_BUDGET,
-        le=MAX_THINKING_BUDGET,
-        description="Extended thinking budget (Anthropic only; ignored for OpenAI).",
-    )
     evaluate: bool = Field(
         default=True, description="If false, the structural validation is skipped."
     )
@@ -84,7 +92,7 @@ class EstimationMetrics(BaseModel):
         examples=[0.00087],
     )
     truncated: bool = Field(
-        description="True if the estimation was cut off by the output token limit."
+        description="Always false on a 200: a structured output cut at the token limit is a 502."
     )
     fallback_used: bool = Field(description="True if the fallback model answered.")
     cache_hit: bool = Field(description="True if the response was served from the cache.")
@@ -114,10 +122,13 @@ class StructureCheckResponse(BaseModel):
 
 
 class EstimationResponse(EstimationMetrics):
-    text: str = Field(description="Software estimation in Markdown.")
+    text: str = Field(description="Software estimation in Markdown (server-side render).")
+    result: ComputedEstimate = Field(
+        description="Validated structured estimate with costs and totals computed by the server."
+    )
     prompt_version: str = Field(description="Prompt version effectively rendered.")
     validation: StructureCheckResponse | None = Field(
-        description="Structural check of the estimation; null if evaluate is false."
+        description="Structural check of the estimation; null if evaluate is false or out of scope."
     )
 
 
@@ -130,3 +141,58 @@ class HealthResponse(BaseModel):
         examples=["claude-haiku-4-5"],
     )
     cache: Literal["ok", "unavailable"] = Field(description="Redis cache status.")
+
+
+class GuardrailError(BaseModel):
+    reason: GuardrailReason = Field(description="Why the input was blocked.")
+    message: str = Field(description="Generic explanation; never echoes the input.")
+
+
+class GuardrailErrorResponse(BaseModel):
+    detail: GuardrailError
+
+
+class SessionCreated(BaseModel):
+    session_id: str
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    turn_count: int = Field(description="Successful turns since creation.")
+    history_turns: int = Field(description="Turns currently in the window (<= max_turns).")
+    max_turns: int
+    project_metadata: ProjectMetadata
+
+
+class SessionEstimateResponse(EstimationResponse):
+    session_id: str
+    turn: int = Field(description="Ordinal of this turn (== turn_count after it).")
+    project_metadata: ProjectMetadata = Field(description="Project metadata after the update.")
+
+
+class SessionError(BaseModel):
+    reason: Literal["session_not_found", "session_busy"]
+    message: str
+
+
+class SessionErrorResponse(BaseModel):
+    detail: SessionError
+
+
+class SessionGuardrailError(GuardrailError):
+    field: Literal["transcript", "attachments", "input"]
+    index: int | None = Field(description="Attachment position when `field` is `attachments`.")
+
+
+class SessionGuardrailErrorResponse(BaseModel):
+    detail: SessionGuardrailError
+
+
+class AttachmentErrorDetail(BaseModel):
+    reason: AttachmentErrorReason
+    index: int | None
+    message: str
+
+
+class AttachmentErrorResponse(BaseModel):
+    detail: AttachmentErrorDetail

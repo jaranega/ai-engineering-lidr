@@ -17,17 +17,16 @@ from app.services.llm_service import (
     MAX_TOKENS,
     PRIMARY_GROUP,
     ChatMessage,
-    EstimationService,
     LiteLLMProvider,
     LLMCallOptions,
     LLMProviderError,
     LLMResult,
     LLMStream,
-    _to_estimation_result,
     build_override_router,
     build_router,
 )
-from tests.conftest import make_input, make_settings
+from app.services.pricing import estimate_cost
+from tests.conftest import make_settings
 
 PRIMARY = Deployment("gpt-4o-mini", "openai")
 FALLBACK = Deployment("claude-haiku-4-5", "anthropic")
@@ -216,9 +215,9 @@ def test_prefixed_model_resolves_to_unprefixed_name_and_prices_with_it():
         anthropic_api_key="sk-ant-fake",
     )
     provider = LiteLLMProvider(FakeRouter(response(usage=(1000, 500))), settings.primary, None)
-    estimation = _to_estimation_result(provider.generate(SYSTEM, MESSAGES))
-    assert estimation.model == "claude-haiku-4-5"
-    assert estimation.cost_usd == 0.0035
+    result = provider.generate(SYSTEM, MESSAGES)
+    assert result.model == "claude-haiku-4-5"
+    assert estimate_cost(result.model, result.input_tokens, result.output_tokens) == 0.0035
 
 
 def test_snapshot_model_is_priced_like_the_alias():
@@ -227,24 +226,24 @@ def test_snapshot_model_is_priced_like_the_alias():
         primary_model="claude-haiku-4-5-20251001", fallback_model="", anthropic_api_key="sk-ant"
     )
     provider = LiteLLMProvider(FakeRouter(response(usage=(1000, 500))), settings.primary, None)
-    estimation = _to_estimation_result(provider.generate(SYSTEM, MESSAGES))
-    assert estimation.cost_usd == 0.0035
+    result = provider.generate(SYSTEM, MESSAGES)
+    assert estimate_cost(result.model, result.input_tokens, result.output_tokens) == 0.0035
 
 
 def test_fallback_answer_is_priced_with_fallback_model():
     """Requirement: Coste estimado / Scenario: Coste del respaldo."""
     router = FakeRouter(response(usage=(1000, 500), model_id=FALLBACK_GROUP))
-    estimation = EstimationService(make_provider(router)).estimate(make_input())
-    assert estimation.model == "claude-haiku-4-5"
-    assert estimation.cost_usd == 0.0035
+    result = make_provider(router).generate(SYSTEM, MESSAGES)
+    assert result.model == "claude-haiku-4-5"
+    assert estimate_cost(result.model, result.input_tokens, result.output_tokens) == 0.0035
 
 
 def test_unknown_effective_model_has_null_cost():
     """Requirement: Coste estimado / Scenario: Modelo desconocido."""
     provider = LiteLLMProvider(FakeRouter(response()), Deployment("gpt-4o", "openai"), None)
-    estimation = _to_estimation_result(provider.generate(SYSTEM, MESSAGES))
-    assert estimation.cost_usd is None
-    assert estimation.text == "estimación"
+    result = provider.generate(SYSTEM, MESSAGES)
+    assert estimate_cost(result.model, result.input_tokens, result.output_tokens) is None
+    assert result.text == "estimación"
 
 
 # --- Requirement: Fallback entre modelo primario y de respaldo (identificación) ---
@@ -614,18 +613,6 @@ def test_truncation_is_reported_against_the_effective_limit():
     assert [w["max_tokens"] for w in warnings] == [50]
 
 
-def test_truncation_warning_with_thinking_reports_the_sum_limit():
-    """Requirement: Razonamiento extendido (límite efectivo max_tokens + thinking_budget)."""
-    router = FakeRouter(response(finish_reason="length"))
-    provider = LiteLLMProvider(router, FALLBACK, None)
-    with capture_logs() as logs:
-        result = provider.generate(
-            SYSTEM, MESSAGES, LLMCallOptions(max_tokens=2048, thinking_budget=2048)
-        )
-    assert result.truncated is True
-    assert [e["max_tokens"] for e in logs if e["event"] == "llm_output_truncated"] == [4096]
-
-
 def test_streaming_truncation_uses_the_requested_limit_in_the_warning():
     """Requirement: Límites de la llamada / Scenario: Salida truncada en streaming (límite)."""
     items = [chunk("a"), chunk("b", finish_reason="length"), usage_chunk()]
@@ -695,94 +682,6 @@ def test_override_unknown_model_id_is_still_attributed_to_the_override():
     assert [e for e in logs if e["event"] == "llm_deployment_unknown"]
 
 
-# --- Requirement: Razonamiento extendido ---
-
-
-def test_thinking_with_anthropic_primary_sends_budget_and_summed_limit():
-    """Requirement: Razonamiento extendido / Scenario: Thinking con Anthropic."""
-    router = FakeRouter(response())
-    provider = LiteLLMProvider(router, FALLBACK, None)
-    provider.generate(SYSTEM, MESSAGES, LLMCallOptions(max_tokens=2048, thinking_budget=2048))
-    kwargs = router.calls[0]
-    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
-    assert kwargs["max_tokens"] == 4096
-
-
-def test_thinking_with_anthropic_primary_in_streaming():
-    """Requirement: Razonamiento extendido / Scenario: Thinking con Anthropic (streaming)."""
-    router = FakeRouter(standard_stream())
-    provider = LiteLLMProvider(router, FALLBACK, None)
-    consume(
-        provider.stream(SYSTEM, MESSAGES, LLMCallOptions(max_tokens=1000, thinking_budget=1024))
-    )
-    assert router.calls[0]["thinking"] == {"type": "enabled", "budget_tokens": 1024}
-    assert router.calls[0]["max_tokens"] == 2024
-
-
-def test_thinking_budget_is_ignored_with_a_warning_for_an_openai_primary():
-    """Requirement: Razonamiento extendido / Scenario: Thinking ignorado en OpenAI."""
-    router = FakeRouter(response())
-    with capture_logs() as logs:
-        result = make_provider(router).generate(
-            SYSTEM, MESSAGES, LLMCallOptions(thinking_budget=2048)
-        )
-    assert "thinking" not in router.calls[0]
-    assert router.calls[0]["max_tokens"] == MAX_TOKENS  # the budget does not widen the limit
-    assert result.text == "estimación"
-    ignored = [e for e in logs if e["event"] == "thinking_budget_ignored"]
-    assert len(ignored) == 1
-    assert (ignored[0]["provider"], ignored[0]["model"]) == ("openai", "gpt-4o-mini")
-    assert ignored[0]["log_level"] == "warning"
-
-
-def test_thinking_follows_the_override_target_not_the_primary():
-    """Requirement: Razonamiento extendido (modelo destino: el pedido o, si no hay, el primario)."""
-    override_router = FakeRouter(response())
-    provider, _ = provider_with_override(FakeRouter(response()), override_router)  # OpenAI primary
-    provider.generate(
-        SYSTEM, MESSAGES, LLMCallOptions(model=FALLBACK, thinking_budget=1024, max_tokens=1000)
-    )
-    assert override_router.calls[0]["thinking"] == {"type": "enabled", "budget_tokens": 1024}
-    assert override_router.calls[0]["max_tokens"] == 2024
-
-    anthropic_primary_router = FakeRouter(response())
-    other_override = FakeRouter(response())
-    provider, _ = provider_with_override(
-        anthropic_primary_router, other_override, primary=FALLBACK, fallback=None
-    )
-    with capture_logs() as logs:
-        provider.generate(
-            SYSTEM, MESSAGES, LLMCallOptions(model=OPENAI_OVERRIDE, thinking_budget=2048)
-        )
-    assert "thinking" not in other_override.calls[0]
-    assert [e["model"] for e in logs if e["event"] == "thinking_budget_ignored"] == ["gpt-4o"]
-
-
-def test_no_thinking_is_sent_without_a_budget():
-    """Requirement: Razonamiento extendido (sin thinking_budget no hay razonamiento)."""
-    router = FakeRouter(response())
-    LiteLLMProvider(router, FALLBACK, None).generate(SYSTEM, MESSAGES, LLMCallOptions())
-    assert "thinking" not in router.calls[0]
-
-
-def test_openai_deployments_drop_the_thinking_parameter_and_anthropic_ones_do_not():
-    """Requirement: Razonamiento extendido / Scenario: Fallback a OpenAI con thinking (Router)."""
-    both = build_router(make_settings(anthropic_api_key="sk-ant-fake"))
-    params = {d["model_name"]: d["litellm_params"] for d in both.model_list}
-    assert params[PRIMARY_GROUP]["additional_drop_params"] == ["thinking"]  # OpenAI
-    assert "additional_drop_params" not in params[FALLBACK_GROUP]  # Anthropic
-    reverse = build_router(
-        make_settings(
-            primary_model="claude-haiku-4-5",
-            fallback_model="gpt-4o-mini",
-            anthropic_api_key="sk-ant-fake",
-        )
-    )
-    params = {d["model_name"]: d["litellm_params"] for d in reverse.model_list}
-    assert "additional_drop_params" not in params[PRIMARY_GROUP]
-    assert params[FALLBACK_GROUP]["additional_drop_params"] == ["thinking"]
-
-
 def test_override_router_has_a_single_group_without_fallback_and_same_limits():
     """Requirement: Opciones por llamada / Modelo destino (Router de un solo despliegue)."""
     settings = make_settings(llm_timeout=30, llm_retries=1, anthropic_api_key="sk-ant-fake")
@@ -797,4 +696,4 @@ def test_override_router_has_a_single_group_without_fallback_and_same_limits():
     openai_router = build_override_router(settings, OPENAI_OVERRIDE)
     openai_params = openai_router.model_list[0]["litellm_params"]
     assert openai_params["model"] == "openai/gpt-4o"
-    assert openai_params["additional_drop_params"] == ["thinking"]
+    assert "additional_drop_params" not in openai_params

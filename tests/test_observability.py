@@ -18,8 +18,12 @@ from app.services.llm_service import (
     LiteLLMProvider,
     LLMProviderError,
 )
-from tests.conftest import make_input, make_settings, valid_body
+from app.services.moderation import LiteLLMModerator, get_moderator
+from tests.conftest import FakeModerator, make_input, make_settings, valid_body, valid_payload
+from tests.guardrails.test_moderation import FakeModerations, FakeOpenAIClient, FakeResponse
 from tests.test_llm_provider import PRIMARY, FakeRouter, FakeStream, chunk, response, usage_chunk
+from tests.test_structured_provider import FakeRouter as StructuredRouter
+from tests.test_structured_provider import tool_response
 
 SENTINEL = "DESCRIPCION-SECRETA-123"
 REFERENCE_SENTINEL = "REFERENCIA-SECRETA-456"
@@ -37,6 +41,14 @@ def names(logs: list[dict]) -> list[str]:
 
 def stack(router: FakeRouter, cache: ResponseCache | None) -> CachedProvider:
     return CachedProvider(LiteLLMProvider(router, PRIMARY, None), cache, PRIMARY.model)
+
+
+def structured_stack(
+    items: list, cache: ResponseCache | None, retries: int = 2
+) -> tuple[CachedProvider, StructuredRouter]:
+    router = StructuredRouter(items)
+    inner = LiteLLMProvider(router, PRIMARY, None, structured_max_retries=retries)
+    return CachedProvider(inner, cache, PRIMARY.model), router
 
 
 # --- Requirement: Logging estructurado ---
@@ -252,7 +264,7 @@ def _production_stderr(capsys, level: str = "DEBUG") -> None:
 def test_logs_never_contain_the_request_content_with_cache_miss_and_hit(capsys, response_cache):
     """Requirement: Datos que nunca se registran / Scenario: Log sin contenido de la petición."""
     _production_stderr(capsys)
-    provider = stack(FakeRouter(response(text="respuesta")), response_cache)
+    provider, _ = structured_stack([tool_response(valid_payload())], response_cache)
     service = EstimationService(provider)
     request = make_input(description=SENTINEL)
     service.estimate(request)  # miss
@@ -266,7 +278,7 @@ def test_logs_never_contain_the_request_content_with_cache_miss_and_hit(capsys, 
 def test_logs_never_contain_reference_projects(capsys, response_cache):
     """Requirement: Datos que nunca se registran / Scenario: Log sin proyectos de referencia."""
     _production_stderr(capsys)
-    provider = stack(FakeRouter(response(text="respuesta")), response_cache)
+    provider, _ = structured_stack([tool_response(valid_payload())], response_cache)
     service = EstimationService(provider)
     request = make_input(
         reference_projects=[{"name": REFERENCE_SENTINEL, "summary": "Resumen del proyecto"}]
@@ -337,8 +349,9 @@ def test_http_request_logs_through_the_app_never_include_the_description(
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     get_settings.cache_clear()
-    provider = stack(FakeRouter(response(text="respuesta")), response_cache)
+    provider, _ = structured_stack([tool_response(valid_payload())], response_cache)
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
+    app.dependency_overrides[get_moderator] = lambda: FakeModerator()
     try:
         with TestClient(app) as client:
             for _ in range(2):  # miss, then hit
@@ -349,7 +362,7 @@ def test_http_request_logs_through_the_app_never_include_the_description(
                         reference_projects=[{"name": REFERENCE_SENTINEL, "summary": "Resumen"}],
                     ),
                 ).json()
-                assert body["text"] == "respuesta"
+                assert body["text"].startswith("## Estimate:")
     finally:
         app.dependency_overrides.clear()
     logged = capsys.readouterr().err
@@ -357,3 +370,101 @@ def test_http_request_logs_through_the_app_never_include_the_description(
     assert SENTINEL not in logged
     assert REFERENCE_SENTINEL not in logged
     assert API_KEY not in logged
+
+
+# --- Requirement: Eventos de los guardrails y de la salida estructurada ---
+
+
+def test_structured_retry_logs_the_event_without_the_invalid_values(capsys, response_cache):
+    """Scenario: Reintento sin valores (el objeto inválido repite DESCRIPCION-SECRETA-123)."""
+    _production_stderr(capsys)
+    invalid = {**valid_payload(), "phases": [], "title": SENTINEL}
+    provider, router = structured_stack(
+        [tool_response(invalid), tool_response(valid_payload())], response_cache
+    )
+    outcome = EstimationService(provider).estimate(make_input(description=SENTINEL))
+    assert len(router.calls) == 2 and outcome.input_tokens == 200
+    logged = capsys.readouterr().err
+    assert "structured_output_retry" in logged
+    assert "llm_call_completed" in logged
+    assert SENTINEL not in logged
+
+
+def test_exhausted_structured_output_logs_failed_without_content(capsys, response_cache):
+    """Requirement: Eventos (structured_output_failed con reason y attempts, sin contenido)."""
+    from app.services.llm_service import StructuredOutputError
+
+    _production_stderr(capsys)
+    invalid = {**valid_payload(), "phases": [], "title": SENTINEL}
+    provider, _ = structured_stack([tool_response(invalid)] * 3, response_cache)
+    with pytest.raises(StructuredOutputError):
+        EstimationService(provider).estimate(make_input(description=SENTINEL))
+    logged = capsys.readouterr().err
+    assert "structured_output_failed" in logged
+    assert SENTINEL not in logged and "structured_output_retry" in logged
+
+
+def test_moderation_flagged_logs_checked_and_blocked_without_the_text(capsys):
+    """Scenario: Moderación sin contenido (flagged = true e input_guardrail_blocked)."""
+    from app.services.llm_service import InputGuardrailViolation
+
+    marked = "TEXTO-MARCADO-789"
+    moderations = FakeModerations(FakeResponse(True, {"violence": True}))
+    moderator = LiteLLMModerator("sk-fake", client=FakeOpenAIClient(moderations))
+    _production_stderr(capsys)
+    provider, router = structured_stack([], None)
+    service = EstimationService(provider, moderator=moderator)
+    with pytest.raises(InputGuardrailViolation):
+        service.estimate(make_input(description=f"{marked} web de reservas para una clínica"))
+    logged = capsys.readouterr().err
+    assert '"event": "moderation_checked"' in logged and '"flagged": true' in logged
+    assert '"event": "input_guardrail_blocked"' in logged
+    assert marked not in logged and router.calls == []
+
+
+def test_moderation_failure_log_has_the_error_type_only(capsys):
+    """Requirement: Eventos (moderation_failed con error_type y status_code)."""
+    moderator = LiteLLMModerator(
+        "sk-fake", client=FakeOpenAIClient(FakeModerations(error=RuntimeError(f"echo {SENTINEL}")))
+    )
+    _production_stderr(capsys)
+    assert moderator.flagged([SENTINEL]) is None
+    logged = capsys.readouterr().err
+    assert '"event": "moderation_failed"' in logged and "RuntimeError" in logged
+    assert SENTINEL not in logged
+
+
+def test_out_of_scope_and_rendered_events_carry_no_content(capsys, response_cache):
+    """Requirement: Eventos (estimation_out_of_scope y estimation_rendered)."""
+    from tests.conftest import out_of_scope_payload
+
+    _production_stderr(capsys)
+    provider, _ = structured_stack(
+        [tool_response(out_of_scope_payload(summary=SENTINEL))], response_cache
+    )
+    EstimationService(provider).estimate(make_input(description=SENTINEL))
+    logged = capsys.readouterr().err
+    for event in ("estimation_out_of_scope", "estimation_rendered", "estimation_evaluated"):
+        assert event in logged
+    assert '"skipped": "out_of_scope"' in logged
+    assert SENTINEL not in logged
+
+
+def test_cache_entry_invalid_log_has_only_the_key_prefix(capsys, fake_redis, response_cache):
+    """Requirement: Eventos (cache_entry_invalid estructurado, sin valores)."""
+    import json
+
+    _production_stderr(capsys)
+    provider, router = structured_stack(
+        [tool_response(valid_payload()), tool_response(valid_payload())], response_cache
+    )
+    service = EstimationService(provider)
+    service.estimate(make_input(description=SENTINEL))
+    key = fake_redis.keys("*")[0]
+    entry = json.loads(fake_redis.get(key))
+    entry["value"] = {"title": SENTINEL}
+    fake_redis.set(key, json.dumps(entry))
+    service.estimate(make_input(description=SENTINEL))
+    logged = capsys.readouterr().err
+    assert "cache_entry_invalid" in logged and len(router.calls) == 2
+    assert SENTINEL not in logged

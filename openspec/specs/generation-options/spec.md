@@ -1,10 +1,10 @@
 # generation-options Specification
 
 ## Purpose
-Permitir ajustar por petición cómo se genera la estimación (número de ejemplos, uso de ejemplos, modelo, límite de salida, razonamiento extendido y evaluación) con valores por defecto que reproducen el comportamiento original y validación que devuelve 422 ante opciones inválidas.
+Permitir ajustar por petición cómo se genera la estimación (número de ejemplos, uso de ejemplos, modelo, límite de salida y evaluación) con valores por defecto que reproducen el comportamiento original y validación que devuelve 422 ante opciones inválidas.
 ## Requirements
 ### Requirement: Parámetros de generación por petición
-`POST /api/v1/estimate` SHALL aceptar, además de los campos obligatorios del formulario (`description`, `project_type`, `detail_level` y `output_format`), estos campos opcionales. Sus valores por defecto MUST reproducir el comportamiento sin parámetros (mismo modelo con fallback, `max_tokens` 2048, sin thinking, todos los ejemplos, con evaluación).
+`POST /api/v1/estimate` SHALL aceptar, además de los campos obligatorios del formulario (`description`, `project_type`, `detail_level` y `output_format`), estos campos opcionales. Sus valores por defecto MUST reproducir el comportamiento sin parámetros (mismo modelo con fallback, `max_tokens` 2048, todos los ejemplos, con evaluación).
 
 | Campo | Tipo | Por defecto | Reglas (422 si no se cumplen) |
 |---|---|---|---|
@@ -12,18 +12,17 @@ Permitir ajustar por petición cómo se genera la estimación (número de ejempl
 | `use_examples` | `boolean` | `true` | `false` equivale a `num_examples = 0` |
 | `model` | `string \| null` | `null` (modelo primario con fallback) | 1..100 caracteres; modelo de OpenAI o Anthropic con API key configurada |
 | `max_tokens` | `integer` | `2048` | `1..16384` |
-| `thinking_budget` | `integer \| null` | `null` | `1024..16384` |
 | `evaluate` | `boolean` | `true` | — |
 
-Toda la validación MUST ocurrir antes de cualquier llamada al LLM. Los campos retirados `preprocessing` y `example_format` MUST NOT aceptarse con efecto: un body que los incluya se procesa como si no estuvieran (Pydantic ignora los campos desconocidos). La app Streamlit MUST NOT exponer estos parámetros y usa siempre los valores por defecto.
+Toda la validación MUST ocurrir antes de cualquier llamada al LLM. Los campos retirados `preprocessing`, `example_format` y `thinking_budget` MUST NOT aceptarse con efecto: un body que los incluya se procesa como si no estuvieran (Pydantic ignora los campos desconocidos). La app Streamlit MUST NOT exponer estos parámetros y usa siempre los valores por defecto.
 
 #### Scenario: Petición sin parámetros
 - **GIVEN** un body solo con `description`, `project_type`, `detail_level` y `output_format`
 - **WHEN** se hace POST a `/api/v1/estimate`
-- **THEN** el proveedor recibe el modelo primario con fallback, `max_tokens = 2048`, sin thinking, y el system prompt con los 3 ejemplos
+- **THEN** el proveedor recibe el modelo primario con fallback, `max_tokens = 2048` y el system prompt con los 3 ejemplos
 
 #### Scenario: Valor fuera de rango
-- **WHEN** el body incluye `num_examples: 4`, `max_tokens: 0` o `thinking_budget: 500`
+- **WHEN** el body incluye `num_examples: 4` o `max_tokens: 0`
 - **THEN** la respuesta es 422 indicando el campo y no se llama al LLM
 
 #### Scenario: Sin ejemplos
@@ -35,8 +34,8 @@ Toda la validación MUST ocurrir antes de cualquier llamada al LLM. Los campos r
 - **THEN** el system prompt contiene solo el primer ejemplo de `ESTIMATION_EXAMPLES`
 
 #### Scenario: Campos retirados
-- **WHEN** el body incluye además `preprocessing: "two_phase"` o `example_format: "json"`
-- **THEN** la respuesta es 200, se hace una única llamada al LLM y el system prompt es el mismo que sin esos campos
+- **WHEN** el body incluye además `preprocessing: "two_phase"`, `example_format: "json"` o `thinking_budget: 2048`
+- **THEN** la respuesta es 200, la llamada estructurada no incluye `thinking` y el system prompt es el mismo que sin esos campos
 
 ### Requirement: Sobrescritura del modelo por petición
 Cuando la petición incluye `model`, el sistema SHALL resolver su proveedor sin llamar a la red y usar ese modelo **sin fallback**. Si el modelo no se reconoce, su proveedor no es OpenAI ni Anthropic o no hay API key configurada para su proveedor, la respuesta MUST ser 422 con un mensaje que nombre el campo `model` y no contenga valores de keys, sin llamar al LLM. El modelo y proveedor efectivos de la respuesta MUST ser los del modelo pedido, con `fallback_used = false`.
@@ -67,22 +66,4 @@ Cuando la petición incluye `model`, el sistema SHALL resolver su proveedor sin 
 - **GIVEN** un body con `max_tokens: 50` y un proveedor que corta por límite
 - **WHEN** se hace POST a `/api/v1/estimate`
 - **THEN** el proveedor recibe `max_tokens = 50` y la respuesta tiene `truncated = true`
-
-### Requirement: Razonamiento extendido
-Con `thinking_budget`, el sistema SHALL activar el razonamiento extendido solo si el modelo destino (el pedido en `model` o, si no hay, el primario) es de Anthropic: MUST enviar `thinking` con ese presupuesto y un límite de salida efectivo de `max_tokens + thinking_budget`. Si el modelo destino es de OpenAI, MUST ignorar el presupuesto, no enviar `thinking` y registrar el warning `thinking_budget_ignored` (proveedor y modelo), sin cambiar la respuesta HTTP. Si el primario es de Anthropic y el respaldo de OpenAI, un fallback MUST responder sin thinking en lugar de fallar por el parámetro.
-
-#### Scenario: Thinking con Anthropic
-- **GIVEN** `PRIMARY_MODEL=claude-haiku-4-5`
-- **WHEN** el body incluye `thinking_budget: 2048` y `max_tokens: 2048`
-- **THEN** la llamada se hace con `thinking = {"type": "enabled", "budget_tokens": 2048}` y un límite de salida de 4096
-
-#### Scenario: Thinking ignorado en OpenAI
-- **GIVEN** `PRIMARY_MODEL=gpt-4o-mini`
-- **WHEN** el body incluye `thinking_budget: 2048`
-- **THEN** la llamada no incluye `thinking`, la respuesta es 200 y el log contiene `thinking_budget_ignored`
-
-#### Scenario: Fallback a OpenAI con thinking
-- **GIVEN** `PRIMARY_MODEL=claude-haiku-4-5`, `FALLBACK_MODEL=gpt-4o-mini`, un primario que falla y `thinking_budget: 2048`
-- **WHEN** se hace POST a `/api/v1/estimate`
-- **THEN** responde el respaldo sin thinking y la respuesta tiene `fallback_used = true`
 

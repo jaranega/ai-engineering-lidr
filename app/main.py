@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI
 from pydantic import ValidationError
 
 from app.config import Settings, configure_logging, format_config_error, get_settings
-from app.routers import estimations
+from app.routers import estimations, sessions
 from app.schemas import HealthResponse
 from app.services.cache import ResponseCache, get_response_cache
 from app.services.llm_service import get_llm_provider
@@ -41,6 +41,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(estimations.router, prefix="/api/v1")
+app.include_router(sessions.router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["health"], summary="Health check", response_model=HealthResponse)

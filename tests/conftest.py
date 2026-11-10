@@ -7,9 +7,9 @@ import app.config  # noqa: F401
 # isort: split
 import copy
 import logging
-import re
 import socket
 from collections.abc import Callable, Generator, Iterator, Sequence
+from contextlib import ExitStack
 from functools import partial
 
 import fakeredis
@@ -21,12 +21,18 @@ from litellm import CustomLLM
 from litellm import Router as RealRouter
 
 from app.config import LITELLM_LOGGERS, Settings, get_settings
+from app.context.examples import ESTIMATION_EXAMPLES
 from app.domain import EstimationInput
+from app.estimation.compute import compute_estimate
+from app.estimation.examples import example_result
+from app.estimation.render import render_markdown
+from app.estimation.schema import EstimationResult
 from app.main import app
 from app.prompts import loader as prompt_loader
-from app.prompts.loader import render_estimation_prompt
 from app.services import cache as cache_module
 from app.services import llm_service
+from app.services import moderation as moderation_module
+from app.services import session_service as session_service_module
 from app.services.cache import ResponseCache
 from app.services.llm_service import (
     FALLBACK_GROUP,
@@ -37,16 +43,20 @@ from app.services.llm_service import (
     LLMProviderError,
     LLMResult,
     LLMStream,
+    StructuredResult,
     build_override_router,
     build_router,
 )
+from app.sessions import SessionStore
 
 
 def _clear_caches() -> None:
     get_settings.cache_clear()
     llm_service.get_llm_provider.cache_clear()
     cache_module.get_response_cache.cache_clear()
+    moderation_module.get_moderator.cache_clear()
     prompt_loader._environment.cache_clear()
+    session_service_module.get_session_store.cache_clear()
 
 
 CONFIG_ENV_VARS = (
@@ -60,6 +70,13 @@ CONFIG_ENV_VARS = (
     "CACHE_TTL",
     "APP_ENV",
     "LOG_LEVEL",
+    "STRUCTURED_MAX_RETRIES",
+    "MODERATION_ENABLED",
+    "MAX_CONVERSATION_TURNS",
+    "MAX_SESSIONS",
+    "MAX_ATTACHMENTS",
+    "MAX_ATTACHMENT_BYTES",
+    "MAX_ATTACHMENT_CHARS",
 )
 
 
@@ -139,17 +156,92 @@ def valid_body(**overrides) -> dict:
     }
 
 
+TRANSCRIPT = "We need a clinic booking platform with reminders and an admin panel for the staff."
+
+
+def turn_data(**overrides) -> dict:
+    """Smallest valid multipart form of `POST /api/v1/sessions/{id}/estimate`."""
+    return {
+        "transcript": TRANSCRIPT,
+        "project_type": "web_saas",
+        "detail_level": "medium",
+        "output_format": "line_items",
+        **overrides,
+    }
+
+
+def attachment_parts(*files: tuple[str, bytes] | tuple[str, bytes, str]) -> list[tuple]:
+    """`files=` argument for httpx: one `attachments` part per `(name, data[, mime])`."""
+    return [
+        ("attachments", (name, data, *(rest or ("application/octet-stream",))))
+        for name, data, *rest in files
+    ]
+
+
 def make_input(**overrides) -> EstimationInput:
     """Typed estimation input built from `valid_body` (extra keys are ignored)."""
     return EstimationInput.model_validate(valid_body(**overrides))
 
 
-def example_estimates(output_format: str, version: str = "v1") -> list[str]:
-    """The estimation of each CAG example as rendered by `examples.j2` for the format."""
-    system, _ = render_estimation_prompt(
-        make_input(output_format=output_format), version, num_examples=3
-    )
-    return re.findall(r"<example_estimate>\n(.*?)\n</example_estimate>", system, re.S)
+def valid_payload(**overrides) -> dict:
+    """JSON payload of a valid in-scope `EstimationResult` (example 1) valid for every
+    format and level: it carries narrative paragraphs and per-phase assumptions.
+    """
+    data = example_result(ESTIMATION_EXAMPLES[0]).model_dump(mode="json")
+    # English free text, so label-language checks cannot be confused by Spanish content.
+    data["language"] = "en"
+    data["title"] = "Clinic booking platform"
+    data["summary"] = "Internal web platform with an agenda and reminders."
+    for index, row in enumerate(data["rows"], start=1):
+        row["task"] = f"Work item {index}"
+    for member in data["team"]:
+        member["role"] = "engineers"
+    data["assumptions_and_risks"] = ["The SMS provider is pay per use."]
+    data["narrative"] = ["First paragraph of prose.", "Second paragraph of prose."]
+    for phase in data["phases"]:
+        phase["assumptions"] = [f"Assumption of {phase['phase']}"]
+    return {**data, **overrides}
+
+
+def valid_result(**overrides) -> EstimationResult:
+    return EstimationResult.model_validate(valid_payload(**overrides))
+
+
+def example_estimates(
+    output_format: str, detail_level: str = "medium", language: str = "es"
+) -> list[str]:
+    """Markdown of each CAG example as rendered by the server for the format and level."""
+    return [
+        render_markdown(
+            compute_estimate(example_result(example), language), output_format, detail_level
+        )
+        for example in ESTIMATION_EXAMPLES
+    ]
+
+
+def out_of_scope_payload(**overrides) -> dict:
+    """JSON payload of a valid out-of-scope result (confidence below 30, nothing else)."""
+    return {
+        "language": "en",
+        "title": "Unclear project",
+        "summary": "The description is too vague to estimate.",
+        "confidence_pct": 10,
+        "rows": [],
+        "phases": [],
+        "team": [],
+        "duration_weeks": None,
+        "assumptions_and_risks": ["Scope, users and integrations are missing."],
+        "narrative": [],
+        **overrides,
+    }
+
+
+StructuredPayload = dict | EstimationResult
+StructuredSource = (
+    StructuredPayload
+    | list[StructuredPayload]
+    | Callable[[str, list[ChatMessage]], StructuredPayload]
+)
 
 
 class FakeProvider:
@@ -159,6 +251,10 @@ class FakeProvider:
     `error_after=N` it raises `error` after N fragments (0 = before the first one, like an
     SDK failure at creation: the real streams are lazy, so it surfaces on iteration).
     `fragments=[]` delivers zero fragments (empty reply); `truncated` sets the result flag.
+
+    `structured` is the payload of `generate_structured`: a dict or `EstimationResult`, a list
+    (the n-th call returns the n-th item, the last one repeats) or a callable
+    `(system, messages) -> payload` that can react to what the provider receives.
     """
 
     def __init__(
@@ -174,7 +270,14 @@ class FakeProvider:
         truncated: bool = False,
         fallback_used: bool = False,
         cache_hit: bool = False,
+        structured: StructuredSource | None = None,
+        attempts: int = 1,
     ) -> None:
+        # Payload returned by `generate_structured`, validated with the requested model.
+        self.structured = structured if structured is not None else valid_payload()
+        self.attempts = attempts
+        # Response models received by `generate_structured`, in call order.
+        self.response_models: list[type] = []
         self.result = LLMResult(
             text=text,
             model=model,
@@ -210,6 +313,35 @@ class FakeProvider:
             raise self.error
         return self.result
 
+    def generate_structured(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        response_model: type,
+        options: LLMCallOptions | None = None,
+    ) -> StructuredResult:
+        self.calls.append((system, list(messages)))
+        self.options.append(options)
+        self.response_models.append(response_model)
+        if self.error is not None:
+            raise self.error
+        source = self.structured
+        if callable(source):
+            source = source(system, list(messages))
+        elif isinstance(source, list):
+            source = source[min(len(self.calls), len(source)) - 1]
+        payload = source.model_dump(mode="json") if isinstance(source, EstimationResult) else source
+        return StructuredResult(
+            value=response_model.model_validate(payload),
+            model=self.result.model,
+            provider=self.result.provider,
+            input_tokens=self.result.input_tokens,
+            output_tokens=self.result.output_tokens,
+            attempts=self.attempts,
+            fallback_used=self.result.fallback_used,
+            cache_hit=self.result.cache_hit,
+        )
+
     def stream(
         self,
         system: str,
@@ -237,6 +369,23 @@ class FakeProvider:
             fallback_used=self.result.fallback_used,
             cache_hit=self.result.cache_hit,
         )
+
+
+class FakeModerator:
+    """Moderator double: records the texts it receives; `result` is what `flagged` returns
+    (`True`, `False` or `None` for "could not check"), or `error` is raised instead.
+    """
+
+    def __init__(self, result: bool | None = False, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[list[str]] = []
+
+    def flagged(self, texts: Sequence[str]) -> bool | None:
+        self.calls.append(list(texts))
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 @pytest.fixture
@@ -281,8 +430,26 @@ def response_cache(fake_redis: fakeredis.FakeRedis) -> ResponseCache:
 
 
 @pytest.fixture
+def moderator() -> FakeModerator:
+    """Moderator double used by the `client` fixture: never flags unless told to."""
+    return FakeModerator(result=False)
+
+
+@pytest.fixture
+def session_store(settings: Settings) -> SessionStore:
+    """Fresh in-memory session store (one per test) sized like the `settings` fixture."""
+    return SessionStore(
+        max_sessions=settings.max_sessions, max_turns=settings.max_conversation_turns
+    )
+
+
+@pytest.fixture
 def client(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, provider: FakeProvider
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    provider: FakeProvider,
+    moderator: FakeModerator,
+    session_store: SessionStore,
 ) -> Iterator[TestClient]:
     """TestClient running the lifespan, with settings and LLM provider overridden.
 
@@ -292,10 +459,56 @@ def client(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-lifespan")
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
+    app.dependency_overrides[moderation_module.get_moderator] = lambda: moderator
+    app.dependency_overrides[session_service_module.get_session_store] = lambda: session_store
     try:
         with TestClient(app) as test_client:
             yield test_client
     finally:
+        app.dependency_overrides.clear()
+
+
+def install_overrides(
+    settings: Settings,
+    provider: FakeProvider,
+    moderator: FakeModerator,
+    store: SessionStore,
+) -> None:
+    """Swap settings, provider, moderator and session store for doubles (offline wiring)."""
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
+    app.dependency_overrides[moderation_module.get_moderator] = lambda: moderator
+    app.dependency_overrides[session_service_module.get_session_store] = lambda: store
+
+
+@pytest.fixture
+def make_session_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[..., tuple[TestClient, FakeProvider, FakeModerator, SessionStore]]]:
+    """Factory of a started `TestClient` with doubles and custom `Settings` values.
+
+    `factory(provider=None, moderator=None, **settings_kwargs)` returns
+    `(client, provider, moderator, store)`; the store is sized like the settings.
+    """
+    stack = ExitStack()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-lifespan")
+
+    def factory(
+        provider: FakeProvider | None = None,
+        moderator: FakeModerator | None = None,
+        **settings_kwargs,
+    ) -> tuple[TestClient, FakeProvider, FakeModerator, SessionStore]:
+        cfg = make_settings(**settings_kwargs)
+        provider = provider or FakeProvider(model=cfg.primary.model, provider=cfg.primary.provider)
+        moderator = moderator or FakeModerator(result=False)
+        store = SessionStore(max_sessions=cfg.max_sessions, max_turns=cfg.max_conversation_turns)
+        install_overrides(cfg, provider, moderator, store)
+        return stack.enter_context(TestClient(app)), provider, moderator, store
+
+    try:
+        yield factory
+    finally:
+        stack.close()
         app.dependency_overrides.clear()
 
 

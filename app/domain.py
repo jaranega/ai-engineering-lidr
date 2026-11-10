@@ -8,9 +8,11 @@ re-exports the enums.
 """
 
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+
+Language = Literal["es", "en"]
 
 MIN_DESCRIPTION_CHARS = 20
 MAX_DESCRIPTION_CHARS = 2000
@@ -24,6 +26,16 @@ MIN_REFERENCE_HOURS = 1
 MAX_REFERENCE_HOURS = 20000
 MIN_REFERENCE_WEEKS = 1
 MAX_REFERENCE_WEEKS = 104
+
+MIN_TRANSCRIPT_CHARS = 1
+MAX_TRANSCRIPT_CHARS = 20_000
+
+
+class ChatMessage(TypedDict):
+    """One conversation turn; the shape LiteLLM expects."""
+
+    role: Literal["user", "assistant"]
+    content: str
 
 
 class ProjectType(str, Enum):  # noqa: UP042
@@ -129,3 +141,19 @@ class EstimationInput(BaseModel):
     @classmethod
     def _empty_to_none(cls, value: list[ReferenceProject] | None) -> list[ReferenceProject] | None:
         return value or None
+
+
+class SessionTurnInput(BaseModel):
+    """One turn of a conversation session: the new transcript plus the form enums."""
+
+    model_config = ConfigDict(frozen=True)
+
+    transcript: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True, min_length=MIN_TRANSCRIPT_CHARS, max_length=MAX_TRANSCRIPT_CHARS
+        ),
+    ]
+    project_type: ProjectType
+    detail_level: DetailLevel
+    output_format: OutputFormat

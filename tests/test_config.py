@@ -82,6 +82,47 @@ def test_invalid_limits_name_the_variable(monkeypatch, var, value, field):
     assert field in format_config_error(exc_info.value)
 
 
+def test_structured_output_and_moderation_defaults(monkeypatch):
+    """Requirement: Configuración de la salida estructurada / Scenario: Valores por defecto."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    settings = Settings(_env_file=None)
+    assert settings.structured_max_retries == 2
+    assert settings.moderation_enabled is True
+
+
+@pytest.mark.parametrize("value", ["9", "-1", "6"])
+def test_structured_max_retries_out_of_range_names_the_variable(monkeypatch, value):
+    """Requirement: Configuración de la salida estructurada / Reintentos fuera de rango."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
+    monkeypatch.setenv("STRUCTURED_MAX_RETRIES", value)
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None)
+    message = format_config_error(exc_info.value)
+    assert "STRUCTURED_MAX_RETRIES" in message
+    assert "sk-secret-value" not in message
+
+
+@pytest.mark.parametrize("value", ["0", "5"])
+def test_structured_max_retries_limits_are_inclusive(monkeypatch, value):
+    """Requirement: Configuración de la salida estructurada (rango 0..5 inclusivo)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("STRUCTURED_MAX_RETRIES", value)
+    assert Settings(_env_file=None).structured_max_retries == int(value)
+
+
+def test_moderation_can_be_disabled_from_the_environment(monkeypatch):
+    """Requirement: Configuración de la moderación / Scenario: Moderación desactivada."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("MODERATION_ENABLED", "false")
+    assert Settings(_env_file=None).moderation_enabled is False
+
+
+def test_env_example_documents_the_structured_output_and_moderation_variables():
+    """Requirement: Configuración de la salida estructurada (.env.example las documenta)."""
+    content = (REPO_ROOT / ".env.example").read_text()
+    assert "STRUCTURED_MAX_RETRIES" in content and "MODERATION_ENABLED" in content
+
+
 def test_zero_retries_is_valid():
     """Requirement: Configuración desde variables de entorno (LLM_RETRIES >= 0)."""
     assert make_settings(llm_retries=0).llm_retries == 0

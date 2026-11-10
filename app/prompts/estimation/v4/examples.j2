@@ -1,0 +1,23 @@
+{#
+  Few-shot examples as structured objects (structured output design D4). Each example
+  shows the client request and the `EstimationResult` delivered for it, as compact JSON
+  serialized in Python (accents unescaped, default-valued fields omitted; `narrative`
+  only in the narrative format). v4: `technologies` always present (also `[]`) and
+  per-phase `assumptions` only at the detailed level (S05 design D5). Spanish content,
+  `medium` granularity, no amounts: the code computes them.
+#}
+<examples>
+{% for example in examples %}
+<example>
+<example_request>
+<project_type>{{ example.project_type }}</project_type>
+<client_request>
+{{ example.meeting_summary }}
+</client_request>
+</example_request>
+<example_output>
+{{ example.output_json }}
+</example_output>
+</example>
+{% endfor %}
+</examples>

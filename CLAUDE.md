@@ -12,7 +12,8 @@ Es el "Proyecto 1" del programa AI Engineering de LIDR y **evoluciona sesión a 
 | S02 | Scaffolding FastAPI + arquitectura **CAG** (contexto estático en el prompt), `POST /api/v1/estimate`, `GET /health`, CI | `session-02` |
 | S03 | Cliente Streamlit (`streamlit_app.py`: chat multi-turno + streaming, in-process sobre `app/services`); en directo (puesta al día en `session-04`): LiteLLM con fallback, caché exact-match en Redis, structlog, SSE y Docker | `session-03` |
 | S04 | Formulario tipado (Pydantic + enums), prompts Jinja2 versionados (`prompts/estimation/v1/`), tests de templates | `session-04` |
-| S05+ | Contexto dinámico, memoria, prompts adaptativos, evaluación, RAG… | — |
+| S05 | Puesta al día con el directo de S04 (salida estructurada con Instructor, guardrails de entrada) y ejercicio: sesiones con memoria conversacional (ventana deslizante + `project_metadata`) y adjuntos PDF/DOCX | `session-05` |
+| S06+ | Contexto dinámico, prompts adaptativos, evaluación, RAG… | — |
 
 Enunciados y material de referencia: `/Users/javiaranega/claude/AIEngineer-notas/` (carpeta por módulo, `00_ejercicio-*.md` es el enunciado de cada sesión).
 Las notas son de otra edición (2026/09) pero el contenido es el mismo: **ignorar sus fechas límite y los destinatarios de email** que aparecen en ellas.
@@ -41,8 +42,8 @@ La sesión principal actúa como **orquestadora**: aplica el flujo de OpenSpec y
 | Agente | Modelo | Rutas que le pertenecen | Cuándo |
 |---|---|---|---|
 | `architect` | opus | solo `openspec/changes/**/design.md` | tras `/opsx:propose` y en cambios transversales |
-| `backend-engineer` | sonnet | `pyproject.toml`, `app/{main,config,domain,schemas}.py`, `app/routers/`, `.github/workflows/` | `/opsx:apply` |
-| `ai-engineer` | opus | `app/services/`, `app/context/`, `app/prompts/` | `/opsx:apply` y revisión de la calidad de los prompts |
+| `backend-engineer` | sonnet | `pyproject.toml`, `app/{main,config,domain,schemas}.py`, `app/routers/`, `app/attachments/`, `.github/workflows/` | `/opsx:apply` |
+| `ai-engineer` | opus | `app/services/`, `app/context/`, `app/prompts/`, `app/estimation/`, `app/guardrails/`, `app/sessions/` (y `app/services/session_service.py`) | `/opsx:apply` y revisión de la calidad de los prompts |
 | `frontend-engineer` | sonnet | `streamlit_app.py`, `.streamlit/` | `/opsx:apply`, interfaz Streamlit (desde S03) |
 | `qa-engineer` | sonnet | `tests/`, `samples/` | `/opsx:apply`, de escenarios a tests |
 
@@ -70,8 +71,9 @@ Naming de changes: `sNN-<verbo>-<qué>` en kebab-case (p. ej. `s02-add-cag-estim
 
 - **Python 3.12** (mínimo 3.11), gestor **uv** (`uv add`, `uv run`; nunca `pip install`).
 - **FastAPI** + **uvicorn**, **Pydantic v2** y **pydantic-settings** para configuración desde `.env`.
-- Proveedores LLM: **OpenAI** (`gpt-4o-mini`) y **Anthropic** (`claude-haiku-4-5`) vía **LiteLLM** (`litellm==1.106.4`, fijada), con modelo primario (`PRIMARY_MODEL`) y de respaldo (`FALLBACK_MODEL`). Solo `app/services` y `app/config.py` importan LiteLLM; no se usan los SDK directamente.
+- Proveedores LLM: **OpenAI** (`gpt-4o-mini`) y **Anthropic** (`claude-haiku-4-5`) vía **LiteLLM** (`litellm==1.106.4`, fijada), con modelo primario (`PRIMARY_MODEL`) y de respaldo (`FALLBACK_MODEL`). Salida estructurada con **Instructor** (`instructor==1.17.0`, fijada) en `Mode.TOOLS` sobre el Router de LiteLLM; nunca se le pasa `context`/`validation_context` (renderizaría los mensajes como plantillas). Solo `app/services` y `app/config.py` importan LiteLLM o Instructor; no se usan los SDK directamente, salvo el cliente de OpenAI que `app/services/moderation.py` pasa a `litellm.moderation` para fijar un timeout (LiteLLM no lo admite en esa llamada).
 - Caché exact-match en **Redis** (`REDIS_URL`, opcional) y logs con **structlog** (`structlog.get_logger(__name__)`); nunca se registran transcripciones, prompts, respuestas ni keys.
+- Adjuntos: **pypdf** (PDF) y **python-docx** (DOCX), extracción local en `app/attachments`; `python-multipart` para los formularios multipart de FastAPI.
 - Calidad: **ruff** (lint + format) y **pytest**. Los tests **nunca** llaman a APIs reales (LLM mockeado).
 - CI: **GitHub Actions** en cada push/PR → `uv sync`, `ruff check`, `ruff format --check`, `pytest`, `openspec validate --all --strict`.
 
@@ -84,14 +86,18 @@ app/
 ├── domain.py        # Enums y entrada tipada (EstimationInput); sin imports de app
 ├── schemas.py       # Contrato HTTP (EstimationRequest hereda de EstimationInput)
 ├── routers/         # HTTP: validación de entrada/salida, sin lógica de negocio
-├── services/        # Lógica de negocio: render del prompt, proveedor LiteLLM con fallback, caché Redis, coste, evaluación
-├── prompts/         # loader.py + templates Jinja2 versionados (estimation/v1, v2)
+├── services/        # Lógica de negocio: pipeline, proveedor LiteLLM + Instructor con fallback, caché Redis, coste, moderación, evaluación
+├── estimation/      # Schema del LLM (EstimationResult), cálculo de costes/totales y render Markdown es/en; sin LLM
+├── guardrails/      # Guardrails de entrada sin red (prompt injection ES/EN, PII y su enmascarado)
+├── sessions/        # Memoria conversacional en el proceso (historial con ventana, ProjectMetadata, almacén LRU); sin LLM
+├── attachments/     # Extracción local de texto de PDF (pypdf) y DOCX (python-docx), con límites; sin LLM
+├── prompts/         # loader.py + templates Jinja2 versionados (estimation/v3 para /estimate, v4 para sesiones)
 └── context/         # Datos estáticos inyectados en el prompt (CAG)
 ```
 
 - Routers **no** llaman a SDKs de LLM directamente; dependen de `services/` vía `Depends` (facilita mocks en tests).
 - Secrets solo vía variables de entorno; nunca en código, logs ni respuestas.
-- Patrón de mensajes: `system` (render de `system.j2`: instrucciones + ejemplos CAG) → `user` (render de `user.j2`: descripción tipada del proyecto). En Anthropic el system va en el parámetro `system`, no como mensaje.
+- Patrón de mensajes: `system` (render de `system.j2`: instrucciones + ejemplos CAG) → `user` (render de `user.j2`: descripción tipada del proyecto). En Anthropic el system va en el parámetro `system`, no como mensaje. El LLM devuelve un `EstimationResult` (herramienta forzada); importes y totales los calcula el código, nunca el LLM. En las sesiones (`v4`), los mensajes son el historial de la ventana (pares `user`/`assistant`) más el turno nuevo, y el system se regenera en cada turno con el `project_metadata`; el system nunca se guarda en el historial.
 - Una versión de prompt publicada (`app/prompts/estimation/vN/`) no se edita: los cambios van en una versión nueva.
 
 ## Comandos habituales

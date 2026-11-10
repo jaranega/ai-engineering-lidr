@@ -242,10 +242,11 @@ def test_unreadable_number_is_none(raw):
 
 
 @pytest.mark.parametrize("output_format", list(OutputFormat))
-@pytest.mark.parametrize("version", ["v1", "v2"])
-def test_reference_examples_score_one_in_every_format(output_format, version):
+@pytest.mark.parametrize("language", ["es", "en"])
+@pytest.mark.parametrize("level", ["summary", "medium", "detailed"])
+def test_reference_examples_score_one_in_every_format(output_format, level, language):
     """Requirement: Resultado de la evaluación / Scenario: Ejemplos de referencia."""
-    estimates = example_estimates(output_format.value, version)
+    estimates = example_estimates(output_format.value, level, language)
     assert len(estimates) == 3
     for estimate in estimates:
         check = evaluate_estimation(estimate, truncated=False, output_format=output_format)
