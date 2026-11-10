@@ -8,7 +8,7 @@ Proyecto del programa **AI-Engineering 2026/10 (LIDR)**. Servicio que recibe la 
 |---|---|---|
 | S02 | Scaffolding FastAPI + arquitectura CAG | `session-02` |
 | S03 | Interfaz conversacional con Streamlit (chat multi-turno, streaming y panel de contexto CAG) | `session-03` |
-| S04 | Del chat a la interfaz de producto: formulario tipado y prompts Jinja2 versionados | `pre-session-04` |
+| S04 | Del chat a la interfaz de producto: formulario tipado y prompts Jinja2 versionados | `session-04` |
 
 ## Arquitectura
 

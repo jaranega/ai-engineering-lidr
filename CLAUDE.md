@@ -10,8 +10,8 @@ Es el "Proyecto 1" del programa AI Engineering de LIDR y **evoluciona sesión a 
 | Sesión | Hito | Rama |
 |---|---|---|
 | S02 | Scaffolding FastAPI + arquitectura **CAG** (contexto estático en el prompt), `POST /api/v1/estimate`, `GET /health`, CI | `session-02` |
-| S03 | Cliente Streamlit (`streamlit_app.py`: chat multi-turno + streaming, in-process sobre `app/services`); en directo (puesta al día en `pre-session-04`): LiteLLM con fallback, caché exact-match en Redis, structlog, SSE y Docker | `session-03` |
-| S04 | Formulario tipado (Pydantic + enums), prompts Jinja2 versionados (`prompts/estimation/v1/`), tests de templates | `pre-session-04` / `session-04` |
+| S03 | Cliente Streamlit (`streamlit_app.py`: chat multi-turno + streaming, in-process sobre `app/services`); en directo (puesta al día en `session-04`): LiteLLM con fallback, caché exact-match en Redis, structlog, SSE y Docker | `session-03` |
+| S04 | Formulario tipado (Pydantic + enums), prompts Jinja2 versionados (`prompts/estimation/v1/`), tests de templates | `session-04` |
 | S05+ | Contexto dinámico, memoria, prompts adaptativos, evaluación, RAG… | — |
 
 Enunciados y material de referencia: `/Users/javiaranega/claude/AIEngineer-notas/` (carpeta por módulo, `00_ejercicio-*.md` es el enunciado de cada sesión).
