@@ -1,110 +1,113 @@
 # cag-prompt Specification
 
 ## Purpose
-Definir el contexto estático (ejemplos de estimaciones previas) y construir los mensajes `system`/`user` según la arquitectura CAG, en la que todo el contexto viaja en cada llamada al LLM.
+Definir el contexto estático (ejemplos de estimaciones previas) y construir, con los templates versionados, los mensajes `system`/`user` según la arquitectura CAG: todo el contexto viaja en cada llamada al LLM y el system prompt se adapta al formato de salida, al nivel de detalle, al tipo de proyecto y al idioma de la descripción.
 ## Requirements
 ### Requirement: Ejemplos de estimación estáticos
-El sistema SHALL definir en `app/context/examples.py` una constante `ESTIMATION_EXAMPLES` con 3 ejemplos de estimaciones previas de tipos de proyecto distintos, y las tarifas `RATES_EUR_PER_HOUR` (62,50 EUR/h para desarrollo, QA, despliegue y gestión; 50 EUR/h para diseño UX/UI). Cada ejemplo MUST incluir `meeting_summary` (qué pedía el cliente), los datos estructurados de la estimación (título, filas de desglose con tarea, horas y perfil de tarifa, equipo recomendado, duración en semanas y riesgos) y `estimation`, el Markdown con el formato de salida generado a partir de esos datos. El coste de cada fila MUST ser horas × tarifa de su perfil y los totales de horas y coste MUST ser la suma de las filas. Las horas de cada fila MUST ser múltiplos de 5.
+El sistema SHALL definir en `app/context/examples.py` una constante `ESTIMATION_EXAMPLES` con 3 ejemplos de estimaciones previas de tipos de proyecto distintos, las tarifas `RATES_EUR_PER_HOUR` (62,50 EUR/h para desarrollo, QA, despliegue y gestión; 50 EUR/h para diseño UX/UI) y la lista canónica de fases, en este orden: `discovery` (Descubrimiento y diseño / Discovery and design), `setup` (Arquitectura y setup / Architecture and setup), `development` (Desarrollo / Development), `qa` (QA y testing / QA and testing) y `deployment` (Despliegue y traspaso / Deployment and handover). Cada ejemplo MUST incluir `meeting_summary` (qué pedía el cliente), `project_type` (`web_saas`, `mobile_app` y `data_pipeline`, uno por ejemplo), los datos estructurados de la estimación (título, filas de desglose con tarea, horas, perfil de tarifa y fase, equipo recomendado, duración en semanas y riesgos), la confianza de cada fase (`confidence_pct`, entero de 0 a 100 múltiplo de 5) y la agregación por fase (horas, coste y confianza de cada fase con filas, en el orden canónico), calculada en Python. El coste de cada fila MUST ser horas × tarifa de su perfil, los totales de horas y coste MUST ser la suma de las filas y también la suma de las fases, y las horas de cada fila MUST ser múltiplos de 5. Los ejemplos MUST NOT guardar texto renderizado: la presentación la hace `examples.j2`.
 
 #### Scenario: Ejemplos válidos
 - **WHEN** se carga `ESTIMATION_EXAMPLES`
-- **THEN** contiene 3 elementos y cada uno tiene `meeting_summary` y `estimation` como strings no vacíos
+- **THEN** contiene 3 elementos, cada uno con `meeting_summary` no vacío y un `project_type` válido, y ninguno es de tipo `internal_tool`
 
 #### Scenario: Aritmética de los ejemplos
-- **WHEN** se recorren las filas de cada ejemplo
-- **THEN** cada coste es horas × tarifa, las horas son múltiplos de 5 y los totales coinciden con la suma de las filas
+- **WHEN** se recorren las filas y las fases de cada ejemplo
+- **THEN** cada coste es horas × tarifa, las horas son múltiplos de 5 y los totales coinciden con la suma de las filas y con la suma de las fases
 
-#### Scenario: Markdown coherente con los datos
-- **WHEN** se lee la `estimation` de un ejemplo
-- **THEN** contiene una fila de tabla por cada fila de datos con sus horas y coste, y los totales de horas y coste
+#### Scenario: Fases de los ejemplos
+- **WHEN** se recorren las filas de cada ejemplo
+- **THEN** cada fila tiene una fase de la lista canónica y cada fase con filas tiene una confianza entre 0 y 100 múltiplo de 5
 
 ### Requirement: System prompt con contexto inyectado
-El sistema SHALL construir un system prompt que defina el rol (estimador de software experto), dé instrucciones sobre el formato de la estimación e incluya los ejemplos seleccionados de `ESTIMATION_EXAMPLES` (por defecto, todos en formato Markdown) como referencia (arquitectura CAG: el contexto viaja en cada llamada). El orden de las secciones MUST ser: regla de idioma y rol, bloque de limpieza (solo con `inline_cleaning`), cómo usar los ejemplos (solo si hay ejemplos), formato de salida, ejemplos (solo si hay) y reglas; ninguna sección MUST ir después de las reglas. La construcción MUST ser una función pura, sin I/O, y determinista.
+El sistema SHALL construir el system prompt con `system.j2` de la versión pedida (capability `prompt-templates`): define el rol (estimador de software experto que recibe la descripción tipada de un proyecto), da instrucciones sobre el formato de la estimación e incluye los ejemplos seleccionados de `ESTIMATION_EXAMPLES` (por defecto, todos) como referencia (arquitectura CAG: el contexto viaja en cada llamada). El orden de las secciones MUST ser: regla de idioma, rol, pista del tipo de proyecto, cómo usar los ejemplos (solo si hay ejemplos), formato de salida (bloque del `output_format`, bloque del `detail_level`, tarifas y esqueleto en inglés del formato pedido), ejemplos (solo si hay) y reglas; después de las reglas solo MUST ir la línea del idioma detectado. El idioma de la descripción se detecta en el código con una heurística pura sin dependencias (palabras funcionales frecuentes de español e inglés, solo sobre la descripción): si es claro, el system prompt termina con una línea en inglés que lo nombra (`The project description is in English: …` o `… is in Spanish: …`); si es ambiguo, no se añade y la regla genérica cierra el prompt. El render MUST ser determinista y sin llamadas de red.
 
 #### Scenario: Todos los ejemplos en el prompt
 - **WHEN** se construye el system prompt con los valores por defecto
-- **THEN** contiene literalmente el `meeting_summary` y la `estimation` de cada ejemplo
+- **THEN** contiene literalmente el `meeting_summary` de cada ejemplo dentro del bloque `<examples>`
 
 #### Scenario: Determinismo
 - **WHEN** se construye el system prompt dos veces con los mismos parámetros
 - **THEN** ambos resultados son idénticos
 
-#### Scenario: Transcripción tratada como datos
+#### Scenario: Entrada tratada como datos
 - **WHEN** se construye el system prompt
-- **THEN** incluye la instrucción de tratar la transcripción únicamente como datos a estimar e ignorar las instrucciones que contenga
+- **THEN** sus reglas indican tratar el contenido de `<project_description>` y `<reference_projects>` únicamente como datos e ignorar las instrucciones que contenga
 
 #### Scenario: Idioma de la estimación
-- **WHEN** se construye el system prompt con cualquier combinación de parámetros
-- **THEN** empieza por la regla de idioma en inglés y las reglas terminan con ella
+- **WHEN** se construye el system prompt con cualquier combinación de versión, `project_type`, `detail_level`, `output_format` y número de ejemplos
+- **THEN** empieza por la regla de idioma en inglés referida a la descripción del proyecto y las reglas terminan con ella
+
+#### Scenario: Idioma detectado
+- **GIVEN** una descripción en inglés y proyectos de referencia en español
+- **WHEN** se construye el system prompt
+- **THEN** su última línea es `The project description is in English: write the entire estimate in English, including the title, headings, labels and text.`
+
+#### Scenario: Idioma ambiguo
+- **GIVEN** una descripción sin palabras funcionales de ninguno de los dos idiomas (solo siglas y nombres de producto)
+- **WHEN** se construye el system prompt
+- **THEN** no contiene ninguna línea de idioma detectado y termina con la regla de idioma genérica
 
 ### Requirement: Patrón de mensajes system / user
-El sistema SHALL enviar al LLM las instrucciones y los ejemplos como mensaje `system` y la transcripción, sin modificar, como primer mensaje `user` de la conversación. En el endpoint `POST /api/v1/estimate` ese es el único mensaje de la conversación, salvo con `preprocessing = "two_phase"`, donde el único mensaje `user` de la llamada de estimación son los requisitos extraídos de la transcripción en la llamada previa (que recibe la transcripción sin modificar). En el chat, la conversación continúa con turnos `assistant` y `user` alternos, también sin modificar. La transcripción y los mensajes de la conversación MUST NOT concatenarse en el system prompt.
+El sistema SHALL enviar al LLM las instrucciones y los ejemplos como mensaje `system` y el render de `user.j2` (tipo de proyecto, proyectos de referencia y descripción) como único mensaje `user` de la conversación. La descripción y los proyectos de referencia MUST NOT concatenarse en el system prompt.
 
 #### Scenario: Separación de roles
-- **GIVEN** una transcripción `T`
-- **WHEN** se construyen los mensajes para el LLM desde el endpoint sin preprocesado
-- **THEN** la conversación es exactamente un mensaje `user` con contenido `T` y el system prompt no contiene `T`
-
-#### Scenario: Conversación del chat
-- **GIVEN** una transcripción `T`, una estimación previa `E` y una petición de ajuste `A`
-- **WHEN** se construyen los mensajes para el LLM desde el chat
-- **THEN** la conversación es `user: T`, `assistant: E`, `user: A`, en ese orden, y el system prompt no contiene `T`, `E` ni `A`
-
-#### Scenario: Dos fases
-- **GIVEN** una transcripción `T` y unos requisitos extraídos `R`
-- **WHEN** se construyen los mensajes con `preprocessing = "two_phase"`
-- **THEN** la llamada de extracción recibe `user: T` y la de estimación recibe `user: R`, y ningún system prompt contiene `T` ni `R`
-
-### Requirement: System prompt del chat
-El system prompt del chat SHALL depender del turno: cuando la conversación tiene un único mensaje (la transcripción), MUST ser exactamente el system prompt CAG del endpoint; cuando la conversación ya tiene historial, MUST ser ese mismo prompt, íntegro y sin modificaciones, seguido de una sección de conversación que indique al modelo: que el primer mensaje del usuario es la transcripción; que los mensajes posteriores son peticiones de ajuste del usuario sobre la estimación (no contenido de la transcripción) y deben responderse con la estimación completa actualizada en el mismo formato y en el idioma de la transcripción, aunque la petición esté escrita en otro idioma; que si un mensaje posterior es una transcripción nueva debe estimarla desde cero; y que si un mensaje no tiene relación con la estimación debe responder brevemente, en el idioma de ese mensaje, que solo genera y ajusta estimaciones. La construcción MUST ser pura y determinista, y el system prompt del endpoint MUST NOT cambiar.
-
-#### Scenario: Primer turno con el prompt del endpoint
-- **GIVEN** una conversación con un único mensaje `user`
-- **WHEN** se construye el system prompt del chat
-- **THEN** es idéntico al system prompt del endpoint
-
-#### Scenario: Prompt del endpoint contenido
-- **GIVEN** una conversación con historial (`user`, `assistant`, `user`)
-- **WHEN** se construye el system prompt del chat
-- **THEN** empieza exactamente por el del endpoint y añade la sección de conversación al final
-
-#### Scenario: Idioma de los ajustes
-- **WHEN** se construye el system prompt del chat para una conversación con historial
-- **THEN** la sección de conversación indica responder los ajustes en el idioma de la transcripción
-
-#### Scenario: Endpoint sin cambios
-- **WHEN** `POST /api/v1/estimate` construye su system prompt
-- **THEN** no contiene la sección de conversación
-
-#### Scenario: Determinismo del prompt del chat
-- **WHEN** se construye el system prompt del chat dos veces
-- **THEN** ambos resultados son idénticos
+- **GIVEN** una descripción `D`
+- **WHEN** se construyen los mensajes para el LLM
+- **THEN** la conversación es exactamente un mensaje `user` que contiene `D` dentro de `<project_description>` y el system prompt no contiene `D`
 
 ### Requirement: Formato de salida con coste
-El formato de salida del system prompt SHALL pedir, con las etiquetas en el idioma de la transcripción (en español y, entre paréntesis, en inglés): título `## Estimación: <proyecto>` (`## Estimate: <project>`); sección `### Desglose de tareas` con una tabla `| Tarea | Horas | Coste (EUR) |` (`| Task | Hours | Cost (EUR) |`) sin fila de total; sección `### Totales` con total de horas, coste total, equipo recomendado y duración estimada en semanas; y `### Supuestos y riesgos` con 2 a 4 viñetas. MUST incluir las tarifas de `RATES_EUR_PER_HOUR` y la instrucción de calcular primero el coste de cada fila y después los totales como suma exacta de las filas, con importes sin separador de miles. Al final de la sección MUST incluir un esqueleto con las etiquetas en inglés para cuando la transcripción esté en inglés (medido: sin él, gpt-4o-mini respondía en español a parte de las transcripciones en inglés).
+El formato de salida del system prompt SHALL depender de `output_format` y pedir, con las etiquetas en el idioma de la descripción (en español y, entre paréntesis, en inglés), solo el formato pedido:
+- comunes a los tres: título `## Estimación: <proyecto>` (`## Estimate: <project>`) y sección `### Totales` (`### Totals`) con total de horas, coste total, equipo recomendado y duración estimada en semanas;
+- `line_items`: sección `### Desglose de tareas` (`### Task breakdown`) con una tabla `| Tarea | Horas | Coste (EUR) |` (`| Task | Hours | Cost (EUR) |`) sin fila de total, y `### Supuestos y riesgos` (`### Assumptions and risks`);
+- `phases_table`: sección `### Desglose por fases` (`### Phase breakdown`) con una tabla `| Fase | Horas | Coste (EUR) | Confianza (%) |` (`| Phase | Hours | Cost (EUR) | Confidence (%) |`), una fila por fase canónica que aplique y sin fila de total, con la instrucción que nombra `confidence_pct` y sus pautas, y `### Supuestos y riesgos`;
+- `narrative`: de 2 a 4 párrafos de prosa con el alcance, el enfoque por fases y los riesgos, sin tablas, seguidos de `### Totales`.
 
-#### Scenario: Instrucciones de formato
-- **WHEN** se construye el system prompt
-- **THEN** contiene la cabecera de tabla `| Tarea | Horas | Coste (EUR) |`, las tarifas 62,50 y 50 EUR/h y la instrucción de calcular las filas antes que los totales
+MUST incluir las tarifas de `RATES_EUR_PER_HOUR` y, en los formatos con tabla, la instrucción de calcular primero el coste de cada fila y después los totales como suma exacta de las filas, con importes sin separador de miles. Al final de la sección MUST incluir el esqueleto con las etiquetas en inglés del formato pedido, para cuando la descripción esté en inglés. El system prompt MUST NOT contener las instrucciones ni el esqueleto de los formatos no pedidos.
 
-#### Scenario: Esqueleto en inglés
-- **WHEN** se construye el system prompt
-- **THEN** la sección de formato termina con el esqueleto en inglés (`## Estimate:`, `| Task | Hours | Cost (EUR) |`, `### Totals`, `**Total hours:**`, `**Total cost:**`) y la regla de idioma en inglés sigue cerrando las reglas
+#### Scenario: Formato por partidas
+- **WHEN** se construye el system prompt con `output_format = "line_items"`
+- **THEN** contiene la cabecera `| Tarea | Horas | Coste (EUR) |`, las tarifas 62,50 y 50 EUR/h y la instrucción de calcular las filas antes que los totales, y no contiene `confidence_pct`
 
-### Requirement: Formatos de los ejemplos
-El sistema SHALL inyectar los ejemplos seleccionados dentro de un bloque `<examples>` en uno de tres formatos derivados de la misma fuente estructurada: `markdown` (resumen y estimación en Markdown de cada ejemplo), `json` (lista JSON con resumen, título, desglose con horas y coste, totales, equipo, duración y riesgos) y `narrative` (un párrafo en español por ejemplo con el resumen, los totales, la duración, el equipo y todas las tareas con horas y coste, y los riesgos), de modo que los tres formatos llevan la misma información. Con 0 ejemplos MUST omitirse el bloque `<examples>` y la sección sobre cómo usar los ejemplos. Los ejemplos seleccionados MUST ser los `num_examples` primeros en el orden de `ESTIMATION_EXAMPLES`.
-
-#### Scenario: Formato JSON
-- **WHEN** se construye el system prompt con `example_format = "json"`
-- **THEN** el bloque `<examples>` contiene un JSON válido con un elemento por ejemplo y sus totales de horas y coste
+#### Scenario: Formato por fases
+- **WHEN** se construye el system prompt con `output_format = "phases_table"`
+- **THEN** contiene la cabecera `| Fase | Horas | Coste (EUR) | Confianza (%) |`, la palabra `confidence_pct` y las cinco fases canónicas
 
 #### Scenario: Formato narrativo
-- **WHEN** se construye el system prompt con `example_format = "narrative"`
-- **THEN** el bloque `<examples>` contiene un párrafo por ejemplo con su total de horas y su coste total, y ninguna tabla Markdown
+- **WHEN** se construye el system prompt con `output_format = "narrative"`
+- **THEN** pide prosa sin tablas seguida de `### Totales` y no contiene `confidence_pct`, `phases_table` ni la cabecera de ninguna tabla
 
-#### Scenario: Misma información en los tres formatos
-- **WHEN** se construye el system prompt con cada formato
-- **THEN** los tres contienen el `meeting_summary` y los totales de horas y coste de cada ejemplo seleccionado
+#### Scenario: Esqueleto en inglés
+- **WHEN** se construye el system prompt con cada `output_format`
+- **THEN** la sección de formato termina con el esqueleto en inglés de ese formato (`## Estimate:`, `### Totals`, `**Total hours:**`, `**Total cost:**` y, si tiene tabla, su cabecera en inglés) y la regla de idioma en inglés sigue cerrando las reglas
+
+### Requirement: Nivel de detalle
+El system prompt SHALL incluir, dentro de la sección de formato y antes del esqueleto, el bloque del `detail_level` pedido: `summary` pide un desglose agregado (de 4 a 6 filas en `line_items`, 1 o 2 párrafos en `narrative`) y 1 o 2 supuestos; `medium` pide una fila por tarea (como hasta S03) y de 2 a 4 supuestos; `detailed` pide tareas desglosadas y añade la instrucción de listar los supuestos de cada fase en una sección `### Supuestos por fase` (`### Assumptions by phase`) con 1 a 3 viñetas por fase. La instrucción de supuestos por fase MUST aparecer solo con `detailed`.
+
+#### Scenario: Detallado
+- **WHEN** se construye el system prompt con `detail_level = "detailed"`
+- **THEN** contiene la instrucción de listar los supuestos de cada fase y la sección `### Supuestos por fase`
+
+#### Scenario: Resumen
+- **WHEN** se construye el system prompt con `detail_level = "summary"` o `"medium"`
+- **THEN** no contiene la instrucción de listar los supuestos de cada fase
+
+### Requirement: Pista del tipo de proyecto
+El system prompt SHALL incluir una única línea con la pista del `project_type` pedido (las tareas que suelen aparecer en ese tipo de proyecto) y MUST NOT incluir las pistas de los demás tipos.
+
+#### Scenario: Pista del tipo pedido
+- **WHEN** se construye el system prompt con `project_type = "data_pipeline"` y con `"mobile_app"`
+- **THEN** cada system prompt contiene la pista de su tipo y no la del otro
+
+### Requirement: Ejemplos en el formato pedido
+`examples.j2` SHALL presentar los ejemplos seleccionados dentro de un bloque `<examples>`, cada uno en un `<example>` con la petición (tipo de proyecto y `meeting_summary`) y la estimación en el mismo `output_format` que se pide, generada a partir de los datos estructurados con el filtro de importes del loader. Con 0 ejemplos MUST omitirse el bloque `<examples>` y la sección sobre cómo usar los ejemplos. Los ejemplos seleccionados MUST ser los `num_examples` primeros en el orden de `ESTIMATION_EXAMPLES`. Los ejemplos MUST NOT usar la etiqueta `<project_description>`, reservada para la entrada real.
+
+#### Scenario: Mismo formato que la salida
+- **WHEN** se construye el system prompt con `output_format = "phases_table"`
+- **THEN** cada ejemplo del bloque `<examples>` tiene una tabla por fases con confianza y ninguno tiene la tabla `| Tarea | Horas | Coste (EUR) |`
+
+#### Scenario: Ejemplos evaluables
+- **WHEN** se evalúa la estimación de cada ejemplo renderizada en cada `output_format` con la evaluación de ese formato
+- **THEN** todas obtienen `score = 1.0`
 
 #### Scenario: Sin ejemplos
 - **WHEN** se construye el system prompt con `num_examples = 0` o `use_examples = false`

@@ -2,14 +2,15 @@
 
 import pytest
 
-from app.context.examples import ESTIMATION_EXAMPLES
+from app.domain import OutputFormat
 from app.services.evaluation import (
-    CHECK_COUNT,
+    CHECK_COUNTS,
     COST_TOLERANCE_RATIO,
     HOURS_TOLERANCE,
     evaluate_estimation,
     parse_number,
 )
+from tests.conftest import example_estimates
 
 ES = """\
 ## Estimación: Web de reservas
@@ -114,7 +115,7 @@ def test_numbered_list_without_table_fails_table_and_arithmetic_checks():
     assert check.sum_row_hours is None
     assert check.sum_row_cost is None
     # Missing arithmetic data counts as not passed: 5 of 8 pass.
-    assert check.score == round(5 / CHECK_COUNT, 3)
+    assert check.score == round(5 / CHECK_COUNTS[OutputFormat.LINE_ITEMS], 3)
     assert len(check.issues) == 3
 
 
@@ -122,7 +123,7 @@ def test_truncated_response_fails_finish_check_and_reports_it():
     """Requirement: Evaluación estructural / Scenario: Respuesta truncada."""
     check = evaluate_estimation(ES, truncated=True)
     assert check.finish_ok is False
-    assert check.score == round(7 / CHECK_COUNT, 3)
+    assert check.score == round(7 / CHECK_COUNTS[OutputFormat.LINE_ITEMS], 3)
     assert len(check.issues) == 1
     assert "truncated" in check.issues[0]
 
@@ -143,7 +144,7 @@ def test_partial_score_is_passed_checks_over_eight():
 def test_empty_text_scores_only_the_finish_check():
     """Requirement: Resultado de la evaluación (score = aprobadas entre 8, redondeado a 3)."""
     check = evaluate_estimation("", truncated=False)
-    assert check.score == round(1 / CHECK_COUNT, 3) == 0.125
+    assert check.score == round(1 / CHECK_COUNTS[OutputFormat.LINE_ITEMS], 3) == 0.125
     assert len(check.issues) == 7
 
 
@@ -240,12 +241,16 @@ def test_unreadable_number_is_none(raw):
     assert parse_number(raw) is None
 
 
-@pytest.mark.parametrize("example", ESTIMATION_EXAMPLES, ids=lambda e: e["title"][:30])
-def test_reference_examples_score_one(example):
+@pytest.mark.parametrize("output_format", list(OutputFormat))
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_reference_examples_score_one_in_every_format(output_format, version):
     """Requirement: Resultado de la evaluación / Scenario: Ejemplos de referencia."""
-    check = evaluate_estimation(example["estimation"], truncated=False)
-    assert check.score == 1.0
-    assert check.issues == ()
+    estimates = example_estimates(output_format.value, version)
+    assert len(estimates) == 3
+    for estimate in estimates:
+        check = evaluate_estimation(estimate, truncated=False, output_format=output_format)
+        assert check.score == 1.0, check.issues
+        assert check.issues == ()
 
 
 @pytest.mark.parametrize(
@@ -272,3 +277,116 @@ def test_cost_total_label_with_european_decimal_number_parses():
     check = evaluate_estimation(text, truncated=False)
     assert check.declared_total_cost == 25312.5
     assert check.declared_total_hours == 100
+
+
+PHASES = """\
+## Estimación: Plataforma de datos
+
+### Desglose por fases
+| Fase | Horas | Coste (EUR) | Confianza (%) |
+|---|---|---|---|
+| Descubrimiento y diseño | 60 | 3750 | 85 |
+| Desarrollo | 160 | 10000 | 70 |
+| QA y testing | 80 | 5000 | 80 |
+
+### Totales
+- **Total de horas:** 300
+- **Coste total:** 18750 EUR
+- **Equipo recomendado:** 3 desarrolladores
+- **Duración estimada:** 4-5 semanas
+
+### Supuestos y riesgos
+- Sin migración de datos.
+"""
+
+NARRATIVE = """\
+## Estimación: Plataforma de datos
+
+La propuesta cubre el alcance completo con tres fases y un riesgo principal en la integración.
+
+### Totales
+- **Total de horas:** 300
+- **Coste total:** 18750 EUR
+- **Equipo recomendado:** 3 desarrolladores
+- **Duración estimada:** 4-5 semanas
+"""
+
+
+def test_phases_table_estimation_passes_all_eight_checks():
+    """Requirement: Evaluación estructural de la estimación / Scenario: Tabla por fases."""
+    check = evaluate_estimation(PHASES, False, OutputFormat.PHASES_TABLE)
+    assert check.score == 1.0
+    assert check.checks_total == 8
+    assert check.output_format == "phases_table"
+    assert (check.sum_row_hours, check.sum_row_cost) == (300, 18750)
+    assert check.rows_parsed == 3
+
+
+def test_phases_table_without_confidence_column_is_not_a_breakdown_table():
+    """Requirement: Evaluación estructural / Scenario: Tabla por fases sin confianza."""
+    text = (
+        PHASES.replace(" | Confianza (%) |", " |")
+        .replace("|---|---|---|---|", "|---|---|---|")
+        .replace(" | 85 |", " |")
+        .replace(" | 70 |", " |")
+        .replace(" | 80 |", " |")
+    )
+    check = evaluate_estimation(text, False, OutputFormat.PHASES_TABLE)
+    assert check.has_breakdown_table is False
+    assert any("phase breakdown table" in issue for issue in check.issues)
+
+
+def test_phases_confidence_is_not_validated_row_by_row():
+    """Requirement: Evaluación estructural (la confianza no se valida fila a fila)."""
+    text = PHASES.replace("| 85 |", "| 999 |").replace("| 70 |", "| abc |")
+    assert evaluate_estimation(text, False, OutputFormat.PHASES_TABLE).score == 1.0
+
+
+def test_line_items_table_is_not_accepted_as_a_phases_table():
+    """Requirement: Evaluación estructural (las columnas dependen del formato)."""
+    check = evaluate_estimation(ES, False, OutputFormat.PHASES_TABLE)
+    assert check.has_breakdown_table is False
+
+
+def test_narrative_estimation_passes_five_checks_without_table_fields():
+    """Requirement: Evaluación estructural / Scenario: Narrativa correcta."""
+    check = evaluate_estimation(NARRATIVE, False, OutputFormat.NARRATIVE)
+    assert check.score == 1.0
+    assert check.checks_total == 5
+    assert check.has_breakdown_table is None
+    assert check.hours_match is None
+    assert check.cost_match is None
+    assert check.rows_parsed == 0
+    assert check.issues == ()
+    assert not any("table" in issue for issue in check.issues)
+
+
+def test_narrative_partial_score_is_four_of_five():
+    """Requirement: Resultado de la evaluación / Scenario: Puntuación parcial narrativa."""
+    text = "\n".join(ln for ln in NARRATIVE.splitlines() if "Equipo recomendado" not in ln)
+    check = evaluate_estimation(text, False, OutputFormat.NARRATIVE)
+    assert check.score == 0.8
+    assert len(check.issues) == 1
+
+
+def test_check_counts_per_format():
+    """Requirement: Evaluación estructural (número de comprobaciones: 8, 8 y 5)."""
+    assert CHECK_COUNTS == {
+        OutputFormat.LINE_ITEMS: 8,
+        OutputFormat.PHASES_TABLE: 8,
+        OutputFormat.NARRATIVE: 5,
+    }
+
+
+def test_narrative_truncated_reports_it():
+    """Requirement: Evaluación estructural / Scenario: Respuesta truncada (narrativa)."""
+    check = evaluate_estimation(NARRATIVE, True, OutputFormat.NARRATIVE)
+    assert check.finish_ok is False
+    assert check.score == 0.8
+    assert "truncated" in check.issues[0]
+
+
+def test_unknown_output_format_is_rejected():
+    """Requirement: Evaluación estructural (formato desconocido es un error de programación)."""
+    with pytest.raises(ValueError):
+        evaluate_estimation(ES, False, "markdown")

@@ -18,6 +18,7 @@ source = { virtual = "." }
 default-groups = ["dev", "ui"]
 dependencies = [
     { name = "fastapi" },
+    { name = "jinja2" },
     { name = "litellm" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -40,6 +41,7 @@ ui = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.157.0" },
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "litellm", specifier = "==1.106.4" },
     { name = "pydantic-settings", specifier = ">=2.16.1" },
     { name = "python-dotenv", specifier = ">=1.2.4" },

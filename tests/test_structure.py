@@ -1,9 +1,14 @@
 """Project structure required by the exercise (`ci-pipeline` spec)."""
 
 import ast
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import CONFIG_ENV_VARS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -17,6 +22,16 @@ REQUIRED_FILES = [
     "app/services/llm_service.py",
     "app/context/__init__.py",
     "app/context/examples.py",
+    "app/domain.py",
+    "app/prompts/__init__.py",
+    "app/prompts/loader.py",
+    "app/prompts/language.py",
+    "app/prompts/estimation/v1/system.j2",
+    "app/prompts/estimation/v1/user.j2",
+    "app/prompts/estimation/v1/examples.j2",
+    "app/prompts/estimation/v2/system.j2",
+    "app/prompts/estimation/v2/user.j2",
+    "app/prompts/estimation/v2/examples.j2",
     "streamlit_app.py",
     ".env.example",
     ".gitignore",
@@ -58,6 +73,10 @@ FORBIDDEN_OUTSIDE_SERVICES = {"litellm", "redis", "openai", "anthropic"}
         "app/routers/estimations.py",
         "app/context/__init__.py",
         "app/context/examples.py",
+        "app/domain.py",
+        "app/prompts/__init__.py",
+        "app/prompts/loader.py",
+        "app/prompts/language.py",
         "streamlit_app.py",
     ],
 )
@@ -99,7 +118,7 @@ def test_provider_adapters_of_the_sdks_are_gone():
 
 
 def test_streamlit_app_imports_nothing_from_the_service_nor_llm_libraries():
-    """chat-ui / Scenario: Sin imports del servicio (AST: `app`, litellm, redis, SDKs)."""
+    """estimation-form-ui / Scenario: Sin dependencias del servicio."""
     roots = _imported_roots(REPO_ROOT / "streamlit_app.py")
     assert not roots & {"app", "litellm", "redis", "openai", "anthropic"}
 
@@ -142,3 +161,39 @@ def test_compose_has_api_and_redis_with_local_ports_and_no_streamlit():
     assert '"127.0.0.1:8000:8000"' in text
     assert '"127.0.0.1:6379:6379"' in text
     assert text.count("ports:") == 2  # no other published port
+
+
+def test_domain_module_imports_no_other_app_module():
+    """Design D2 / tasks 1.3: `app.domain` depends only on pydantic and the standard library."""
+    assert not {root for root in _imported_roots(REPO_ROOT / "app/domain.py") if root == "app"}
+    code = (
+        "import sys, app.domain; "
+        "print(sorted(m for m in sys.modules if m == 'app' or m.startswith('app.')))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        env={k: v for k, v in os.environ.items() if k not in CONFIG_ENV_VARS},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "['app', 'app.domain']"
+
+
+def test_retired_chat_and_streaming_artifacts_are_gone():
+    """Specs REMOVED: SSE, chat y contexto CAG (S04 design D10)."""
+    from app import schemas
+    from app.services import llm_service
+
+    for name in (
+        "MessageText",
+        "ConversationMessage",
+        "StreamEstimationRequest",
+        "ContextResponse",
+    ):
+        assert not hasattr(schemas, name)
+    for name in ("two_phase", "stream_chat", "EstimationStream", "build_estimation_prompt"):
+        assert not hasattr(llm_service, name)
+    assert not hasattr(llm_service.EstimationService, "stream_chat")

@@ -1,7 +1,7 @@
 # observability Specification
 
 ## Purpose
-Logging estructurado del servicio y de la interfaz con structlog (consola en desarrollo, JSON en producción): eventos de cada llamada al LLM y de la caché, y garantía de que nunca se registran transcripciones, mensajes, prompts, respuestas ni API keys.
+Logging estructurado del servicio y de la interfaz con structlog (consola en desarrollo, JSON en producción): eventos de cada llamada al LLM y de la caché, y garantía de que nunca se registran descripciones de proyectos, proyectos de referencia, mensajes, prompts, respuestas ni API keys.
 ## Requirements
 ### Requirement: Logging estructurado
 El sistema SHALL emitir sus logs con structlog: en formato de consola legible cuando `APP_ENV` no es `production` y en JSON (un objeto por línea, con `timestamp` ISO 8601, `level` y `event`) cuando `APP_ENV=production`. El nivel mínimo MUST ser `LOG_LEVEL`. Los logs de la librería estándar (`logging`), incluidos los de la aplicación y los de terceros, MUST salir con el mismo formato.
@@ -46,28 +46,20 @@ El sistema SHALL registrar `cache_hit`, `cache_miss` y `cache_stored` (con un pr
 - **THEN** se registran `cache_miss` y `cache_stored` en la primera, y `cache_hit` en la segunda
 
 ### Requirement: Datos que nunca se registran
-Ningún log del sistema, de la aplicación o de las librerías de terceros con el nivel configurado, MUST contener el contenido de las transcripciones, los mensajes de la conversación, los system prompts, las respuestas del LLM ni las API keys. Los mensajes de error de los SDK MUST NOT registrarse literalmente (solo el tipo de error y el status). Los loggers de terceros que vuelcan peticiones a nivel DEBUG MUST quedar como mínimo en INFO, y los loggers propios de LiteLLM MUST quedar silenciados (sus mensajes de error incluyen el cuerpo de la respuesta del proveedor) y su modo de depuración desactivado.
+Ningún log del sistema, de la aplicación o de las librerías de terceros con el nivel configurado, MUST contener el contenido de las descripciones de proyecto, de los proyectos de referencia, de los system prompts o mensajes renderizados, las respuestas del LLM ni las API keys. Los mensajes de error de los SDK MUST NOT registrarse literalmente (solo el tipo de error y el status). Los loggers de terceros que vuelcan peticiones a nivel DEBUG MUST quedar como mínimo en INFO, y los loggers propios de LiteLLM MUST quedar silenciados (sus mensajes de error incluyen el cuerpo de la respuesta del proveedor) y su modo de depuración desactivado.
 
 #### Scenario: Log sin contenido de la petición
-- **GIVEN** `LOG_LEVEL=DEBUG` y una transcripción con el texto `TRANSCRIPCION-SECRETA-123`
+- **GIVEN** `LOG_LEVEL=DEBUG` y una descripción con el texto `DESCRIPCION-SECRETA-123`
 - **WHEN** se genera una estimación, con acierto o fallo de caché
-- **THEN** ningún log contiene `TRANSCRIPCION-SECRETA-123`
+- **THEN** ningún log contiene `DESCRIPCION-SECRETA-123`
+
+#### Scenario: Log sin proyectos de referencia
+- **GIVEN** `LOG_LEVEL=DEBUG` y un proyecto de referencia cuyo nombre es `REFERENCIA-SECRETA-456`
+- **WHEN** se genera una estimación
+- **THEN** ningún log contiene `REFERENCIA-SECRETA-456`
 
 #### Scenario: Log sin API keys
 - **GIVEN** `OPENAI_API_KEY=sk-test-visible-value` y un proveedor que falla con un error cuyo mensaje contiene la key
 - **WHEN** se registra el fallo
 - **THEN** ningún log contiene `sk-test-visible-value`
-
-### Requirement: Eventos del streaming por HTTP
-El endpoint SSE SHALL registrar `estimate_stream_cancelled` (con el número de fragmentos enviados) cuando el cliente se desconecta antes del final y `estimate_stream_failed` (solo con el tipo de error) cuando una excepción inesperada que no es del proveedor corta la generación. La app Streamlit SHALL registrar `api_unreachable` (tipo de error) cuando no puede conectar con la API y `api_stream_failed` (motivo: estado HTTP distinto de 200, evento `error`, stream sin evento terminal o error de transporte a mitad). Ninguno de estos eventos MUST incluir el contenido de los mensajes, de la respuesta ni mensajes de error literales.
-
-#### Scenario: Cancelación registrada
-- **GIVEN** un stream SSE que ha entregado dos fragmentos
-- **WHEN** el cliente se desconecta
-- **THEN** se registra `estimate_stream_cancelled` con `fragments = 2`
-
-#### Scenario: API inaccesible desde la UI
-- **GIVEN** que la API no acepta conexiones
-- **WHEN** la app Streamlit intenta enviar un mensaje
-- **THEN** se registra `api_unreachable` con el tipo de error y sin el texto del mensaje
 

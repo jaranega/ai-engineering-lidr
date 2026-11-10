@@ -4,7 +4,7 @@
 Caché exact-match en Redis de las respuestas completas del LLM, compartida entre la generación normal y el streaming: clave, caducidad, qué se guarda y qué no, y degradación sin errores cuando Redis no está disponible.
 ## Requirements
 ### Requirement: Caché exact-match de respuestas
-El sistema SHALL guardar en Redis las respuestas completas del LLM y reutilizarlas cuando llega una petición idéntica. La clave MUST derivarse de forma determinista (hash SHA-256) del system prompt, la lista completa de mensajes (roles y contenidos, en orden), el modelo destino (el pedido en la petición o, si no hay, el primario configurado), si el modelo es una sobrescritura de la petición, el límite de tokens de salida solicitado y el presupuesto de razonamiento, de modo que cualquier cambio en cualquiera de ellos produzca una clave distinta. Las opciones que solo afectan al prompt (preprocesado, formato y número de ejemplos) entran en la clave a través del system prompt y los mensajes; la evaluación no entra. Las entradas MUST caducar a los `CACHE_TTL` segundos.
+El sistema SHALL guardar en Redis las respuestas completas del LLM y reutilizarlas cuando llega una petición idéntica. La clave MUST derivarse de forma determinista (hash SHA-256) del system prompt, la lista completa de mensajes (roles y contenidos, en orden), el modelo destino (el pedido en la petición o, si no hay, el primario configurado), si el modelo es una sobrescritura de la petición, el límite de tokens de salida solicitado y el presupuesto de razonamiento, de modo que cualquier cambio en cualquiera de ellos produzca una clave distinta. Lo que solo afecta al prompt (versión del prompt, `project_type`, `detail_level`, `output_format`, número de ejemplos y proyectos de referencia) entra en la clave a través del system prompt y el mensaje `user` renderizados; la evaluación no entra. Las entradas MUST caducar a los `CACHE_TTL` segundos.
 
 #### Scenario: Segunda petición idéntica
 - **GIVEN** una caché disponible y una primera petición que se completó correctamente
@@ -12,8 +12,8 @@ El sistema SHALL guardar en Redis las respuestas completas del LLM y reutilizarl
 - **THEN** la respuesta se sirve desde la caché, no se llama al LLM y el resultado indica `cache_hit = true`
 
 #### Scenario: Petición distinta
-- **GIVEN** una respuesta guardada para una transcripción
-- **WHEN** llega una petición cuya transcripción difiere en un solo carácter, o con otro historial de conversación
+- **GIVEN** una respuesta guardada para una descripción
+- **WHEN** llega una petición cuya descripción difiere en un solo carácter, o con otros proyectos de referencia
 - **THEN** se llama al LLM y el resultado indica `cache_hit = false`
 
 #### Scenario: Cambio de configuración
@@ -22,8 +22,8 @@ El sistema SHALL guardar en Redis las respuestas completas del LLM y reutilizarl
 - **THEN** no se reutiliza la respuesta guardada
 
 #### Scenario: Opciones distintas
-- **GIVEN** una respuesta guardada para una transcripción con los valores por defecto
-- **WHEN** llega la misma transcripción con otro `max_tokens`, otro `thinking_budget`, otro `example_format` o `model` igual al primario pedido como sobrescritura
+- **GIVEN** una respuesta guardada para una descripción con los valores por defecto
+- **WHEN** llega la misma descripción con otro `max_tokens`, otro `thinking_budget`, otro `output_format`, otro `detail_level`, otro `project_type`, `prompt_version=v2` o `model` igual al primario pedido como sobrescritura
 - **THEN** no se reutiliza la respuesta guardada
 
 #### Scenario: Evaluación fuera de la clave
@@ -65,8 +65,8 @@ La generación en streaming SHALL consultar y alimentar la misma caché que la g
 - **THEN** el stream entrega el texto guardado en un único fragmento, no se llama al LLM y el resultado indica `cache_hit = true`
 
 #### Scenario: Compartida entre modos
-- **GIVEN** una respuesta generada y guardada mediante `POST /api/v1/estimate`
-- **WHEN** la app Streamlit envía la misma transcripción como primer mensaje
+- **GIVEN** una respuesta generada y guardada con `generate` para un system prompt y unos mensajes
+- **WHEN** se pide en streaming con el mismo system prompt y los mismos mensajes
 - **THEN** la respuesta se sirve desde la caché
 
 ### Requirement: Degradación sin Redis

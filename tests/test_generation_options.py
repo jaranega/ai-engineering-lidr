@@ -1,5 +1,5 @@
 """HTTP and service tests for the per-request generation options (spec: generation-options,
-estimation-api and cag-prompt deltas of `s02-add-generation-knobs-and-evaluation`)."""
+estimation-api, cag-prompt and estimation-evaluation of `s04-add-typed-form-and-jinja-prompts`)."""
 
 import pytest
 from structlog.testing import capture_logs
@@ -7,10 +7,9 @@ from structlog.testing import capture_logs
 from app.config import Deployment, get_settings
 from app.context.examples import ESTIMATION_EXAMPLES
 from app.main import app
+from app.prompts.loader import render_estimation_prompt
 from app.services import llm_service
 from app.services.llm_service import (
-    EXTRACTION_MAX_TOKENS,
-    EXTRACTION_SYSTEM_PROMPT,
     CachedProvider,
     EstimationService,
     GenerationOptions,
@@ -19,18 +18,14 @@ from app.services.llm_service import (
     LLMProviderError,
     LLMResult,
 )
-from app.services.pricing import estimate_cost
-from tests.conftest import FakeProvider, make_settings
+from tests.conftest import FakeProvider, example_estimates, make_input, make_settings, valid_body
 
 ESTIMATE = "/api/v1/estimate"
-STREAM = "/api/v1/estimate/stream"
-T = "Cliente: queremos una web de reservas. TRANSCRIPCION-ZZ-1"
 HAIKU = Deployment("claude-haiku-4-5", "anthropic")
-CLEANING_HEADING = "## Limpieza de la transcripción"
 
 
 def post(client, **options):
-    return client.post(ESTIMATE, json={"transcription": T, **options})
+    return client.post(ESTIMATE, json=valid_body(**options))
 
 
 def call_options(provider: FakeProvider, index: int = 0) -> LLMCallOptions:
@@ -50,17 +45,15 @@ def test_request_without_parameters_uses_the_defaults(client, provider):
     response = post(client)
     assert response.status_code == 200
     system, messages = provider.calls[0]
-    assert system == llm_service._system_prompt() == llm_service._system_prompt(3, "markdown")
+    expected_system, expected_user = render_estimation_prompt(make_input(), "v1", num_examples=3)
+    assert system == expected_system
     for example in ESTIMATION_EXAMPLES:
         assert example["meeting_summary"] in system
-        assert example["estimation"] in system
-    assert messages == [{"role": "user", "content": T}]
+    assert messages == [{"role": "user", "content": expected_user}]
     options = call_options(provider)
     assert options == LLMCallOptions()
     assert (options.model, options.max_tokens, options.thinking_budget) == (None, 2048, None)
-    body = response.json()
-    assert body["preprocessing"] == "none"
-    assert body["validation"] is not None
+    assert response.json()["validation"] is not None
     assert provider.call_count == 1
 
 
@@ -74,8 +67,6 @@ def test_request_without_parameters_uses_the_defaults(client, provider):
         ("thinking_budget", 500),
         ("thinking_budget", 1023),
         ("thinking_budget", 16385),
-        ("preprocessing", "otro"),
-        ("example_format", "xml"),
         ("model", ""),
         ("model", "m" * 101),
         ("evaluate", "quizá"),
@@ -134,12 +125,21 @@ def test_num_examples_one_includes_only_the_first_example(client, provider):
         assert example["meeting_summary"] not in system
 
 
-@pytest.mark.parametrize("fmt", ["json", "narrative"])
-def test_example_format_changes_the_prompt(client, provider, fmt):
-    """Requirement: Formatos de los ejemplos (selección por petición)."""
-    assert post(client, example_format=fmt).status_code == 200
-    assert provider.calls[0][0] == llm_service._system_prompt(3, fmt)
-    assert provider.calls[0][0] != llm_service._system_prompt()
+@pytest.mark.parametrize(
+    "removed",
+    [{"preprocessing": "two_phase"}, {"example_format": "json"}, {"transcription": "texto viejo"}],
+    ids=["preprocessing", "example_format", "transcription"],
+)
+def test_removed_fields_are_ignored(client, provider, removed):
+    """Requirement: Parámetros de generación / Scenario: Campos retirados."""
+    baseline = post(client)
+    system_without = provider.calls[0][0]
+    response = post(client, **removed)
+    assert response.status_code == baseline.status_code == 200
+    assert provider.call_count == 2  # one call each: no second phase
+    assert provider.calls[1][0] == system_without
+    assert provider.calls[1] == provider.calls[0]
+    assert set(response.json()) == set(baseline.json())
 
 
 def test_max_tokens_reaches_the_provider_and_a_cut_generation_is_truncated(client, provider):
@@ -239,134 +239,9 @@ def test_override_failure_is_a_generic_502_without_a_second_call(client, provide
     assert call_options(provider).model == HAIKU
 
 
-# --- Requirement: Preprocesado de la transcripción ---
-
-
-def test_inline_cleaning_block_and_unmodified_transcription(client, provider):
-    """Requirement: Preprocesado / Scenario: Limpieza en línea."""
-    response = post(client, preprocessing="inline_cleaning")
-    assert response.status_code == 200
-    system, messages = provider.calls[0]
-    assert system == llm_service._system_prompt(3, "markdown", True)
-    assert system.index("Eres un consultor") < system.index(CLEANING_HEADING)
-    assert system.index(CLEANING_HEADING) < system.index("## Formato de la respuesta")
-    assert messages == [{"role": "user", "content": T}]
-    assert response.json()["preprocessing"] == "inline_cleaning"
-    assert provider.call_count == 1
-
-
-def two_phase_provider(
-    extraction: LLMResult | LLMProviderError, estimation: LLMResult | None = None
-):
-    return FakeProvider(responses=[extraction, estimation or llm_result("## Estimación: x")])
-
-
-def test_two_phase_makes_two_calls_and_exposes_the_extraction(client):
-    """Requirement: Preprocesado / Scenario: Dos fases; Estimación en dos fases."""
-    requirements = "REQ-ZZ-9: reservas online"
-    provider = two_phase_provider(
-        llm_result(requirements, input_tokens=800, output_tokens=200),
-        llm_result("## Estimación: x", input_tokens=3000, output_tokens=600),
-    )
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    response = post(client, preprocessing="two_phase")
-    assert response.status_code == 200
-    assert provider.call_count == 2
-    (first_system, first_messages), (second_system, second_messages) = provider.calls
-    # Extraction: the transcription goes unmodified; limited to 1500 output tokens.
-    assert first_system == EXTRACTION_SYSTEM_PROMPT
-    assert first_messages == [{"role": "user", "content": T}]
-    assert call_options(provider, 0).max_tokens == EXTRACTION_MAX_TOKENS == 1500
-    # Estimation: the extracted requirements are the only user message.
-    assert second_messages == [{"role": "user", "content": requirements}]
-    assert second_system == llm_service._system_prompt(two_phase=True)
-    for system in (first_system, second_system):
-        assert T not in system
-        assert requirements not in system
-    body = response.json()
-    assert body["preprocessing"] == "two_phase"
-    assert body["extracted_requirements"] == requirements
-    assert (body["preprocessing_input_tokens"], body["preprocessing_output_tokens"]) == (800, 200)
-    assert body["preprocessing_cost_usd"] == estimate_cost("gpt-4o-mini", 800, 200)
-    assert (body["input_tokens"], body["output_tokens"]) == (3000, 600)
-
-
-def test_two_phase_cost_usd_excludes_the_extraction_call(client):
-    """Requirement: Endpoint de estimación (el coste de la fase previa no se suma a cost_usd)."""
-    provider = two_phase_provider(
-        llm_result("REQ", model="gpt-4o-mini", input_tokens=5000, output_tokens=1000),
-        llm_result("## Estimación: x", model="gpt-4o-mini", input_tokens=3000, output_tokens=600),
-    )
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    body = post(client, preprocessing="two_phase").json()
-    assert body["cost_usd"] == estimate_cost("gpt-4o-mini", 3000, 600)
-    assert body["preprocessing_cost_usd"] == estimate_cost("gpt-4o-mini", 5000, 1000)
-    assert body["cost_usd"] != body["preprocessing_cost_usd"]
-
-
-def test_without_two_phase_the_preprocessing_fields_are_neutral(client):
-    """Requirement: Endpoint de estimación (fase previa: 0 tokens y null sin two_phase)."""
-    for preprocessing in ("none", "inline_cleaning"):
-        body = post(client, preprocessing=preprocessing).json()
-        assert body["extracted_requirements"] is None
-        assert (body["preprocessing_input_tokens"], body["preprocessing_output_tokens"]) == (0, 0)
-        assert body["preprocessing_cost_usd"] is None
-
-
-def test_two_phase_unknown_model_has_null_preprocessing_cost(client):
-    """Requirement: Endpoint de estimación (preprocessing_cost_usd null con modelo sin precio)."""
-    provider = two_phase_provider(llm_result("REQ", model="mystery-model"))
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    body = post(client, preprocessing="two_phase").json()
-    assert body["preprocessing_cost_usd"] is None
-
-
-def test_two_phase_extraction_failure_is_a_generic_502_and_skips_the_estimation(client):
-    """Requirement: Preprocesado / Scenario: Fallo en la extracción."""
-    provider = two_phase_provider(LLMProviderError(provider="openai"))
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    response = post(client, preprocessing="two_phase")
-    assert response.status_code == 502
-    assert response.json() == {"detail": "LLM provider error"}
-    assert provider.call_count == 1
-
-
-@pytest.mark.parametrize("blank", ["", "   \n\t "])
-def test_two_phase_blank_extraction_is_a_generic_502(client, blank):
-    """Requirement: Preprocesado / Scenario: Extracción vacía."""
-    provider = two_phase_provider(llm_result(blank))
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    response = post(client, preprocessing="two_phase")
-    assert response.status_code == 502
-    assert response.json() == {"detail": "LLM provider error"}
-    assert provider.call_count == 1
-
-
-def test_two_phase_truncated_extraction_continues_with_the_received_text_and_warns(client):
-    """Requirement: Preprocesado (extracción truncada: continúa y registra un warning)."""
-    provider = two_phase_provider(llm_result("REQ-PARCIAL", truncated=True))
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    with capture_logs() as logs:
-        response = post(client, preprocessing="two_phase")
-    assert response.status_code == 200
-    assert provider.calls[1][1] == [{"role": "user", "content": "REQ-PARCIAL"}]
-    assert response.json()["extracted_requirements"] == "REQ-PARCIAL"
-    warnings = [e for e in logs if e["event"] == "requirements_extraction_truncated"]
-    assert len(warnings) == 1
-    assert warnings[0]["log_level"] == "warning"
-
-
-def test_two_phase_estimation_failure_after_extraction_is_502(client):
-    """Requirement: Endpoint de estimación / Scenario: Fallo del proveedor (segunda llamada)."""
-    provider = two_phase_provider(llm_result("REQ"), LLMProviderError(provider="openai"))
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    assert post(client, preprocessing="two_phase").status_code == 502
-    assert provider.call_count == 2
-
-
 # --- Requirement: Evaluación (API) ---
 
-VALID_ESTIMATION = ESTIMATION_EXAMPLES[0]["estimation"]
+VALID_ESTIMATION = example_estimates("line_items")[0]
 
 
 def test_evaluate_true_returns_the_full_validation_object(client, provider):
@@ -374,6 +249,8 @@ def test_evaluate_true_returns_the_full_validation_object(client, provider):
     provider.result = llm_result(VALID_ESTIMATION)
     validation = post(client).json()["validation"]
     assert set(validation) == {
+        "output_format",
+        "checks_total",
         "has_title",
         "has_breakdown_table",
         "has_totals",
@@ -392,7 +269,35 @@ def test_evaluate_true_returns_the_full_validation_object(client, provider):
     }
     assert validation["score"] == 1.0
     assert validation["issues"] == []
+    assert validation["output_format"] == "line_items"
+    assert validation["checks_total"] == 8
     assert validation["rows_parsed"] == len(ESTIMATION_EXAMPLES[0]["rows"])
+
+
+@pytest.mark.parametrize(
+    ("fmt", "total", "table"), [("phases_table", 8, True), ("narrative", 5, None)]
+)
+def test_validation_follows_the_requested_output_format(client, provider, fmt, total, table):
+    """Requirement: Evaluación estructural (por output_format) / Resultado de la evaluación."""
+    provider.result = llm_result(example_estimates(fmt)[1])
+    validation = post(client, output_format=fmt).json()["validation"]
+    assert validation["output_format"] == fmt
+    assert validation["checks_total"] == total
+    assert validation["has_breakdown_table"] is table
+    assert validation["score"] == 1.0
+    if fmt == "narrative":
+        assert (validation["rows_parsed"], validation["hours_match"]) == (0, None)
+
+
+def test_estimation_evaluated_log_has_the_output_format(client, provider):
+    """Requirement: Resultado de la evaluación (log con output_format, score e incidencias)."""
+    provider.result = llm_result(example_estimates("narrative")[0])
+    with capture_logs() as logs:
+        post(client, output_format="narrative")
+    logged = [e for e in logs if e["event"] == "estimation_evaluated"]
+    assert [(e["output_format"], e["score"], e["issues"]) for e in logged] == [
+        ("narrative", 1.0, 0)
+    ]
 
 
 def test_unstructured_estimation_gets_a_partial_score_and_issues(client, provider):
@@ -436,7 +341,7 @@ def test_cache_hit_is_evaluated_on_the_cached_text(client, response_cache):
     first = post(client).json()
     second = post(client).json()
     assert (first["cache_hit"], second["cache_hit"]) == (False, True)
-    assert second["estimation"] == first["estimation"]
+    assert second["text"] == first["text"]
     assert second["validation"]["score"] == 1.0
     assert inner.call_count == 1
 
@@ -454,13 +359,6 @@ def test_evaluate_false_after_a_cached_evaluated_request_is_still_a_hit(client, 
     assert inner.call_count == 1
 
 
-def test_latency_includes_a_value_for_two_phase(client):
-    """Requirement: Endpoint de estimación (latency_ms total, también con fase previa)."""
-    provider = two_phase_provider(llm_result("REQ"))
-    app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
-    assert post(client, preprocessing="two_phase").json()["latency_ms"] >= 0
-
-
 # --- Service level (callers without HTTP) ---
 
 
@@ -471,12 +369,14 @@ def test_latency_includes_a_value_for_two_phase(client):
         (GenerationOptions(num_examples=4), "num_examples"),
         (GenerationOptions(thinking_budget=10), "thinking_budget"),
         (GenerationOptions(model=""), "model"),
+        (GenerationOptions(prompt_version="v9"), "prompt_version"),
+        (GenerationOptions(prompt_version="../v1"), "prompt_version"),
     ],
 )
 def test_service_rejects_invalid_options_before_any_llm_call(fake_provider, options, field):
     """Requirement: Parámetros de generación (validación antes de cualquier llamada al LLM)."""
     with pytest.raises(InvalidOptionError) as exc_info:
-        EstimationService(fake_provider).estimate("T", options)
+        EstimationService(fake_provider).estimate(make_input(), options)
     assert exc_info.value.field == field
     assert fake_provider.call_count == 0
 
@@ -489,25 +389,30 @@ def test_service_turns_a_resolver_error_into_an_invalid_model_option(fake_provid
 
     service = EstimationService(fake_provider, resolve_model=resolve)
     with pytest.raises(InvalidOptionError) as exc_info:
-        service.estimate("T", GenerationOptions(model="x"))
+        service.estimate(make_input(), GenerationOptions(model="x"))
     assert (exc_info.value.field, exc_info.value.message) == ("model", "model 'x' is unusable")
     assert fake_provider.call_count == 0
 
 
-# --- Requirement: SSE y Streamlit no exponen los parámetros ---
+def test_service_sends_system_and_a_single_user_message(fake_provider):
+    """Requirement: Endpoint de estimación / Scenario: Mensajes separados (servicio)."""
+    request = make_input(output_format="phases_table")
+    result = EstimationService(fake_provider).estimate(request, GenerationOptions("v2"))
+    system, user = render_estimation_prompt(request, "v2")
+    assert fake_provider.calls == [(system, [{"role": "user", "content": user}])]
+    assert result.prompt_version == "v2"
+    assert result.validation is not None
 
 
-def test_sse_endpoint_ignores_generation_parameters_and_uses_the_defaults(client, provider):
-    """Requirement: Parámetros de generación (el endpoint SSE usa los valores por defecto)."""
-    body = {
-        "messages": [{"role": "user", "content": T}],
-        "max_tokens": 5,
-        "model": "claude-haiku-4-5",
-        "num_examples": 0,
-        "preprocessing": "two_phase",
-    }
-    response = client.post(STREAM, json=body)
-    assert response.status_code == 200
-    assert provider.call_count == 1
-    assert provider.options == [None]
-    assert provider.calls[0][0] == llm_service._system_prompt()
+def test_service_logs_the_requested_event_without_content(fake_provider):
+    """Requirement: Observabilidad (estimation_requested con los campos nuevos, sin contenido)."""
+    with capture_logs() as logs:
+        EstimationService(fake_provider).estimate(make_input(), GenerationOptions("v2"))
+    event = next(e for e in logs if e["event"] == "estimation_requested")
+    assert event["prompt_version"] == "v2"
+    assert event["output_format"] == "line_items"
+    assert event["detail_level"] == "medium"
+    assert event["project_type"] == "web_saas"
+    assert event["num_examples"] == 3
+    assert "description" not in event
+    assert "transcription_chars" not in event
