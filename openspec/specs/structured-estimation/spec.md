@@ -4,7 +4,7 @@
 Obtener del LLM la estimación como un objeto Pydantic validado (`EstimationResult`), calcular en el código los costes y totales, filtrar las estimaciones fuera de alcance y renderizar el Markdown de cada formato de forma determinista, con las etiquetas en el idioma de la descripción.
 ## Requirements
 ### Requirement: Schema de la estimación estructurada
-El sistema SHALL definir en `app/estimation/schema.py` el modelo Pydantic `EstimationResult`, que es lo único que rellena el LLM, con los campos en este orden: `language` (`"es" | "en"`, idioma de los campos de texto libre), `title` (1–120 caracteres), `summary` (1–600), `confidence_pct` (0–100, confianza global), `technologies` (0–15 textos de 1 a 60 caracteres, por defecto `[]`; ver el requisito "Tecnologías mencionadas por el cliente"), `rows` (0–60 filas con `task` de 1–200 caracteres, `phase` de la lista canónica `discovery | setup | development | qa | deployment`, `rate_profile` `"dev" | "design"` y `hours` de 1 a 2000), `phases` (0–5 elementos con `phase`, `confidence_pct` de 0 a 100 y `assumptions`, de 0 a 3 textos), `team` (0–8 miembros con `role`, `count` de 1 a 20 y `part_time`), `duration_weeks` (`{min_weeks, max_weeks}` de 1 a 104, con `min_weeks ≤ max_weeks`, o `null`), `assumptions_and_risks` (0–8 textos) y `narrative` (0–6 párrafos). El schema MUST NOT contener importes, tarifas ni totales. El módulo MUST NOT importar Instructor, LiteLLM ni `app.services`.
+El sistema SHALL definir en `app/estimation/schema.py` el modelo Pydantic `EstimationResult`, que es lo único que rellena el LLM, con los campos en este orden: `language` (`"es" | "en"`, idioma de los campos de texto libre), `title` (1–120 caracteres), `summary` (1–600), `confidence_pct` (0–100, confianza global), `explicit_constraints` (0–8 textos de 1 a 200 caracteres, por defecto `[]`; ver el requisito "Restricciones explícitas y opciones descartadas"), `rejected_options` (0–10 textos de 1 a 60 caracteres, por defecto `[]`; ver el mismo requisito), `technologies` (0–15 textos de 1 a 60 caracteres, por defecto `[]`; ver el requisito "Tecnologías mencionadas por el cliente"), `rows` (0–60 filas con `task` de 1–200 caracteres, `phase` de la lista canónica `discovery | setup | development | qa | deployment`, `rate_profile` `"dev" | "design"` y `hours` de 1 a 2000), `phases` (0–5 elementos con `phase`, `confidence_pct` de 0 a 100 y `assumptions`, de 0 a 3 textos), `team` (0–8 miembros con `role`, `count` de 1 a 20 y `part_time`), `duration_weeks` (`{min_weeks, max_weeks}` de 1 a 104, con `min_weeks ≤ max_weeks`, o `null`), `assumptions_and_risks` (0–8 textos) y `narrative` (0–6 párrafos). El schema MUST NOT contener importes, tarifas ni totales. El módulo MUST NOT importar Instructor, LiteLLM ni `app.services`.
 
 Las horas y las confianzas MUST normalizarse sin reintento al múltiplo de 5 más cercano (mínimo 5 horas), se recortan los espacios y se quitan los textos vacíos de las listas; la normalización MUST ser idempotente. Una validación fallida de rangos, longitudes o valores admitidos MUST provocar un reintento de la llamada estructurada. Además, MUST validarse con reintento: `phases` sin fases repetidas y con el mismo conjunto de fases que `rows`; y, si `confidence_pct ≥ 30`, `rows`, `team` y `assumptions_and_risks` no vacíos y `duration_weeks` no nulo. `response_model_for(output_format, detail_level)` SHALL devolver una subclase con el mismo nombre y el mismo JSON Schema que exige además, en alcance, de 1 a 6 párrafos de `narrative` con `output_format = narrative` y de 1 a 3 supuestos por fase con `detail_level = detailed`.
 
@@ -34,7 +34,7 @@ Las horas y las confianzas MUST normalizarse sin reintento al múltiplo de 5 má
 
 #### Scenario: Posición de las tecnologías
 - **WHEN** se inspeccionan las propiedades de `EstimationResult.model_json_schema()`
-- **THEN** `technologies` va justo después de `confidence_pct` y antes de `rows`, y no está entre los campos obligatorios
+- **THEN** el orden es `confidence_pct`, `explicit_constraints`, `rejected_options`, `technologies`, `rows`, y ninguno de los tres campos de lista nuevos o de tecnologías está entre los obligatorios
 
 ### Requirement: Cálculo de costes y totales en el código
 `compute_estimate(result, language)` en `app/estimation/compute.py` SHALL ser una función pura que devuelve un `ComputedEstimate` con: `language`, `title`, `summary`, `confidence_pct`, `out_of_scope`, `rows` con `rate_eur_per_hour` y `cost_eur = horas × tarifa del perfil` (`RATES_EUR_PER_HOUR`: 62,50 EUR/h `dev` y 50 EUR/h `design`), `phases` agregadas en el orden canónico (solo las que tienen filas) con horas, coste, confianza y supuestos, `team`, `duration_weeks`, `assumptions_and_risks`, `narrative`, `total_hours` (suma de las filas) y `total_cost_eur` (suma de los costes, redondeada a 2 decimales). El LLM MUST NOT aportar ningún importe ni total.
@@ -105,4 +105,29 @@ Si `confidence_pct` es menor que 30, `compute_estimate` SHALL marcar `out_of_sco
 - **GIVEN** un resultado con `technologies = ["TECNOLOGIA-MARCADOR"]`
 - **WHEN** se renderiza en cada formato
 - **THEN** el texto no contiene `TECNOLOGIA-MARCADOR`
+
+### Requirement: Restricciones explícitas y opciones descartadas
+`EstimationResult.explicit_constraints` SHALL recoger las restricciones vinculantes que el cliente ha declarado explícitamente en cualquier turno o adjunto y que siguen vigentes (presupuesto fijo, plazo, normativa, NDA, plataforma o alojamiento impuestos, límites de equipo), incluidas las de `project_metadata`, una frase breve por restricción, en el idioma del cliente y conservando cifras y fechas, sin supuestos propios del modelo. `EstimationResult.rejected_options` SHALL recoger las tecnologías, proveedores o plataformas que el cliente ha descartado explícitamente, escritas igual que en `technologies` o `mentioned_technologies`. Las descripciones de los dos campos MUST decirlo. Un normalizador previo a la validación MUST, para cada campo, sin reintento y de forma idempotente: recortar los espacios, quitar los textos vacíos y los que superan su longitud máxima (200 caracteres en `explicit_constraints`, 60 en `rejected_options`), quitar los duplicados por `casefold` conservando la primera grafía y quedarse con los primeros 8 (`explicit_constraints`) o 10 (`rejected_options`); el normalizador de `technologies` MUST ser la misma función con otros parámetros. `ComputedEstimate` MUST incluir los dos campos copiados tal cual, también fuera de alcance. `render_markdown` MUST NOT mostrarlos: el texto de los tres formatos y su evaluación no cambian. `POST /api/v1/estimate` MUST devolverlos en `result` sin más cambios en su contrato.
+
+#### Scenario: Normalización de restricciones
+- **WHEN** se valida un resultado con `explicit_constraints = [" NDA firmado ", "", "nda firmado", <texto de 201 caracteres>, "Presupuesto máximo de 40 000 €"]`
+- **THEN** queda `["NDA firmado", "Presupuesto máximo de 40 000 €"]` sin error de validación ni reintento
+
+#### Scenario: Tope de descartes por turno
+- **WHEN** se valida un resultado con 12 opciones descartadas distintas
+- **THEN** quedan las 10 primeras
+
+#### Scenario: Sin los campos
+- **WHEN** se valida un resultado sin `explicit_constraints` ni `rejected_options`
+- **THEN** la validación pasa con las dos listas vacías
+
+#### Scenario: Fuera de alcance conserva los campos
+- **GIVEN** un resultado con `confidence_pct = 10`, `explicit_constraints = ["NDA firmado"]` y `rejected_options = ["Firebase"]`
+- **WHEN** se calcula la estimación
+- **THEN** `out_of_scope = true` y los dos campos se conservan
+
+#### Scenario: Sin render en el Markdown
+- **GIVEN** un resultado con `explicit_constraints = ["RESTRICCION-MARCADOR"]` y `rejected_options = ["DESCARTE-MARCADOR"]`
+- **WHEN** se renderiza en cada formato
+- **THEN** el texto no contiene ninguno de los dos marcadores
 

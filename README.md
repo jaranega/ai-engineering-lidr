@@ -10,6 +10,7 @@ Proyecto del programa **AI-Engineering 2026/10 (LIDR)**. Servicio que recibe la 
 | S03 | Interfaz conversacional con Streamlit (chat multi-turno, streaming y panel de contexto CAG) | `session-03` |
 | S04 | Del chat a la interfaz de producto: formulario tipado y prompts Jinja2 versionados | `session-04` |
 | S05 | Puesta al día con el directo de S04 (salida estructurada y guardrails) y memoria conversacional con adjuntos | `session-05` |
+| S05 directo | Memoria con anclas y resumen acumulativo, y tier de audiencia dinámico (puesta al día antes de S06) | `session-06` |
 
 ## Arquitectura
 
@@ -175,6 +176,9 @@ cp .env.example .env
 | `LLM_RETRIES` | No | `2` | Reintentos por modelo antes de pasar al respaldo |
 | `STRUCTURED_MAX_RETRIES` | No | `2` | Reintentos (0–5) cuando el objeto del LLM no valida; cada uno es una llamada más |
 | `MAX_CONVERSATION_TURNS` | No | `6` | Turnos (pares `user` + `assistant`) de la ventana del historial de cada sesión |
+| `MAX_ANCHORED_TURNS` | No | `3` | Turnos ancla (0–10) que se conservan literales al salir de la ventana; 0 desactiva las anclas |
+| `ANCHOR_DETECTION_MODE` | No | `heuristic` | Detector de anclas: `heuristic` (patrones ES/EN, sin LLM) o `llm` (el heurístico decide los positivos y un clasificador LLM revisa los negativos) |
+| `COMPRESSION_MODEL` | No | vacío (= primario con fallback) | Modelo del resumen acumulativo y del clasificador de anclas; si se fija y no se puede usar, la API no arranca |
 | `MAX_SESSIONS` | No | `1000` | Sesiones en memoria; al llenarse se desaloja la usada hace más tiempo |
 | `MAX_ATTACHMENTS` | No | `5` | Adjuntos por turno |
 | `MAX_ATTACHMENT_BYTES` | No | `10485760` | Tamaño máximo de cada adjunto (10 MiB) |
@@ -231,7 +235,8 @@ Desde S05 la interfaz es **conversacional**:
 - Al cargar la página crea una sesión (`POST /api/v1/sessions`) y la vuelve a crear si la API se reinició (404).
 - Cada turno muestra lo que se envió (transcripción y nombres de los adjuntos) y la estimación, con métricas y validación plegadas.
 - El formulario tiene la transcripción (hasta 20 000 caracteres), el tipo, el nivel y el formato, y un selector múltiple de ficheros PDF y Word (hasta 5, de 10 MiB cada uno).
-- La barra lateral muestra el estado de la API, el panel **Memoria del proyecto** (el `project_metadata`: nombre, equipo asumido, tecnologías y alcance acordado) y el botón **Nueva conversación**.
+- La barra lateral muestra el estado de la API, el panel **Memoria del proyecto** (el `project_metadata`: nombre, equipo asumido, tecnologías, alcance acordado, restricciones y opciones descartadas; el número de anclas, si hay resumen y la audiencia del último turno con la regla que la decidió) y el botón **Nueva conversación**.
+- En **Opciones avanzadas**, la versión del prompt (`v5` por defecto, o `v4`) y la **Audiencia** ("Automático" por defecto, o Dirección, Gestión, Técnica y Sin adaptar; solo con `v5`). Las métricas de cada turno incluyen `Audiencia: …`.
 - Los errores se muestran en español según el motivo (guardrails, adjuntos, sesión ocupada o perdida), sin repetir el texto ni los nombres de fichero.
 
 ![Conversación de 3 turnos con el panel Memoria del proyecto](docs/s05-conversacion.png)
@@ -275,8 +280,8 @@ curl -s "http://localhost:8000/api/v1/sessions/$SID" | jq   # turnos y project_m
 | Endpoint | Qué hace |
 |---|---|
 | `POST /api/v1/sessions` | Crea una sesión vacía y devuelve `{"session_id"}` (UUID v4), 201 |
-| `GET /api/v1/sessions/{id}` | `turn_count`, `history_turns`, `max_turns` y `project_metadata` |
-| `POST /api/v1/sessions/{id}/estimate` | `multipart/form-data` con `transcript` (1–20 000 caracteres), `project_type`, `detail_level`, `output_format` y `attachments` opcionales. Devuelve el contrato de `/api/v1/estimate` más `session_id`, `turn` y `project_metadata` |
+| `GET /api/v1/sessions/{id}` | `turn_count`, `history_turns`, `max_turns`, `project_metadata`, `anchors_count`, `summary_chars`, `last_tier` y `last_tier_rule` |
+| `POST /api/v1/sessions/{id}/estimate` | `multipart/form-data` con `transcript` (1–20 000 caracteres), `project_type`, `detail_level`, `output_format`, `tier` opcional y `attachments` opcionales; `?prompt_version=v5` (por defecto) o `v4`. Devuelve el contrato de `/api/v1/estimate` más `session_id`, `turn`, `project_metadata`, `tier` y `tier_rule` |
 
 **Historial y memoria.** Son dos cosas separadas:
 
@@ -294,6 +299,30 @@ curl -s "http://localhost:8000/api/v1/sessions/$SID" | jq   # turnos y project_m
 - prepara el *chunking* de RAG del módulo 3.
 
 El coste es no entender imágenes ni PDF escaneados (sin OCR). El tipo se decide por *magic bytes* y la extensión tiene que coincidir. Límites: 5 ficheros, 10 MiB por fichero y 60 000 caracteres de texto por turno. Una inyección en un adjunto bloquea (400); los datos personales (email, teléfono, IBAN) se **enmascaran** (`[EMAIL]`, `[PHONE]`, `[IBAN]`) en lugar de bloquear, porque los documentos reales suelen llevar contactos.
+
+**Memoria con anclas y resumen (directo de S05).** Lo que sale de la ventana ya no se pierde:
+
+- Cuando un turno sale de la ventana, un **detector de anclas** mira el mensaje del cliente. Si contiene un compromiso duradero (NDA, contrato firmado, alcance cerrado, presupuesto cerrado, normativa como RGPD o HIPAA, fecha innegociable o un acuerdo explícito), el turno se conserva **literal** como ancla. Por defecto el detector usa patrones en español e inglés sin LLM; cada regla exige el término y un calificador, para tener pocos falsos positivos.
+- Hay como máximo `MAX_ANCHORED_TURNS` anclas (3); si llega otra, la más antigua pasa al resumen.
+- Los turnos que no son ancla se integran en un **resumen acumulativo** único por sesión, con una llamada barata al LLM en el idioma de la sesión. Solo resume los mensajes del cliente (las estimaciones antiguas quedarían obsoletas) y reescribe el resumen entero en cada pasada.
+- Si el resumen falla, el turno responde igual (la compresión nunca hace fallar un turno): se conserva el resumen anterior y los turnos pendientes se reintentan en el siguiente turno, con un tope igual a la ventana.
+- El LLM recibe: system (con `<project_metadata>`, `<conversation_summary>` y `<audience>`) → anclas → ventana → turno nuevo. El número de mensajes es `2 × (anclas + turnos en la ventana) + 1`.
+- El `project_metadata` añade `explicit_constraints` (restricciones del cliente) y `rejected_options` (lo que ha descartado). Ambos se acumulan, y una tecnología descartada sale de `mentioned_technologies` (política de olvido). Las restricciones mantienen un NDA aunque su turno salga de la ventana.
+
+![Conversación de 5 turnos con anclas, resumen y audiencia](docs/s05-live-memoria.png)
+
+*Conversación de 5 turnos con gpt-4o-mini y una ventana de 2 turnos (`MAX_CONVERSATION_TURNS=2`). El turno 2 declara un NDA y un presupuesto cerrado: desde ahí la audiencia es Dirección (`nda_detected`) y, al salir de la ventana, queda anclado. Los turnos 1 y 3 se integran en el resumen (308 caracteres). El panel muestra las restricciones y Firebase descartado.*
+
+**Tier de audiencia dinámico.** Cada turno se adapta al interlocutor: `executive`, `pm`, `developer` o `default`. Lo decide una cadena de reglas puras, sin LLM, y gana la primera que se cumple:
+
+1. `explicit`: el campo `tier` del turno;
+2. `nda_detected` → `executive` (en la transcripción o en `explicit_constraints`);
+3. `regulatory_context` → `executive`;
+4. `technical_audience` → `developer` (2 o más términos técnicos distintos);
+5. `small_team` → `pm` (equipo de 2 personas o menos);
+6. `default`.
+
+El prompt `v5` incluye un bloque `<audience>` que cambia el **contenido** (el criterio de las filas, qué riesgos van primero y el foco del resumen), no el schema. La respuesta devuelve `tier` y `tier_rule`. Con `v4` el tier es siempre `default`/`prompt_version`, y un `tier` explícito con `v4` da 422. `/api/v1/estimate` no usa tier.
 
 **Volatilidad.** Las sesiones viven en un diccionario del proceso (`MAX_SESSIONS`, 1000, con desalojo LRU): se pierden al reiniciar la API y no se comparten entre workers. Es suficiente para esta fase y simplifica el ejercicio; la persistencia queda para más adelante. No hay autenticación: quien conoce un `session_id` puede usar la sesión.
 
@@ -490,6 +519,21 @@ Los tests de `tests/prompts/` comprueban los templates sin llamar al modelo (los
 Los tests no usan API keys reales ni hacen llamadas de red: el proveedor se sustituye por un doble mediante `dependency_overrides` en la API, y en la app Streamlit, que se ejecuta sin navegador con `streamlit.testing.v1.AppTest`, con `httpx.Client` sustituido por un transporte simulado. El proveedor LiteLLM se prueba con un doble del Router y con tests de contrato sobre un `Router` real con `mock_response`; Redis se sustituye por `fakeredis`. Un fixture bloquea cualquier conexión de red y los tests no leen el `.env` local. La CI (`.github/workflows/ci.yml`) ejecuta en cada push y PR: `uv sync --locked`, ruff (lint y formato), pytest y `openspec validate --all --strict`, y en paralelo un job `docker` con `docker build` y `docker compose config`.
 
 ## Desviaciones respecto al enunciado
+
+### S05 directo (memoria con anclas y tier dinámico; puesta al día en `session-06`)
+
+- **Patrones en español además de en inglés**, tanto en las anclas como en el tier, y más estrictos que los del directo (término más calificador).
+- **Resumen en el idioma de la sesión** (el directo resume siempre en inglés), y **solo de los mensajes del cliente** (el directo pasa también las respuestas del asistente).
+- **Resumen en el system** (`<conversation_summary>`), no como mensaje `user` sintético, para no romper la alternancia de mensajes.
+- **Backlog**: si el resumen falla, los turnos se reintentan en el siguiente (el directo los pierde).
+- **Tope de anclas** con degradación al resumen (el directo nunca las desaloja).
+- **Modo LLM del detector**: el heurístico decide los positivos y el LLM solo revisa los negativos (en el directo el LLM decide siempre).
+- **El tier lee también `explicit_constraints`**, para que no cambie cuando el turno del NDA sale de la ventana. `small_team` sustituye a `low_budget_pm`, porque la regla mira el equipo y no el presupuesto.
+- **`explicit_constraints` y `rejected_options`** en el metadata, que el directo no implementa pero sí describe el material de la sesión.
+- **Prompt `v5`** nuevo (v3 y v4 no se editan y quedan fijados con tests dorados).
+- Fuera de alcance: Actor-Critic-Boss y evals con *golden dataset*.
+
+Detalle: [`openspec/changes/archive/2026-11-17-s05-add-memory-compression-and-dynamic-tier`](openspec/changes/archive/2026-11-17-s05-add-memory-compression-and-dynamic-tier/).
 
 ### S05 (memoria conversacional y adjuntos)
 

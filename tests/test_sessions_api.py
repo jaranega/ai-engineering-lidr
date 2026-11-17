@@ -46,7 +46,9 @@ def _http() -> httpx.AsyncClient:
 def _setup(provider: FakeProvider, **settings_kwargs) -> SessionStore:
     settings = make_settings(**settings_kwargs)
     store = SessionStore(
-        max_sessions=settings.max_sessions, max_turns=settings.max_conversation_turns
+        max_sessions=settings.max_sessions,
+        max_turns=settings.max_conversation_turns,
+        max_anchors=settings.max_anchored_turns,
     )
     install_overrides(settings, provider, FakeModerator(result=False), store)
     return store
@@ -92,6 +94,8 @@ async def test_two_chained_turns_update_the_project_metadata():
         "assumed_team_size": 3,
         "mentioned_technologies": ["Twilio"],
         "agreed_scope": "Internal web platform with an agenda and reminders.",
+        "explicit_constraints": [],
+        "rejected_options": [],
     }
     assert two["project_metadata"]["assumed_team_size"] == 4
     assert two["project_metadata"]["mentioned_technologies"] == ["Twilio", "Stripe"]
@@ -161,7 +165,7 @@ async def test_a_pdf_attachment_changes_the_estimate_and_is_replaced_in_the_hist
 @pytest.mark.anyio
 async def test_eight_turns_never_send_more_than_the_window_plus_the_new_message():
     """Requirement: Tests de integración (test 3), Mensajes enviados al LLM /
-    Scenario: Ventana respetada.
+    Scenario: Ventana respetada sin anclas (fórmula 2 x (anclas + min(k - 1, N)) + 1).
     """
     provider = FakeProvider()
     _setup(provider, max_conversation_turns=6)
@@ -175,6 +179,8 @@ async def test_eight_turns_never_send_more_than_the_window_plus_the_new_message(
             assert response.status_code == 200, response.text
         info = await http.get(f"{BASE}/{session_id}")
 
+    # The fake compressor never calls the LLM: the provider only saw the 8 estimations.
+    assert provider.call_count == 8
     sizes = [len(messages) for _, messages in provider.calls]
     assert sizes == [2 * min(k - 1, 6) + 1 for k in range(1, 9)]
     assert max(sizes) == 13
@@ -183,5 +189,52 @@ async def test_eight_turns_never_send_more_than_the_window_plus_the_new_message(
     first_marker = "MARCADOR-TURNO-1:"
     assert any(first_marker in m["content"] for m in provider.calls[6][1])  # still in the window
     assert all(first_marker not in m["content"] for m in provider.calls[7][1])  # dropped
-    assert info.json()["turn_count"] == 8
-    assert info.json()["history_turns"] == 6
+    assert "</conversation_summary>" not in provider.calls[6][0]  # nothing summarized yet
+    assert "</conversation_summary>" in provider.calls[7][0]
+    state = info.json()
+    assert state["turn_count"] == 8 and state["history_turns"] == 6
+    assert state["anchors_count"] == 0 and state["summary_chars"] > 0
+
+
+@pytest.mark.anyio
+async def test_nine_turns_keep_the_anchor_outside_the_window_and_the_tier_executive():
+    """Requirement: Tests de integración (test 4), Mensajes enviados al LLM /
+    Scenario: Ancla fuera de la ventana, Tier del turno en la sesión /
+    Scenario: Tier persistente por el metadata.
+    """
+    nda = "Hemos firmado un NDA y el presupuesto está cerrado en 40 000 €"
+    calls = {"n": 0}
+
+    def reply(system: str, messages: list[dict]) -> dict:
+        calls["n"] += 1
+        payload = valid_payload()
+        if calls["n"] >= 2:  # the estimate of turn 2 onwards remembers the NDA
+            payload["explicit_constraints"] = ["NDA firmado"]
+        return payload
+
+    provider = FakeProvider(structured=reply)
+    _setup(provider, max_conversation_turns=6)
+    responses = []
+    async with _http() as http:
+        session_id = await _new_session(http)
+        for k in range(1, 10):
+            transcript = nda if k == 2 else f"MARCADOR-TURNO-{k}: keep the same project."
+            response = await http.post(
+                f"{BASE}/{session_id}/estimate", data=turn_data(transcript=transcript)
+            )
+            assert response.status_code == 200, response.text
+            responses.append(response.json())
+        info = await http.get(f"{BASE}/{session_id}")
+
+    assert provider.call_count == 9
+    system, messages = provider.calls[8]
+    assert len(messages) == 2 * (1 + 6) + 1 == 15
+    assert nda in messages[0]["content"]  # the first pair is the literal turn 2
+    assert "MARCADOR-TURNO-1:" not in messages[0]["content"]
+    assert "<conversation_summary>\nS:1\n</conversation_summary>" in system
+    assert "<audience>" in system
+    assert info.json()["anchors_count"] == 1
+    assert [(r["tier"], r["tier_rule"]) for r in responses[1:]] == [
+        ("executive", "nda_detected")
+    ] * 8
+    assert responses[0]["tier_rule"] == "default"

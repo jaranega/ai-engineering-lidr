@@ -70,6 +70,9 @@ def test_completed_turn_is_logged_with_counts_and_the_session_on_llm_events(real
     assert done["language"] == "en" and done["metadata_updated"] is True
     assert done["metadata_fields"] == ["project_name", "assumed_team_size", "agreed_scope"]
     assert done["technologies"] == 0
+    assert (done["anchors"], done["summary_chars"]) == (0, 0)
+    assert (done["tier"], done["tier_rule"]) == ("default", "default")
+    assert (done["constraints"], done["rejected"]) == (0, 0)
     (requested,) = events(logs, "estimation_requested")
     assert (requested["mode"], requested["attachments"], requested["history_messages"]) == (
         "session",

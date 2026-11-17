@@ -25,6 +25,7 @@ from app.schemas import (
     SessionEstimateResponse,
     SessionGuardrailErrorResponse,
     SessionInfo,
+    Tier,
 )
 from app.services.llm_service import (
     DEFAULT_SESSION_PROMPT_VERSION,
@@ -123,6 +124,10 @@ def get_session(
         history_turns=snapshot.history_turns,
         max_turns=snapshot.max_turns,
         project_metadata=snapshot.project_metadata,
+        anchors_count=snapshot.anchors_count,
+        summary_chars=snapshot.summary_chars,
+        last_tier=snapshot.last_tier,
+        last_tier_rule=snapshot.last_tier_rule,
     )
 
 
@@ -157,6 +162,13 @@ def estimate_turn(
     project_type: Annotated[ProjectType, Form()],
     detail_level: Annotated[DetailLevel, Form()],
     output_format: Annotated[OutputFormat, Form()],
+    tier: Annotated[
+        Tier | None,
+        Form(
+            description="Audience of the estimate; omit for automatic resolution. "
+            "Only with prompt_version v5 (422 with v4)."
+        ),
+    ] = None,
     attachments: Annotated[
         list[UploadFile] | None,
         BeforeValidator(_drop_blank_parts),
@@ -187,7 +199,11 @@ def estimate_turn(
         raise _attachment_http_error(exc) from exc
     try:
         outcome = service.estimate(
-            str(session_id), turn, uploads, GenerationOptions(prompt_version=prompt_version)
+            str(session_id),
+            turn,
+            uploads,
+            GenerationOptions(prompt_version=prompt_version),
+            tier=tier,
         )
     except AttachmentError as exc:
         # The service already logs `attachment_rejected`.
@@ -218,4 +234,6 @@ def estimate_turn(
         session_id=outcome.session_id,
         turn=outcome.turn,
         project_metadata=outcome.project_metadata,
+        tier=outcome.tier,
+        tier_rule=outcome.tier_rule,
     )

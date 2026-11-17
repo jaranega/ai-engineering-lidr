@@ -32,10 +32,18 @@ from app.guardrails.input import GuardrailReason
 from app.main import app
 from app.prompts.loader import DEFAULT_SESSION_PROMPT_VERSION, SESSION_PROMPT_VERSIONS
 from app.services import llm_service
+from app.services import memory as memory_module
 from app.services import session_service as session_service_module
 from app.services.moderation import get_moderator
+from app.sessions.tier import Tier, TierRule
 from tests.attachments.factories import DOCX_MIME, PDF_MIME, make_pdf
-from tests.conftest import FakeModerator, FakeProvider, make_settings, out_of_scope_payload
+from tests.conftest import (
+    FakeModerator,
+    FakeProvider,
+    make_fake_compression,
+    make_settings,
+    out_of_scope_payload,
+)
 
 APP_PATH = Path(__file__).resolve().parent.parent / "streamlit_app.py"
 BASE_URL = "http://api.test"
@@ -81,7 +89,9 @@ METADATA = {
 RESPONSE = {
     "text": "## Estimación: Gimnasio\n\nTEXTO-DE-LA-ESTIMACION",
     "result": {"out_of_scope": False, "total_hours": 120, "total_cost_eur": 7500.0},
-    "prompt_version": "v4",
+    "prompt_version": "v5",
+    "tier": "executive",
+    "tier_rule": "nda_detected",
     "model": "gpt-4o-mini",
     "provider": "openai",
     "input_tokens": 1200,
@@ -229,9 +239,15 @@ def submit(
     project_type: str | None = None,
     detail_level: str | None = None,
     output_format: str | None = None,
+    prompt_version: str | None = None,
+    audience: str | None = None,
 ) -> AppTest:
     """Fill the form and press "Enviar" in the same run (a run in between loses the text)."""
     at.text_area[0].set_value(transcript)
+    if prompt_version is not None:
+        at.selectbox[2].set_value(prompt_version)
+    if audience is not None:
+        at.selectbox[3].set_value(audience)
     if project_type is not None:
         at.selectbox[0].set_value(project_type)
     if detail_level is not None:
@@ -319,7 +335,18 @@ def test_app_starts_with_the_form_defaults_and_the_attachment_selector(api):
     assert uploader.label == "Adjuntos" and uploader.accept_multiple_files
     assert [t.lstrip(".") for t in uploader.allowed_type] == ["pdf", "docx"]
     assert at.expander[0].label == "Opciones avanzadas"
-    assert at.selectbox[2].value == "v4" and list(at.selectbox[2].options) == ["v4"]
+    assert at.selectbox[2].label == "Versión del prompt"
+    assert at.selectbox[2].value == "v5" and list(at.selectbox[2].options) == ["v5", "v4"]
+    assert at.selectbox[3].label == "Audiencia"
+    assert at.selectbox[3].value is None  # "Automático" (no tier is sent)
+    assert list(at.selectbox[3].options) == [
+        "Automático",
+        "Dirección (ejecutivo)",
+        "Gestión (PM)",
+        "Técnica (desarrollo)",
+        "Sin adaptar",
+    ]
+    assert not at.selectbox[3].disabled
     assert submit_button(at).label == "Enviar"
     assert api.estimates == []
 
@@ -339,7 +366,7 @@ def test_the_selectors_offer_the_expected_labels(api):
 def test_the_form_exposes_only_the_agreed_widgets(api):
     """Requirement: sin `reference_projects` ni los demás parámetros de generación."""
     at = run_app()
-    assert len(at.text_area) == 1 and len(at.selectbox) == 3 and len(at.radio) == 1
+    assert len(at.text_area) == 1 and len(at.selectbox) == 4 and len(at.radio) == 1
     assert len(at.file_uploader) == 1
     for empty in (at.text_input, at.number_input, at.slider, at.checkbox, at.toggle):
         assert len(empty) == 0
@@ -360,7 +387,7 @@ def test_submit_posts_multipart_with_exact_enum_values_and_the_attachment(api):
     (request,) = api.estimates
     session_id = api.created[0]
     assert request.method == "POST"
-    assert str(request.url) == f"{BASE_URL}{SESSION_PATH}/{session_id}/estimate?prompt_version=v4"
+    assert str(request.url) == f"{BASE_URL}{SESSION_PATH}/{session_id}/estimate?prompt_version=v5"
     assert request.headers["content-type"].startswith("multipart/form-data")
     fields, files = parse_multipart(request)
     assert fields == {
@@ -370,6 +397,36 @@ def test_submit_posts_multipart_with_exact_enum_values_and_the_attachment(api):
         "output_format": "phases_table",
     }
     assert files == [{"name": "spec.pdf", "type": "application/pdf", "content": pdf}]
+
+
+def test_automatic_audience_sends_no_tier_and_explicit_audience_sends_it_with_v5(api):
+    """Scenarios: Envío tipado con adjuntos (sin tier), Audiencia explícita."""
+    at = submit(run_app())
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "tier" not in fields
+    submit(at, "Otro mensaje.", audience="developer")
+    fields, _ = parse_multipart(api.estimates[1])
+    assert fields["tier"] == "developer"
+    assert api.estimates[1].url.params["prompt_version"] == "v5"
+
+
+@pytest.mark.parametrize("audience", ["executive", "developer", "default"])
+def test_explicit_audience_with_v4_never_sends_tier(api, audience):
+    """Scenario: Audiencia con v4."""
+    at = submit(run_app(), prompt_version="v4", audience=audience)
+    assert not at.exception
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "tier" not in fields
+    assert api.estimates[0].url.params["prompt_version"] == "v4"
+
+
+def test_the_audience_selector_is_disabled_once_v4_is_selected(api):
+    """Scenario: Audiencia con v4 (selector deshabilitado con la indicación Solo con v5)."""
+    at = submit(run_app(), prompt_version="v4")
+    assert at.selectbox[3].disabled
+    assert at.selectbox[3].proto.help == "Solo con v5"
+    submit(at, "Siguiente.", prompt_version="v5")
+    assert not at.selectbox[3].disabled
 
 
 def test_docx_attachment_goes_with_the_word_mime_type(api):
@@ -460,7 +517,10 @@ def test_ui_values_and_limits_match_the_api():
     assert list(ui["PROJECT_TYPE_LABELS"]) == [t.value for t in domain.ProjectType]
     assert list(ui["DETAIL_LEVEL_LABELS"]) == [t.value for t in domain.DetailLevel]
     assert list(ui["OUTPUT_FORMAT_LABELS"]) == [t.value for t in domain.OutputFormat]
-    assert tuple(ui["SESSION_PROMPT_VERSIONS"]) == tuple(SESSION_PROMPT_VERSIONS) == ("v4",)
+    assert tuple(ui["SESSION_PROMPT_VERSIONS"]) == ("v5", "v4")
+    assert set(ui["SESSION_PROMPT_VERSIONS"]) == set(SESSION_PROMPT_VERSIONS)
+    assert set(ui["TIERS"]) == {t.value for t in Tier}
+    assert set(ui["TIER_RULE_LABELS"]) == set(get_args(TierRule))
     assert ui["DEFAULT_PROMPT_VERSION"] == DEFAULT_SESSION_PROMPT_VERSION
     assert ui["MAX_TRANSCRIPT_CHARS"] == domain.MAX_TRANSCRIPT_CHARS == 20_000
     assert ui["MAX_ATTACHMENTS"] == defaults["max_attachments"] == 5
@@ -537,7 +597,8 @@ def test_full_result_shows_user_turn_text_version_metrics_and_validation(api):
     assert any("spec.pdf" in c.value for c in user.caption)
     assert any("TEXTO-DE-LA-ESTIMACION" in m.value for m in assistant.markdown)
     text = all_text(at)
-    assert "Versión del prompt: v4" in text
+    assert "Versión del prompt: v5" in text
+    assert "Audiencia: Dirección (NDA detectado)" in text
     assert "Modelo: `gpt-4o-mini`" in text and "Proveedor: `openai`" in text
     assert "Respaldo: no" in text and "Desde caché: no" in text
     assert "Tokens de entrada: 1200" in text and "Tokens de salida: 300" in text
@@ -927,7 +988,8 @@ def test_memory_panel_is_empty_without_turns(api):
     text = sidebar_text(run_app())
     assert "Memoria del proyecto" in text
     assert "Aún no hay datos del proyecto" in text
-    assert "Turnos: 0 · en la ventana: 0/6" in text
+    assert "Turnos: 0 · en la ventana: 0/6 · anclas: 0 · resumen: no" in text
+    assert "Audiencia del último turno" not in text
 
 
 def test_memory_panel_shows_the_metadata_and_the_counters(api):
@@ -939,9 +1001,32 @@ def test_memory_panel_shows_the_metadata_and_the_counters(api):
     assert "Clinic booking platform" in text
     assert "Twilio" in text and "Stripe" in text
     assert "Booking with reminders." in text and "3" in text
-    assert "Turnos: 2 · en la ventana: 2/6" in text
+    assert "Turnos: 2 · en la ventana: 2/6 · anclas: 0 · resumen: no" in text
     assert api.created[0][:8] in text and api.created[0] not in text
     assert "Aún no hay datos del proyecto" not in text
+
+
+def test_memory_panel_shows_constraints_rejections_anchors_summary_and_audience(api):
+    """Scenario: Panel con memoria y audiencia."""
+    api.project_metadata = {
+        **METADATA,
+        "explicit_constraints": ["NDA firmado"],
+        "rejected_options": ["Firebase"],
+    }
+    api.info = {
+        "turn_count": 8,
+        "history_turns": 6,
+        "max_turns": 6,
+        "anchors_count": 1,
+        "summary_chars": 340,
+        "last_tier": "executive",
+        "last_tier_rule": "nda_detected",
+    }
+    text = sidebar_text(run_app())
+    assert "Restricciones" in text and "NDA firmado" in text
+    assert "Descartado" in text and "Firebase" in text
+    assert "Turnos: 8 · en la ventana: 6/6 · anclas: 1 · resumen: sí (340 caracteres)" in text
+    assert "Audiencia del último turno: Dirección — regla: NDA detectado" in text
 
 
 def test_memory_panel_lists_only_the_fields_with_a_value(api):
@@ -1065,6 +1150,7 @@ def e2e(monkeypatch: pytest.MonkeyPatch, session_store):
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
     app.dependency_overrides[get_moderator] = lambda: moderator
     app.dependency_overrides[session_service_module.get_session_store] = lambda: session_store
+    app.dependency_overrides[memory_module.get_memory_compression] = make_fake_compression
 
     def factory(*args, **kwargs) -> TestClient:
         return TestClient(app, base_url=kwargs["base_url"])
@@ -1089,14 +1175,17 @@ def test_e2e_two_turns_with_a_pdf_reach_the_service_and_fill_the_memory_panel(e2
     assert f"<transcript>\n{TRANSCRIPT}\n</transcript>" in messages[0]["content"]
     assert "Lista los supuestos de cada fase" in system
     text = all_text(at)
-    assert "Versión del prompt: v4" in text and "Comprobaciones superadas: **8/8**" in text
+    assert "Versión del prompt: v5" in text and "Comprobaciones superadas: **8/8**" in text
     side = sidebar_text(at)
-    assert "Clinic booking platform" in side and "Turnos: 1 · en la ventana: 1/6" in side
+    assert "Clinic booking platform" in side
+    assert "Turnos: 1 · en la ventana: 1/6 · anclas: 0 · resumen: no" in side
+    assert "Audiencia del último turno: Sin adaptar — regla: sin señales" in side
+    assert "Audiencia: Sin adaptar (sin señales)" in text
     submit(at, "Añade pagos con Stripe.")
     _, second = e2e.calls[1]
     assert [m["role"] for m in second] == ["user", "assistant", "user"]
     assert "[…]" in second[0]["content"] and "jefe@cliente.es" not in second[0]["content"]
-    assert "Turnos: 2 · en la ventana: 2/6" in sidebar_text(at)
+    assert "Turnos: 2 · en la ventana: 2/6 · anclas: 0 · resumen: no" in sidebar_text(at)
 
 
 @pytest.mark.parametrize(

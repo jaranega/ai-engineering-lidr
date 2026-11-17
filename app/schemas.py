@@ -20,7 +20,7 @@ from app.services.llm_service import (
     ComputedEstimate,
     GuardrailReason,
 )
-from app.sessions import ProjectMetadata
+from app.sessions import ProjectMetadata, Tier, TierRule
 
 __all__ = [
     "DetailLevel",
@@ -45,6 +45,8 @@ __all__ = [
     "SessionGuardrailErrorResponse",
     "SessionInfo",
     "StructureCheckResponse",
+    "Tier",
+    "TierRule",
 ]
 
 
@@ -162,12 +164,22 @@ class SessionInfo(BaseModel):
     history_turns: int = Field(description="Turns currently in the window (<= max_turns).")
     max_turns: int
     project_metadata: ProjectMetadata
+    anchors_count: int = Field(description="Anchored turns kept verbatim outside the window.")
+    summary_chars: int = Field(description="Length of the cumulative summary; 0 if none.")
+    last_tier: Tier | None = Field(
+        description="Audience tier of the last successful turn; null if none."
+    )
+    last_tier_rule: TierRule | None = Field(
+        description="Rule that resolved the tier of the last successful turn; null if none."
+    )
 
 
 class SessionEstimateResponse(EstimationResponse):
     session_id: str
     turn: int = Field(description="Ordinal of this turn (== turn_count after it).")
     project_metadata: ProjectMetadata = Field(description="Project metadata after the update.")
+    tier: Tier = Field(description="Audience tier of this turn.")
+    tier_rule: TierRule = Field(description="Rule that resolved the tier of this turn.")
 
 
 class SessionError(BaseModel):

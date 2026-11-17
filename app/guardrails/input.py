@@ -121,7 +121,8 @@ INJECTION_RULES = _rules(
         "prompt_tag",
         r"<\s*/?\s*(project_description|project_type|reference_projects?|examples?"
         r"|example_output|example_request|client_request|system|assistant"
-        r"|transcript|attachments?|project_metadata)\s*>",
+        r"|transcript|attachments?|project_metadata|conversation_summary|audience"
+        r"|previous_summary|project_context|turns|client_message)\s*>",
     ),
 )
 

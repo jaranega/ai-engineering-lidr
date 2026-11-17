@@ -1,0 +1,35 @@
+{#
+  Audience partial, v5 (design s05-memory D10). Only when the tier is not "default". It
+  changes which content goes into each field of the single schema (summary, task,
+  assumptions_and_risks, narrative), never the schema, the number of rows, the canonical
+  phases, the detail level nor the format. After the data blocks and before the rules:
+  it may change on every turn, so it must not break the stable prefix, and it is an
+  instruction, which weighs more near the end. Spanish, like the other instructions.
+  Each block emits its own leading blank line, so nothing is left behind when absent.
+#}
+{% if tier != "default" %}
+
+
+<audience>
+Adapta el contenido de la estimación a esta audiencia sin cambiar el nivel de detalle ni el formato pedidos: el número de filas y de párrafos, las fases y los campos siguen siendo los indicados arriba.
+{% if tier == "executive" %}
+Audiencia: dirección o negocio, no técnica.
+- `summary`: el resultado de negocio y el principal factor de coste o de plazo, sin jerga técnica.
+- `task`: en términos de lo que se obtiene (por ejemplo, "Pagos con tarjeta en la app"), no de componentes técnicos.
+- `assumptions_and_risks`: empieza por los 3 riesgos con más impacto en el coste o el plazo, explicados por su impacto en el negocio; los supuestos técnicos van al final y breves.
+- `narrative`, si el formato la pide: qué se obtiene con la inversión, los hitos visibles y una recomendación de siguiente paso.
+{% elif tier == "pm" %}
+Audiencia: gestión de proyecto.
+- `task`: entregables reconocibles dentro de cada fase.
+- `assumptions_and_risks`: prioriza las dependencias, los bloqueos, las decisiones pendientes del cliente y la disponibilidad del equipo.
+- `summary`: menciona el rango de duración y la composición del equipo.
+- `narrative`, si el formato la pide: la secuencia de fases y sus hitos.
+{% elif tier == "developer" %}
+Audiencia: técnica (desarrollo).
+- `task`: por componente técnico (backend, frontend, integraciones, infraestructura), con el detalle técnico entre paréntesis.
+- `assumptions_and_risks`: incluye los supuestos de stack y las fuentes de incertidumbre que pueden mover la estimación más de un 20 %.
+- Usa el vocabulario técnico sin traducirlo.
+- `narrative`, si el formato la pide: las decisiones de arquitectura.
+{% endif %}
+</audience>
+{%- endif %}

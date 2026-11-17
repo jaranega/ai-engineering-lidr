@@ -45,6 +45,14 @@ class ComputedEstimate(BaseModel):
     title: str
     summary: str
     confidence_pct: int
+    explicit_constraints: list[str] = Field(
+        description="Binding constraints the client stated, as returned by the model; kept "
+        "also when out of scope. Not rendered in `text`.",
+    )
+    rejected_options: list[str] = Field(
+        description="Options the client discarded, as returned by the model; kept also "
+        "when out of scope. Not rendered in `text`.",
+    )
     technologies: list[str] = Field(
         description="Technologies named by the client, as returned by the model; kept "
         "also when out of scope (they are mentioned facts, not invented amounts)."
@@ -109,6 +117,8 @@ def compute_estimate(result: EstimationResult, language: Language) -> ComputedEs
         "title": result.title,
         "summary": result.summary,
         "confidence_pct": result.confidence_pct,
+        "explicit_constraints": list(result.explicit_constraints),
+        "rejected_options": list(result.rejected_options),
         "technologies": list(result.technologies),
         "assumptions_and_risks": list(result.assumptions_and_risks),
     }

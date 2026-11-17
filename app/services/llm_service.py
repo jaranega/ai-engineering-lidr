@@ -48,6 +48,7 @@ from app.prompts.language import detect_language
 from app.prompts.loader import (
     DEFAULT_PROMPT_VERSION,
     DEFAULT_SESSION_PROMPT_VERSION,
+    MEMORY_PROMPT_VERSIONS,
     NUM_EXAMPLES,
     PROMPT_VERSIONS,
     SESSION_PROMPT_VERSIONS,
@@ -62,6 +63,7 @@ from app.services.evaluation import StructureCheck, evaluate_estimation
 from app.services.moderation import Moderator, NullModerator, get_moderator
 from app.services.pricing import estimate_cost
 from app.sessions.models import ProjectMetadata
+from app.sessions.tier import Tier
 
 logger = structlog.get_logger(__name__)
 
@@ -71,6 +73,7 @@ __all__ = [
     "DEFAULT_PROMPT_VERSION",
     "DEFAULT_SESSION_PROMPT_VERSION",
     "MAX_MODEL_NAME_CHARS",
+    "MEMORY_PROMPT_VERSIONS",
     "MAX_OUTPUT_TOKENS",
     "MAX_TOKENS",
     "NUM_EXAMPLES",
@@ -1301,14 +1304,18 @@ class EstimationService:
         project_metadata: ProjectMetadata | None = None,
         session_language: Language | None = None,
         options: GenerationOptions | None = None,
+        tier: Tier = Tier.DEFAULT,
+        conversation_summary: str | None = None,
     ) -> TurnOutcome:
         """Estimate one turn of a session, without state (S05 design D6).
 
         Order: option checks (session prompt versions), PII masking of the attachments,
         regex of the transcript and of each attachment, one moderation call, response
         language (detected in the transcript, else the session's; never in the
-        attachments), v4 render with the project metadata, then the shared generation
-        step with `history` followed by the new `user` message. Raise
+        attachments), render with the project metadata and, with v5, the conversation
+        summary and the audience `tier` (both resolved by the caller and passed as data,
+        design s05-memory D9/D10; v4 ignores them), then the shared generation step with
+        `history` (anchors and window) followed by the new `user` message. Raise
         `InvalidOptionError`, `InputGuardrailViolation` (nothing sent to the moderation,
         the cache nor the LLM after a block) or `LLMProviderError`.
         """
@@ -1344,6 +1351,8 @@ class EstimationService:
                 project_metadata=project_metadata,
                 response_language=language,
                 num_examples=num_examples,
+                conversation_summary=conversation_summary,
+                tier=tier,
             )
         except UnknownPromptVersionError:
             # Unreachable after `_check_options`; never a 500 for a version.

@@ -33,12 +33,27 @@ REQUIRED_FILES = [
     "app/prompts/estimation/v4/user.j2",
     "app/prompts/estimation/v4/examples.j2",
     "app/prompts/estimation/v4/project_metadata.j2",
+    "app/prompts/estimation/v5/system.j2",
+    "app/prompts/estimation/v5/user.j2",
+    "app/prompts/estimation/v5/examples.j2",
+    "app/prompts/estimation/v5/project_metadata.j2",
+    "app/prompts/estimation/v5/conversation_summary.j2",
+    "app/prompts/estimation/v5/audience.j2",
+    "app/prompts/conversation_summary/v1/system.j2",
+    "app/prompts/conversation_summary/v1/user.j2",
+    "app/prompts/anchor_classifier/v1/system.j2",
+    "app/prompts/anchor_classifier/v1/user.j2",
     "app/routers/sessions.py",
     "app/services/session_service.py",
+    "app/services/memory.py",
     "app/sessions/__init__.py",
     "app/sessions/models.py",
     "app/sessions/store.py",
     "app/sessions/metadata.py",
+    "app/sessions/tier.py",
+    "app/sessions/compression/__init__.py",
+    "app/sessions/compression/anchors.py",
+    "app/sessions/compression/policy.py",
     "app/attachments/__init__.py",
     "app/attachments/extractor.py",
     "app/estimation/__init__.py",
@@ -200,11 +215,11 @@ def test_guardrails_input_imports_nothing_from_the_app():
     assert internal == set()
 
 
-def test_prompts_folder_has_v3_and_v4_with_their_templates():
-    """prompt-templates / Scenario: Estructura de las versiones (v3 y v4)."""
+def test_prompts_folder_has_v3_v4_and_v5_with_their_templates():
+    """prompt-templates / Scenario: Estructura de las versiones (v3, v4 y v5)."""
     base = REPO_ROOT / "app/prompts/estimation"
     folders = {p.name for p in base.iterdir() if p.is_dir() and p.name != "__pycache__"}
-    assert folders == {"v3", "v4"}
+    assert folders == {"v3", "v4", "v5"}
     assert {p.name for p in (base / "v3").iterdir()} == {"system.j2", "user.j2", "examples.j2"}
     assert {p.name for p in (base / "v4").iterdir()} == {
         "system.j2",
@@ -212,15 +227,40 @@ def test_prompts_folder_has_v3_and_v4_with_their_templates():
         "examples.j2",
         "project_metadata.j2",
     }
+    assert {p.name for p in (base / "v5").iterdir()} == {
+        "system.j2",
+        "user.j2",
+        "examples.j2",
+        "project_metadata.j2",
+        "conversation_summary.j2",
+        "audience.j2",
+    }
 
 
 @pytest.mark.parametrize("package", ["app/sessions", "app/attachments"])
 def test_sessions_and_attachments_do_not_import_services_llm_or_instructor(package):
     """ci-pipeline / Scenario: Capas sin dependencias del LLM."""
-    for path in (REPO_ROOT / package).glob("*.py"):
+    paths = list((REPO_ROOT / package).rglob("*.py"))  # includes sessions/compression
+    assert paths
+    for path in paths:
         modules = _imported_modules(path)
         assert not {m for m in modules if m.startswith(("app.services", "app.prompts"))}, path.name
         assert not _imported_roots(path) & {"litellm", "instructor", "fastapi"}, path.name
+
+
+def test_session_memory_modules_are_part_of_the_layer_check():
+    """ci-pipeline / Scenario: Capas sin dependencias del LLM (compression y tier)."""
+    names = {p.name for p in (REPO_ROOT / "app/sessions").rglob("*.py")}
+    assert {"tier.py", "anchors.py", "policy.py"} <= names
+
+
+def test_memory_prompt_folders_only_contain_v1_with_system_and_user():
+    """prompt-templates / Scenario: Carpetas de los prompts de memoria."""
+    for name in ("conversation_summary", "anchor_classifier"):
+        base = REPO_ROOT / "app/prompts" / name
+        dirs = {p.name for p in base.iterdir() if p.is_dir() and p.name != "__pycache__"}
+        assert dirs == {"v1"}
+        assert {p.name for p in (base / "v1").iterdir()} == {"system.j2", "user.j2"}
 
 
 def test_attachments_package_never_imports_fastapi_nor_services():

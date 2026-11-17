@@ -31,6 +31,7 @@ from app.main import app
 from app.prompts import loader as prompt_loader
 from app.services import cache as cache_module
 from app.services import llm_service
+from app.services import memory as memory_module
 from app.services import moderation as moderation_module
 from app.services import session_service as session_service_module
 from app.services.cache import ResponseCache
@@ -47,7 +48,10 @@ from app.services.llm_service import (
     build_override_router,
     build_router,
 )
+from app.services.memory import MemoryCompression
 from app.sessions import SessionStore
+from app.sessions.compression import detect_anchor
+from app.sessions.models import Turn
 
 
 def _clear_caches() -> None:
@@ -77,6 +81,9 @@ CONFIG_ENV_VARS = (
     "MAX_ATTACHMENTS",
     "MAX_ATTACHMENT_BYTES",
     "MAX_ATTACHMENT_CHARS",
+    "ANCHOR_DETECTION_MODE",
+    "COMPRESSION_MODEL",
+    "MAX_ANCHORED_TURNS",
 )
 
 
@@ -435,11 +442,41 @@ def moderator() -> FakeModerator:
     return FakeModerator(result=False)
 
 
+def fake_summarize(
+    previous: str | None,
+    turns: Sequence[Turn],
+    language: str | None = None,
+    project_metadata: object = None,
+) -> str:
+    """Deterministic summarizer: `"S:"` plus the numbers of the summarized turns, appended to
+    the previous summary (`"S:1,2"`, then `"S:1,2,3"`). Never calls an LLM.
+    """
+    numbers = ",".join(str(turn.number) for turn in turns)
+    return f"{previous},{numbers}" if previous else f"S:{numbers}"
+
+
+def make_fake_compression(max_anchors: int = 3) -> MemoryCompression:
+    """Deterministic `MemoryCompression`: the real heuristic detector (pure, no LLM), the
+    fake summarizer and `max_anchors`.
+    """
+    return MemoryCompression(
+        detect=detect_anchor, summarize=fake_summarize, max_anchors=max_anchors
+    )
+
+
+@pytest.fixture
+def memory_compression(settings: Settings) -> MemoryCompression:
+    """Fake compressor used by the `client` fixture (provider calls stay estimation-only)."""
+    return make_fake_compression(settings.max_anchored_turns)
+
+
 @pytest.fixture
 def session_store(settings: Settings) -> SessionStore:
     """Fresh in-memory session store (one per test) sized like the `settings` fixture."""
     return SessionStore(
-        max_sessions=settings.max_sessions, max_turns=settings.max_conversation_turns
+        max_sessions=settings.max_sessions,
+        max_turns=settings.max_conversation_turns,
+        max_anchors=settings.max_anchored_turns,
     )
 
 
@@ -450,6 +487,7 @@ def client(
     provider: FakeProvider,
     moderator: FakeModerator,
     session_store: SessionStore,
+    memory_compression: MemoryCompression,
 ) -> Iterator[TestClient]:
     """TestClient running the lifespan, with settings and LLM provider overridden.
 
@@ -461,6 +499,7 @@ def client(
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
     app.dependency_overrides[moderation_module.get_moderator] = lambda: moderator
     app.dependency_overrides[session_service_module.get_session_store] = lambda: session_store
+    app.dependency_overrides[memory_module.get_memory_compression] = lambda: memory_compression
     try:
         with TestClient(app) as test_client:
             yield test_client
@@ -479,6 +518,9 @@ def install_overrides(
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
     app.dependency_overrides[moderation_module.get_moderator] = lambda: moderator
     app.dependency_overrides[session_service_module.get_session_store] = lambda: store
+    app.dependency_overrides[memory_module.get_memory_compression] = lambda: make_fake_compression(
+        settings.max_anchored_turns
+    )
 
 
 @pytest.fixture
@@ -501,7 +543,11 @@ def make_session_client(
         cfg = make_settings(**settings_kwargs)
         provider = provider or FakeProvider(model=cfg.primary.model, provider=cfg.primary.provider)
         moderator = moderator or FakeModerator(result=False)
-        store = SessionStore(max_sessions=cfg.max_sessions, max_turns=cfg.max_conversation_turns)
+        store = SessionStore(
+            max_sessions=cfg.max_sessions,
+            max_turns=cfg.max_conversation_turns,
+            max_anchors=cfg.max_anchored_turns,
+        )
         install_overrides(cfg, provider, moderator, store)
         return stack.enter_context(TestClient(app)), provider, moderator, store
 

@@ -31,10 +31,27 @@ OUTPUT_FORMAT_LABELS = {
     "line_items": "Partidas",
     "narrative": "Narrativa",
 }
-SESSION_PROMPT_VERSIONS = ("v4",)
+SESSION_PROMPT_VERSIONS = ("v5", "v4")
+AUDIENCE_PROMPT_VERSION = "v5"
+TIERS = {
+    "executive": "Dirección (ejecutivo)",
+    "pm": "Gestión (PM)",
+    "developer": "Técnica (desarrollo)",
+    "default": "Sin adaptar",
+}
+TIER_RULE_LABELS = {
+    "explicit": "elegida por ti",
+    "nda_detected": "NDA detectado",
+    "regulatory_context": "normativa detectada",
+    "technical_audience": "vocabulario técnico",
+    "small_team": "equipo pequeño",
+    "default": "sin señales",
+    "prompt_version": "v4 no adapta la audiencia",
+}
+AUTO_AUDIENCE_LABEL = "Automático"
 DEFAULT_DETAIL_LEVEL = "medium"
 DEFAULT_OUTPUT_FORMAT = "line_items"
-DEFAULT_PROMPT_VERSION = "v4"
+DEFAULT_PROMPT_VERSION = "v5"
 MAX_TRANSCRIPT_CHARS = 20_000
 MAX_ATTACHMENTS = 5
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
@@ -146,14 +163,18 @@ class TurnForm:
     output_format: str
     prompt_version: str
     uploads: list[Any]
+    tier: str | None = None
 
     def fields(self) -> dict[str, str]:
-        return {
+        fields = {
             "transcript": self.transcript,
             "project_type": self.project_type,
             "detail_level": self.detail_level,
             "output_format": self.output_format,
         }
+        if self.tier is not None and self.prompt_version == AUDIENCE_PROMPT_VERSION:
+            fields["tier"] = self.tier
+        return fields
 
     def files(self) -> list[tuple[str, tuple[str, bytes, str]]]:
         return [("attachments", (f.name, f.getvalue(), mime_type(f.name))) for f in self.uploads]
@@ -378,6 +399,14 @@ def render_health(health: dict) -> None:
     )
 
 
+def tier_label(tier: object) -> str:
+    return TIERS.get(str(tier), str(tier)).split(" (")[0]
+
+
+def audience_text(tier: object, rule: object) -> str:
+    return f"{tier_label(tier)} ({TIER_RULE_LABELS.get(str(rule), str(rule))})"
+
+
 def render_memory(info: dict | None) -> None:
     st.subheader("Memoria del proyecto")
     if info is None:
@@ -393,12 +422,25 @@ def render_memory(info: dict | None) -> None:
         lines.append("**Tecnologías:** " + ", ".join(metadata["mentioned_technologies"]))
     if metadata.get("agreed_scope"):
         lines.append(f"**Alcance acordado:** {metadata['agreed_scope']}")
+    if metadata.get("explicit_constraints"):
+        lines.append("**Restricciones:** " + "; ".join(metadata["explicit_constraints"]))
+    if metadata.get("rejected_options"):
+        lines.append("**Descartado:** " + ", ".join(metadata["rejected_options"]))
     st.markdown("  \n".join(lines) if lines else NO_METADATA_MESSAGE)
+    summary_chars = info.get("summary_chars", 0)
+    summary = f"sí ({summary_chars} caracteres)" if summary_chars else "no"
     st.caption(
         f"Turnos: {info.get('turn_count', 0)} · en la ventana: "
         f"{info.get('history_turns', 0)}/{info.get('max_turns', 0)} · "
+        f"anclas: {info.get('anchors_count', 0)} · resumen: {summary} · "
         f"sesión `{str(info.get('session_id', ''))[:8]}`"
     )
+    if info.get("last_tier") is not None:
+        rule = str(info.get("last_tier_rule"))
+        st.caption(
+            f"Audiencia del último turno: {tier_label(info['last_tier'])} — "
+            f"regla: {TIER_RULE_LABELS.get(rule, rule)}"
+        )
 
 
 def render_sidebar(base_url: str, info: dict | None) -> None:
@@ -456,6 +498,17 @@ def render_form() -> TurnForm | None:
                 "Versión del prompt",
                 SESSION_PROMPT_VERSIONS,
                 index=SESSION_PROMPT_VERSIONS.index(DEFAULT_PROMPT_VERSION),
+                key="prompt_version",
+            )
+            # Widgets in a form only update on submit, so this follows the last submitted version.
+            audience_enabled = st.session_state.get("prompt_version") == AUDIENCE_PROMPT_VERSION
+            tier = st.selectbox(
+                "Audiencia",
+                [None, *TIERS],
+                format_func=lambda value: AUTO_AUDIENCE_LABEL if value is None else TIERS[value],
+                key="tier",
+                disabled=not audience_enabled,
+                help=None if audience_enabled else "Solo con v5",
             )
         submitted = st.form_submit_button("Enviar")
     if not submitted:
@@ -467,6 +520,7 @@ def render_form() -> TurnForm | None:
         output_format,
         prompt_version,
         list(uploads or []),
+        tier,
     )
 
 
@@ -528,6 +582,8 @@ def render_assistant_turn(turn: dict) -> None:
         st.markdown(data["text"])
         with st.expander("Métricas y validación", expanded=False):
             st.caption(f"Versión del prompt: {data.get('prompt_version')}")
+            if data.get("tier") is not None:
+                st.caption(f"Audiencia: {audience_text(data['tier'], data.get('tier_rule'))}")
             render_metrics(data, turn["client_total_s"])
             render_validation(data.get("validation"))
 

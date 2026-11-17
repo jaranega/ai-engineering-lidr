@@ -82,7 +82,13 @@ def test_a_new_session_is_empty(client):
             "assumed_team_size": None,
             "mentioned_technologies": [],
             "agreed_scope": None,
+            "explicit_constraints": [],
+            "rejected_options": [],
         },
+        "anchors_count": 0,
+        "summary_chars": 0,
+        "last_tier": None,
+        "last_tier_rule": None,
     }
 
 
@@ -139,8 +145,15 @@ def test_a_turn_returns_the_estimate_contract_plus_the_session_fields(client, pr
     response = send(client, session_id)
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == RESPONSE_FIELDS | {"session_id", "turn", "project_metadata"}
-    assert body["prompt_version"] == "v4"
+    assert set(body) == RESPONSE_FIELDS | {
+        "session_id",
+        "turn",
+        "project_metadata",
+        "tier",
+        "tier_rule",
+    }
+    assert body["prompt_version"] == "v5"
+    assert (body["tier"], body["tier_rule"]) == ("default", "default")
     assert body["session_id"] == session_id and body["turn"] == 1
     assert body["text"] and body["result"]["total_hours"] > 0
     assert body["project_metadata"]["project_name"] == "Clinic booking platform"
@@ -454,6 +467,92 @@ def test_attachment_errors_leave_the_session_untouched(client):
     assert info(client, session_id) == before
 
 
+# --- Tier y memoria (audience-tier, conversation-sessions) ---
+
+
+def test_explicit_tier_is_applied_and_reported(client, provider):
+    """Scenario: Tier explícito."""
+    session_id = new_session(client)
+    response = send(client, session_id, tier="developer")
+    assert response.status_code == 200
+    assert (response.json()["tier"], response.json()["tier_rule"]) == ("developer", "explicit")
+    assert "<audience>" in provider.calls[0][0]
+    state = info(client, session_id)
+    assert (state["last_tier"], state["last_tier_rule"]) == ("developer", "explicit")
+
+
+def test_explicit_default_tier_forces_no_adaptation(client, provider):
+    """audience-tier / Scenario: Forzar sin adaptación (HTTP)."""
+    session_id = new_session(client)
+    response = send(client, session_id, transcript="We signed an NDA.", tier="default")
+    assert (response.json()["tier"], response.json()["tier_rule"]) == ("default", "explicit")
+    assert "<audience>" not in provider.calls[0][0]
+
+
+def test_tier_with_v4_is_422_on_the_tier_field_without_calling_the_llm(client, provider):
+    """Scenario: Tier con v4."""
+    session_id = new_session(client)
+    response = send(client, session_id, params={"prompt_version": "v4"}, tier="executive")
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "tier"]
+    assert provider.call_count == 0
+    state = info(client, session_id)
+    assert (state["turn_count"], state["last_tier"]) == (0, None)
+
+
+def test_invalid_tier_is_422_on_the_tier_field(client, provider):
+    """Scenario: Tier inválido."""
+    response = send(client, new_session(client), tier="ceo")
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "tier"]
+    assert provider.call_count == 0
+
+
+def test_v4_without_explicit_tier_reports_prompt_version_rule(client, provider):
+    """audience-tier / Scenario: v4 sin tier explícito."""
+    session_id = new_session(client)
+    response = send(
+        client, session_id, transcript="We signed an NDA.", params={"prompt_version": "v4"}
+    )
+    assert response.status_code == 200
+    assert (response.json()["tier"], response.json()["tier_rule"]) == ("default", "prompt_version")
+    assert "<audience>" not in provider.calls[0][0]
+
+
+def test_nda_in_the_transcript_is_executive_with_its_rule(client):
+    """audience-tier / Scenario: Regla en la respuesta."""
+    session_id = new_session(client)
+    body = send(client, session_id, transcript="We signed an NDA with the client.").json()
+    assert (body["tier"], body["tier_rule"]) == ("executive", "nda_detected")
+    state = info(client, session_id)
+    assert (state["last_tier"], state["last_tier_rule"]) == ("executive", "nda_detected")
+
+
+def test_get_reports_the_memory_without_its_text(make_session_client):
+    """Scenario: Memoria tras varios turnos (sin el texto del resumen ni de las anclas)."""
+    client, *_ = make_session_client(max_conversation_turns=2)
+    session_id = new_session(client)
+    signed = "We signed an NDA with ANCLA-SECRETA-1."
+    for transcript in (signed, "MARCADOR-A", "MARCADOR-B", "MARCADOR-C"):
+        assert send(client, session_id, transcript=transcript).status_code == 200
+    response = client.get(f"{BASE}/{session_id}")
+    state = response.json()
+    assert state["anchors_count"] == 1
+    assert state["summary_chars"] > 0
+    # The anchored NDA turn is still in the history sent to the LLM: the tier keeps it.
+    assert (state["last_tier"], state["last_tier_rule"]) == ("executive", "nda_detected")
+    assert "ANCLA-SECRETA-1" not in response.text and "S:" not in response.text
+
+
+def test_a_failed_turn_leaves_last_tier_untouched(client, provider):
+    """conversation-sessions / Scenario: Turno fallido (last_tier)."""
+    session_id = new_session(client)
+    send(client, session_id, tier="pm")
+    provider.error = LLMProviderError(provider="openai")
+    assert send(client, session_id, tier="developer").status_code == 502
+    assert info(client, session_id)["last_tier"] == "pm"
+
+
 # --- 502 ---
 
 
@@ -506,8 +605,23 @@ def test_openapi_documents_the_session_operations_multipart_and_codes(client):
     params = {p["name"]: p for p in turn["parameters"]}
     assert params["session_id"]["schema"]["format"] == "uuid"
     assert params["prompt_version"]["in"] == "query"
-    assert params["prompt_version"]["schema"]["default"] == "v4"
-    assert params["prompt_version"]["schema"]["const"] == "v4"
+    assert params["prompt_version"]["schema"]["default"] == "v5"
+    assert params["prompt_version"]["schema"]["enum"] == ["v4", "v5"]
+    assert "tier" in body["properties"] and "tier" not in body["required"]
+    tier_values = spec["components"]["schemas"]["Tier"]["enum"]
+    assert tier_values == ["executive", "pm", "developer", "default"]
+    response_props = spec["components"]["schemas"]["SessionEstimateResponse"]["properties"]
+    assert {"tier", "tier_rule"} <= set(response_props)
+    info_props = spec["components"]["schemas"]["SessionInfo"]["properties"]
+    assert {"anchors_count", "summary_chars", "last_tier", "last_tier_rule"} <= set(info_props)
+    metadata_props = spec["components"]["schemas"]["ProjectMetadata"]["properties"]
+    assert {"explicit_constraints", "rejected_options"} <= set(metadata_props)
+
+
+def test_openapi_estimate_has_no_tier_field(client):
+    """audience-tier / Scenario: Estimate sin tier."""
+    spec = client.get("/openapi.json").json()
+    assert "tier" not in spec["components"]["schemas"]["EstimationRequest"]["properties"]
 
 
 def test_openapi_error_schemas_have_the_documented_shapes(client):
