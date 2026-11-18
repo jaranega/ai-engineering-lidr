@@ -246,17 +246,17 @@ def submit(
     """Fill the form and press "Enviar" in the same run (a run in between loses the text)."""
     at.text_area[0].set_value(transcript)
     if prompt_version is not None:
-        at.selectbox[2].set_value(prompt_version)
+        at.selectbox[0].set_value(prompt_version)
     if audience is not None:
-        at.selectbox[3].set_value(audience)
+        at.selectbox[1].set_value(audience)
     if review is not None:
         at.checkbox[0].set_value(review)
     if project_type is not None:
-        at.selectbox[0].set_value(project_type)
+        at.selectbox[2].set_value(project_type)
     if detail_level is not None:
         at.radio[0].set_value(detail_level)
     if output_format is not None:
-        at.selectbox[1].set_value(output_format)
+        at.selectbox[3].set_value(output_format)
     if files:
         at.file_uploader[0].set_value(list(files))
     submit_button(at).click().run()
@@ -331,39 +331,39 @@ def test_app_starts_with_the_form_defaults_and_the_attachment_selector(api):
     assert at.title[0].value == "Estimador de software"
     assert len(at.chat_message) == 0
     assert at.text_area[0].label == "Transcripción" and at.text_area[0].value == ""
-    assert at.selectbox[0].label == "Tipo de proyecto"
+    assert at.selectbox[2].label == "Tipo de proyecto"
     assert at.radio[0].label == "Nivel de detalle" and at.radio[0].value == "medium"
-    assert at.selectbox[1].label == "Formato de salida" and at.selectbox[1].value == "line_items"
+    assert at.selectbox[3].label == "Formato de salida" and at.selectbox[3].value == "line_items"
     uploader = at.file_uploader[0]
     assert uploader.label == "Adjuntos" and uploader.accept_multiple_files
     assert [t.lstrip(".") for t in uploader.allowed_type] == ["pdf", "docx"]
     assert at.expander[0].label == "Opciones avanzadas"
-    assert at.selectbox[2].label == "Versión del prompt"
-    assert at.selectbox[2].value == "v6" and list(at.selectbox[2].options) == ["v6", "v5", "v4"]
-    assert at.selectbox[3].label == "Audiencia"
-    assert at.selectbox[3].value is None  # "Automático" (no tier is sent)
-    assert list(at.selectbox[3].options) == [
+    assert at.selectbox[0].label == "Versión del prompt"
+    assert at.selectbox[0].value == "v6" and list(at.selectbox[0].options) == ["v6", "v5", "v4"]
+    assert at.selectbox[1].label == "Audiencia"
+    assert at.selectbox[1].value is None  # "Automático" (no tier is sent)
+    assert list(at.selectbox[1].options) == [
         "Automático",
         "Dirección (ejecutivo)",
         "Gestión (PM)",
         "Técnica (desarrollo)",
         "Sin adaptar",
     ]
-    assert not at.selectbox[3].disabled
+    assert not at.selectbox[1].disabled
     assert submit_button(at).label == "Enviar"
     assert api.estimates == []
 
 
 def test_the_selectors_offer_the_expected_labels(api):
     at = run_app()
-    assert list(at.selectbox[0].options) == [
+    assert list(at.selectbox[2].options) == [
         "App móvil",
         "SaaS web",
         "Herramienta interna",
         "Pipeline de datos",
     ]
     assert list(at.radio[0].options) == ["Resumen", "Medio", "Detallado"]
-    assert list(at.selectbox[1].options) == ["Tabla por fases", "Partidas", "Narrativa"]
+    assert list(at.selectbox[3].options) == ["Tabla por fases", "Partidas", "Narrativa"]
 
 
 def test_the_form_exposes_only_the_agreed_widgets(api):
@@ -424,13 +424,11 @@ def test_explicit_audience_with_v4_never_sends_tier(api, audience):
     assert api.estimates[0].url.params["prompt_version"] == "v4"
 
 
-def test_the_audience_selector_is_disabled_once_v4_is_selected(api):
+def test_the_audience_selector_stays_enabled_and_help_says_v5_or_v6(api):
     """Scenario: Audiencia con v4 (selector deshabilitado con la indicación Solo con v5 o v6)."""
     at = submit(run_app(), prompt_version="v4")
-    assert at.selectbox[3].disabled
-    assert at.selectbox[3].proto.help == "Solo con v5 o v6"
-    submit(at, "Siguiente.", prompt_version="v6")
-    assert not at.selectbox[3].disabled
+    assert not at.selectbox[1].disabled
+    assert at.selectbox[1].proto.help == "Solo con v5 o v6"
 
 
 def test_docx_attachment_goes_with_the_word_mime_type(api):
@@ -458,11 +456,11 @@ def test_the_selectors_keep_their_value_between_turns(api):
     at = submit(
         run_app(), project_type="data_pipeline", detail_level="summary", output_format="narrative"
     )
-    assert at.selectbox[0].value == "data_pipeline"
+    assert at.selectbox[2].value == "data_pipeline"
     assert at.radio[0].value == "summary"
-    assert at.selectbox[1].value == "narrative"
+    assert at.selectbox[3].value == "narrative"
     submit(at, "Otro mensaje del cliente.")
-    assert at.selectbox[0].value == "data_pipeline"
+    assert at.selectbox[2].value == "data_pipeline"
     fields, _ = parse_multipart(api.estimates[1])
     assert (fields["project_type"], fields["detail_level"], fields["output_format"]) == (
         "data_pipeline",
@@ -1434,6 +1432,7 @@ STOP_LABELS = {
     "rejected": "el revisor la rechazó",
     "budget_exhausted": "se agotaron las iteraciones",
     "actor_failed": "falló un reintento",
+    "retry_out_of_scope": "un reintento salió fuera de alcance",
 }
 
 
@@ -1449,11 +1448,11 @@ def test_acb_summary_uses_the_spanish_labels(decision, text, reason, label):
 
 
 def test_acb_labels_cover_every_api_value():
-    from app.schemas import ReviewFinalDecision, ReviewStopReason
+    from app.services.llm_service import FinalDecision, StopReason
 
     ui = load_ui_namespace()
-    assert set(ui["ACB_STOP_REASON_LABELS"]) == set(get_args(ReviewStopReason))
-    assert set(ui["ACB_DECISION_LABELS"]) == set(get_args(ReviewFinalDecision))
+    assert set(ui["ACB_STOP_REASON_LABELS"]) == set(get_args(StopReason))
+    assert set(ui["ACB_DECISION_LABELS"]) == set(get_args(FinalDecision))
 
 
 def test_acb_summary_falls_back_to_the_raw_value_for_unknown_codes():
@@ -1485,7 +1484,8 @@ def test_review_help_mentions_the_default_budget():
 
     ui = load_ui_namespace()
     default = Settings.model_fields["boss_max_iterations"].default
-    assert f"hasta {default} borradores" in ui["REVIEW_HELP"]
+    assert f"{default} por defecto" in ui["REVIEW_HELP"]
+    assert "BOSS_MAX_ITERATIONS" in ui["REVIEW_HELP"]
     assert ui["REVIEW_PROMPT_VERSION"] == "v6"
 
 
@@ -1506,3 +1506,48 @@ def test_e2e_review_turn_reaches_the_boss_and_shows_the_trace(e2e):
     assert "Aceptada — el revisor la aceptó" in text
     assert expander.table[0].value.iloc[0]["Campo"] == "rows[2].hours"
     assert "<critic_feedback>" in reviewer.calls_of("draft")[1][1][-1]["content"]
+
+
+# --- s05-fix-acb-review-findings: controls follow the selected version ---
+
+
+def test_review_is_available_after_a_v4_turn_once_v6_is_selected(api):
+    """Scenario: Revisión tras un turno con v4."""
+    at = submit(run_app(), prompt_version="v4")
+    at = submit(at, "Siguiente.", prompt_version="v6", review=True)
+    assert not at.exception and not at.checkbox[0].disabled
+    fields, _ = parse_multipart(api.estimates[1])
+    assert fields["review"] == "true"
+    assert api.estimates[1].url.params["prompt_version"] == "v6"
+
+
+def test_review_with_a_version_that_does_not_support_it_warns_and_is_not_sent(api):
+    """Scenario: Revisión con una versión que no la admite."""
+    at = run_app()
+    at.checkbox[0].set_value(True).run()
+    assert not [w for w in warnings(at) if "revisión no se enviará" in w]
+    at.selectbox[0].set_value("v4").run()
+    assert any("La revisión no se enviará" in w and "v4" in w for w in warnings(at))
+    at = submit(at)
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "review" not in fields
+
+
+def test_tier_with_a_version_that_does_not_support_it_warns_and_is_not_sent(api):
+    """Requirement: Controles según la versión seleccionada (audiencia)."""
+    at = run_app()
+    at.selectbox[1].set_value("executive").run()
+    assert not [w for w in warnings(at) if "audiencia no se enviará" in w]
+    at.selectbox[0].set_value("v4").run()
+    assert any("La audiencia no se enviará" in w for w in warnings(at))
+    submit(at)
+    assert "tier" not in api.estimates[0].url.params
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "tier" not in fields
+
+
+def test_review_help_does_not_fix_a_hard_limit():
+    """Requirement: la ayuda habla de BOSS_MAX_ITERATIONS, 3 por defecto."""
+    ui = load_ui_namespace()
+    assert "BOSS_MAX_ITERATIONS" in ui["REVIEW_HELP"]
+    assert "hasta 3 borradores" not in ui["REVIEW_HELP"]

@@ -64,7 +64,7 @@ El sistema SHALL definir en `app/services/boss.py` una función pura `run_review
 
 **Bucle.** La función MUST aplicar, en cada iteración empezando por la 1:
 1. Pedir un borrador. En la primera iteración, `actor(None)`.
-2. Si el borrador está fuera de alcance (confianza < 30), aceptarlo sin llamar al Critic, con `stop_reason = "out_of_scope"`.
+2. Si el borrador está fuera de alcance (confianza < 30): en la iteración 1, aceptarlo sin llamar al Critic, con `stop_reason = "out_of_scope"`; en una iteración posterior, terminar sintetizando el último borrador dentro de alcance con su último feedback, con `stop_reason = "retry_out_of_scope"` (un reintento nunca convierte en fuera de alcance un turno que tenía una estimación válida).
 3. Si no, llamar al Critic y actuar según el resultado:
    - Con `accept`, aceptar con `stop_reason = "accepted"`; si el Critic falló, `stop_reason = "critic_failed"`.
    - Con `reject`, sintetizar con `stop_reason = "rejected"`.
@@ -76,7 +76,7 @@ El sistema SHALL definir en `app/services/boss.py` una función pura `run_review
 **Resultado.** La función MUST devolver:
 - el borrador final;
 - `final_decision`: `accept` o `synthesize`;
-- `stop_reason`;
+- `stop_reason` (`accepted`, `out_of_scope`, `critic_failed`, `rejected`, `budget_exhausted`, `actor_failed` o `retry_out_of_scope`);
 - una entrada por iteración con `iteration`, `verdict` (`null` sin Critic), `critic_confidence`, `critic_failed`, `decision` (`accept`, `iterate` o `synthesize`), `draft_confidence_pct`, `draft_total_hours` y los problemas.
 
 `max_iterations` MUST ser al menos 1.
@@ -115,6 +115,11 @@ El sistema SHALL definir en `app/services/boss.py` una función pura `run_review
 - **GIVEN** `max_iterations = 1` y un Critic que devuelve `needs_iteration`
 - **WHEN** se ejecuta `run_review`
 - **THEN** el Actor se llama una vez y `stop_reason = "budget_exhausted"`
+
+#### Scenario: Reintento fuera de alcance
+- **GIVEN** un primer borrador válido de 800 horas, un Critic que devuelve `needs_iteration` y un segundo borrador con `confidence_pct = 10`
+- **WHEN** se ejecuta `run_review` con `max_iterations = 3`
+- **THEN** el resultado es la síntesis del primer borrador (800 horas, no fuera de alcance), `final_decision = "synthesize"` y `stop_reason = "retry_out_of_scope"`, y el Critic no revisa el segundo borrador
 
 ### Requirement: Síntesis del resultado
 Sintetizar SHALL devolver el último borrador con dos cambios, sin llamar al LLM:
@@ -167,4 +172,11 @@ Los esquemas de la traza MUST definirse en `app/schemas.py` y documentarse en Op
 - **GIVEN** un Critic que devuelve `needs_iteration` con un problema `major` `scope_mismatch` en `rows[2].hours` y después `accept`
 - **WHEN** se envía un turno con `review=true`
 - **THEN** `acb.iterations_run = 2`, `acb.iterations[0].decision = "iterate"`, `acb.iterations[0].issues[0].field_path = "rows[2].hours"` y `acb.iterations[1].decision = "accept"`
+
+### Requirement: Tipos de la traza en un único sitio
+Los valores admitidos de la traza (categoría, gravedad, veredicto, decisión por iteración, decisión final y motivo de parada) SHALL definirse una sola vez, en `app/services/critic.py` y `app/services/boss.py`, y `app/schemas.py` MUST reutilizarlos (vía `app.services.llm_service`) en lugar de redefinirlos. Un valor nuevo en el servicio MUST aparecer en el esquema de OpenAPI sin editar `app/schemas.py`.
+
+#### Scenario: Motivo de parada nuevo en OpenAPI
+- **WHEN** se consulta `/openapi.json`
+- **THEN** el enum de `stop_reason` de `ReviewTrace` contiene `retry_out_of_scope` y coincide con los valores de `app/services/boss.py`
 

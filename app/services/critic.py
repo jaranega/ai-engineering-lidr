@@ -135,13 +135,15 @@ class CriticFeedback(BaseModel):
 @dataclass(frozen=True)
 class CriticReview:
     """Result of one Critic call: the feedback, whether the Critic failed (then the
-    feedback is the fail-open `accept` with confidence 0) and the provider call, for the
-    turn metrics (`None` when it failed).
+    feedback is the fail-open `accept` with confidence 0) and, for the turn metrics, the
+    provider call (`None` when it failed) or the provider error, which carries the usage
+    of the failed attempts (design s05-fix D2; `None` when it did not fail).
     """
 
     feedback: CriticFeedback
     failed: bool = False
     call: "StructuredResult[CriticFeedback] | None" = None
+    error: LLMProviderError | None = None
 
 
 def _failed_feedback() -> CriticFeedback:
@@ -192,7 +194,7 @@ class Critic:
                 )
         except LLMProviderError as exc:
             logger.warning("critic_failed", iteration=iteration, error_type=type(exc).__name__)
-            return CriticReview(feedback=_failed_feedback(), failed=True)
+            return CriticReview(feedback=_failed_feedback(), failed=True, error=exc)
         feedback = call.value
         severities = [issue.severity for issue in feedback.issues]
         logger.info(

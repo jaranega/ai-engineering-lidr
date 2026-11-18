@@ -14,6 +14,10 @@ Each case creates its own session and sends one turn (`review=true` in `acb` mod
 The runner never prints nor stores transcripts or full responses: only ids, metrics,
 counters and the metrics' `details`. Exit codes: 0 all cases pass, 1 any case fails or
 errors (or the cost cap stopped the run), 2 usage or dataset error.
+
+With `--max-cost-usd`, a case whose cost is unknown (it may have called the LLM but
+reports no `cost_usd`) stops the run (`stopped_by_unknown_cost`): the cap cannot be
+guaranteed (design s05-fix D3). Without a cap, those cases are counted apart.
 """
 
 import argparse
@@ -55,7 +59,13 @@ class EvalClient(Protocol):
 
 @dataclass
 class CaseRow:
-    """One line of the report. `error` is set when the turn failed (counts as failed)."""
+    """One line of the report. `error` is set when the turn failed (counts as failed).
+
+    `cost_unknown` marks a case that may have called the LLM without a known cost: a 200
+    with `cost_usd = null`, or a turn that failed with a 5xx, a client exception or an
+    unreadable response. Guardrail blocks and other 4xx (rejected before any LLM call)
+    and session-creation failures never count.
+    """
 
     id: str
     language: str
@@ -70,6 +80,7 @@ class CaseRow:
     final_decision: str | None = None
     stop_reason: str | None = None
     iterations_run: int | None = None
+    cost_unknown: bool = False
 
 
 @dataclass
@@ -78,6 +89,7 @@ class EvalReport:
     cases_total: int
     rows: list[CaseRow] = field(default_factory=list)
     stopped_by_cost_cap: bool = False
+    stopped_by_unknown_cost: bool = False
     max_cost_usd: float | None = None
 
     @property
@@ -88,6 +100,7 @@ class EvalReport:
     def all_passed(self) -> bool:
         return (
             not self.stopped_by_cost_cap
+            and not self.stopped_by_unknown_cost
             and len(self.rows) == self.cases_total
             and all(row.passed for row in self.rows)
         )
@@ -107,11 +120,14 @@ class EvalReport:
             "blocked": sum(row.blocked_reason is not None for row in rows),
             "metric_passes": metric_passes,
             "total_cost_usd": self.total_cost_usd,
+            # Cases whose cost is not in `total_cost_usd` although they may have paid.
+            "unknown_cost_cases": sum(row.cost_unknown for row in rows),
             "latency_ms_mean": round(statistics.fmean(latencies)) if latencies else None,
             "latency_ms_p50": round(statistics.median(latencies)) if latencies else None,
             "latency_ms_max": max(latencies) if latencies else None,
             "cache_hits": sum(bool(row.cache_hit) for row in rows),
             "stopped_by_cost_cap": self.stopped_by_cost_cap,
+            "stopped_by_unknown_cost": self.stopped_by_unknown_cost,
         }
         if self.mode == "acb":
             reviewed = [row for row in rows if row.iterations_run is not None]
@@ -162,6 +178,7 @@ def _guardrail_reason(response: _Response) -> str | None:
 def run_case(case: GoldenCase, mode: Mode, client: EvalClient) -> CaseRow:
     """Create a session, send one turn and score it; failures become an error row."""
     row = CaseRow(id=case.id, language=case.language, passed=False)
+    turn_sent = False
     try:
         created = client.post(SESSIONS_PATH)
         if created.status_code != 201:
@@ -169,10 +186,13 @@ def run_case(case: GoldenCase, mode: Mode, client: EvalClient) -> CaseRow:
             return row
         session_id = created.json()["session_id"]
         start = time.perf_counter()
+        turn_sent = True
         response = client.post(f"{SESSIONS_PATH}/{session_id}/estimate", data=form_data(case, mode))
         row.latency_ms = int((time.perf_counter() - start) * 1000)
     except Exception as exc:  # noqa: BLE001 - any client failure is an error row
         row.error = f"{type(exc).__name__}"
+        # The turn may have reached the LLM before the client failed.
+        row.cost_unknown = turn_sent
         return row
 
     if response.status_code == 400 and (reason := _guardrail_reason(response)) is not None:
@@ -183,8 +203,10 @@ def run_case(case: GoldenCase, mode: Mode, client: EvalClient) -> CaseRow:
             parsed = SessionEstimateResponse.model_validate(response.json())
         except (ValidationError, ValueError) as exc:
             row.error = f"invalid response: {type(exc).__name__}"
+            row.cost_unknown = True
             return row
         row.cost_usd = parsed.cost_usd
+        row.cost_unknown = parsed.cost_usd is None
         row.cache_hit = parsed.cache_hit
         row.tier = parsed.tier.value
         if parsed.acb is not None:
@@ -194,6 +216,8 @@ def run_case(case: GoldenCase, mode: Mode, client: EvalClient) -> CaseRow:
         outcome = CaseOutcome(response=parsed)
     else:
         row.error = f"HTTP {response.status_code}"
+        # 4xx are rejected before any LLM call; a 5xx (e.g. 502) may come after paid calls.
+        row.cost_unknown = response.status_code >= 500
         return row
 
     row.metrics = run_all_metrics(case, outcome)
@@ -212,7 +236,9 @@ def run_cases(
     """Run every case in order and return the report.
 
     Stops after the case that takes the accumulated `cost_usd` above `max_cost_usd`
-    (`stopped_by_cost_cap`). `on_row(row)` is called after each case (the CLI prints it).
+    (`stopped_by_cost_cap`) or, with `max_cost_usd`, after the first case whose cost is
+    unknown (`stopped_by_unknown_cost`, design s05-fix D3). `on_row(row)` is called after
+    each case (the CLI prints it).
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
@@ -222,7 +248,12 @@ def run_cases(
         report.rows.append(row)
         if on_row is not None:
             on_row(row)
-        if max_cost_usd is not None and report.total_cost_usd > max_cost_usd:
+        if max_cost_usd is None:
+            continue
+        if row.cost_unknown:
+            report.stopped_by_unknown_cost = True
+            break
+        if report.total_cost_usd > max_cost_usd:
             report.stopped_by_cost_cap = True
             break
     return report
@@ -259,7 +290,12 @@ def format_summary(report: EvalReport) -> str:
         for name, passes in summary["metric_passes"].items()
     ]
     lines += [
-        f"  total cost: ${summary['total_cost_usd']:.4f}",
+        f"  total cost: ${summary['total_cost_usd']:.4f}"
+        + (
+            f" (+ {summary['unknown_cost_cases']} case(s) with unknown cost)"
+            if summary["unknown_cost_cases"]
+            else ""
+        ),
         f"  latency ms: mean {summary['latency_ms_mean']}, p50 {summary['latency_ms_p50']},"
         f" max {summary['latency_ms_max']}",
         f"  cache hits: {summary['cache_hits']}",
@@ -272,6 +308,8 @@ def format_summary(report: EvalReport) -> str:
         ]
     if report.stopped_by_cost_cap:
         lines.append(f"  STOPPED: cost cap of ${report.max_cost_usd} reached")
+    if report.stopped_by_unknown_cost:
+        lines.append(f"  STOPPED: cost unknown, cap of ${report.max_cost_usd} cannot be guaranteed")
     return "\n".join(lines)
 
 

@@ -411,3 +411,58 @@ def test_out_of_scope_draft_is_accepted_without_a_critic_call_and_keeps_the_meta
     assert rig.provider.kinds == ["draft"]
     assert rig.session.turn_count == 1
     assert rig.session.project_metadata.project_name is None
+
+
+# --- s05-fix-acb-review-findings: usage of failed calls ---
+
+
+def failure(input_tokens=None, output_tokens=None, model=None):
+    from app.services.llm_service import StructuredOutputError
+
+    return StructuredOutputError(
+        "openai", "invalid", 3, input_tokens=input_tokens, output_tokens=output_tokens, model=model
+    )
+
+
+def test_failed_critic_with_known_usage_is_summed():
+    """Scenario: Critic que agota los reintentos."""
+    rig = Rig(ReviewProvider(critics=[failure(500, 80, "gpt-4o-mini")]))
+    outcome = rig.turn()
+    assert outcome.review.stop_reason == "critic_failed"
+    assert (outcome.outcome.input_tokens, outcome.outcome.output_tokens) == (1500, 280)
+    expected = estimate_cost("gpt-4o-mini", 1000, 200) + estimate_cost("gpt-4o-mini", 500, 80)
+    assert outcome.outcome.cost_usd == pytest.approx(expected)
+
+
+def test_failed_critic_with_unknown_usage_has_a_null_cost():
+    """Scenario: Consumo desconocido."""
+    outcome = Rig(ReviewProvider(critics=[failure()])).turn().outcome
+    assert outcome.cost_usd is None
+    assert outcome.input_tokens == 1000
+
+
+def test_failed_actor_retry_usage_is_summed_and_logged_without_content():
+    """Requirement: Coste de las llamadas fallidas; `acb_completed` incluye los totales."""
+    drafts = [valid_payload(), failure(300, 50, "gpt-4o-mini")]
+    rig = Rig(ReviewProvider(drafts=drafts, critics=[NEEDS]))
+    with capture() as logs:
+        outcome = rig.turn()
+    assert outcome.review.stop_reason == "actor_failed"
+    assert (outcome.outcome.input_tokens, outcome.outcome.output_tokens) == (1700, 350)
+    expected = (
+        estimate_cost("gpt-4o-mini", 1000, 200)
+        + estimate_cost("gpt-4o-mini", 400, 100)
+        + estimate_cost("gpt-4o-mini", 300, 50)
+    )
+    assert outcome.outcome.cost_usd == pytest.approx(expected)
+    (done,) = [e for e in logs if e["event"] == "acb_completed"]
+    assert (done["input_tokens"], done["output_tokens"]) == (1700, 350)
+    assert done["failed_calls"] == 1 and done["cost_usd"] == pytest.approx(expected)
+    assert "DESCRIPCION-SECRETA-123" not in json.dumps(logs, default=str)
+
+
+def test_acb_completed_has_a_null_cost_with_unknown_failed_usage():
+    with capture() as logs:
+        Rig(ReviewProvider(critics=[failure()])).turn()
+    (done,) = [e for e in logs if e["event"] == "acb_completed"]
+    assert done["cost_usd"] is None and done["failed_calls"] == 1

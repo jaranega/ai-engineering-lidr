@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.config import Deployment, Settings, get_settings
 from app.domain import Language
+from app.guardrails.input import PROMPT_TAG_PATTERN
 from app.prompts.loader import render_anchor_prompt, render_summary_prompt
 from app.services.llm_service import (
     LLMCallOptions,
@@ -64,12 +65,11 @@ __all__ = [
 SUMMARY_MAX_TOKENS = 800
 ANCHOR_MAX_TOKENS = 200
 
-# Tags of the estimation prompt the summary must never open or close (it is rendered
-# inside <conversation_summary> in the system prompt, D7).
-_PROMPT_TAG = re.compile(
-    r"<\s*/?\s*(?:conversation_summary|project_metadata|transcript|attachments|audience)\s*>",
-    re.IGNORECASE,
-)
+# Tags of the prompts the summary must never open or close (it is rendered inside
+# <conversation_summary> in the system prompt, D7): the same pattern the injection
+# guardrail blocks (design s05-fix D5), case-insensitive since the summary is not
+# normalized. The tags are removed, the text between them is kept.
+_PROMPT_TAG = re.compile(PROMPT_TAG_PATTERN, re.IGNORECASE)
 # End of a sentence: the punctuation is kept, the following whitespace is not.
 _SENTENCE_END = re.compile(r"[.!?](?=\s)")
 

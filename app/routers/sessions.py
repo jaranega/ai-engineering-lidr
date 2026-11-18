@@ -210,7 +210,7 @@ def estimate_turn(
         Tier | None,
         Form(
             description="Audience of the estimate; omit for automatic resolution. "
-            "Only with prompt_version v5 (422 with v4)."
+            "Accepted with prompt_version v5 and v6 (422 with v4)."
         ),
     ] = None,
     review: Annotated[

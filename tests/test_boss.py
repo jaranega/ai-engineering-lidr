@@ -112,12 +112,14 @@ def test_out_of_scope_draft_is_accepted_without_calling_the_critic():
 
 
 def test_out_of_scope_after_a_retry_stops_without_a_second_critic_call():
+    first = make_draft()
     oos = make_draft(**out_of_scope_payload(confidence_pct=10))
     critic = Critic(NEEDS)
-    run = run_review(Actor(make_draft(), oos), critic, max_iterations=3)
+    run = run_review(Actor(first, oos), critic, max_iterations=3)
     assert len(critic.drafts) == 1
-    assert run.stop_reason == "out_of_scope" and run.final_decision == "accept"
-    assert [it.decision for it in run.trace.iterations] == ["iterate", "accept"]
+    assert run.stop_reason == "retry_out_of_scope" and run.final_decision == "synthesize"
+    assert run.draft is first
+    assert [it.decision for it in run.trace.iterations] == ["iterate", "synthesize"]
 
 
 def test_actor_failure_in_the_retry_synthesizes_the_first_draft():
@@ -296,3 +298,29 @@ def test_warnings_are_cut_to_300_characters():
     out = synthesize(make_draft().result, fb("needs_iteration", issue), "es")
     assert len(out.assumptions_and_risks[0]) <= 300
     assert out.assumptions_and_risks[0].startswith("Revisión independiente: xxx")
+
+
+# --- s05-fix-acb-review-findings ---
+
+
+def test_retry_out_of_scope_synthesizes_the_first_in_scope_draft():
+    """Scenario: Reintento fuera de alcance."""
+    first = make_draft()
+    oos = make_draft(**out_of_scope_payload(confidence_pct=10))
+    critic = Critic(NEEDS)
+    run = run_review(Actor(first, oos), critic, max_iterations=3)
+    assert critic.drafts == [first]  # the Critic never reviews the out-of-scope retry
+    assert (run.final_decision, run.stop_reason) == ("synthesize", "retry_out_of_scope")
+    assert run.final == synthesize(first.result, NEEDS, "en")
+    assert run.draft is first and not run.draft.estimate.out_of_scope
+    assert run.trace.critic_calls == 1 and run.trace.actor_calls == 2
+    last = run.trace.iterations[-1]
+    assert last.verdict is None and last.decision == "synthesize"
+
+
+def test_out_of_scope_on_the_first_iteration_is_unchanged():
+    """Scenario: Borrador fuera de alcance (la iteración 1 no cambia)."""
+    oos = make_draft(**out_of_scope_payload(confidence_pct=10))
+    run = run_review(Actor(oos), Critic(NEEDS), max_iterations=3)
+    assert (run.final_decision, run.stop_reason) == ("accept", "out_of_scope")
+    assert run.draft is oos

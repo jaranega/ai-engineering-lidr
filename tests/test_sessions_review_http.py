@@ -271,3 +271,75 @@ def test_openapi_documents_review_acb_and_last_review(client):
         schemas["ReviewSummary"]["properties"]
     )
     assert {"200", "400", "404", "409", "413", "415", "422", "502"} <= set(turn["responses"])
+
+
+# --- s05-fix-acb-review-findings ---
+
+
+def test_retry_out_of_scope_keeps_the_valid_estimate_over_http(review_client):
+    """Scenario: Reintento fuera de alcance (HTTP): the turn is not out of scope."""
+    from tests.conftest import out_of_scope_payload
+
+    provider = ReviewProvider(
+        drafts=[valid_payload(), out_of_scope_payload(confidence_pct=10)], critics=[NEEDS]
+    )
+    client, session_id, *_ = review_client(provider)
+    response = send(client, session_id, review="true")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["acb"]["stop_reason"] == "retry_out_of_scope"
+    assert body["acb"]["final_decision"] == "synthesize"
+    assert body["result"]["out_of_scope"] is False
+    assert provider.kinds == ["draft", "critic", "draft"]
+    assert body["project_metadata"]["project_name"] == "Clinic booking platform"
+    assert info(client, session_id)["project_metadata"] == body["project_metadata"]
+
+
+def test_critic_failure_with_known_usage_adds_its_tokens_over_http(review_client):
+    """Scenario: Critic que agota los reintentos (1000/200 + 500/80)."""
+    from app.services.llm_service import StructuredOutputError
+
+    failure = StructuredOutputError(
+        "openai", "invalid", 3, input_tokens=500, output_tokens=80, model="gpt-4o-mini"
+    )
+    client, session_id, *_ = review_client(ReviewProvider(critics=[failure]))
+    response = send(client, session_id, review="true")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["acb"]["stop_reason"] == "critic_failed"
+    assert (body["input_tokens"], body["output_tokens"]) == (1500, 280)
+
+
+def test_critic_failure_without_usage_has_a_null_cost_over_http(review_client):
+    """Scenario: Consumo desconocido."""
+    from app.services.llm_service import StructuredOutputError
+
+    client, session_id, *_ = review_client(
+        ReviewProvider(critics=[StructuredOutputError("openai", "invalid", 3)])
+    )
+    body = send(client, session_id, review="true").json()
+    assert body["cost_usd"] is None and body["input_tokens"] == 1000
+
+
+def test_openapi_stop_reason_enum_follows_boss_and_tier_mentions_v5_and_v6(client):
+    """Requirement: Tipos de la traza en un único sitio; Descripción de `tier`."""
+    from typing import get_args
+
+    from app.services.boss import StopReason
+
+    spec = client.get("/openapi.json").json()
+    stop = spec["components"]["schemas"]["ReviewTrace"]["properties"]["stop_reason"]
+    values = (
+        stop["enum"]
+        if "enum" in stop
+        else spec["components"]["schemas"][stop["$ref"].rsplit("/", 1)[-1]]["enum"]
+    )
+    assert "retry_out_of_scope" in values
+    assert set(values) == set(get_args(StopReason))
+    turn = spec["paths"]["/api/v1/sessions/{session_id}/estimate"]["post"]
+    ref = turn["requestBody"]["content"]["multipart/form-data"]["schema"]["$ref"]
+    body = spec["components"]["schemas"][ref.rsplit("/", 1)[-1]]
+    params = {p["name"]: p for p in turn["parameters"]}
+    tier = body["properties"].get("tier") or params["tier"]
+    description = tier.get("description") or tier["schema"].get("description", "")
+    assert "v5" in description and "v6" in description

@@ -15,7 +15,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Generator, Iterator, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, partial
 from typing import Any, Generic, Protocol, TypeVar
 
@@ -64,14 +64,25 @@ from app.prompts.loader import (
     render_estimation_prompt,
     render_session_prompt,
 )
-from app.services.boss import BossIteration, BossTrace, Draft, run_review
+from app.services.boss import (
+    BossDecision,
+    BossIteration,
+    BossTrace,
+    Draft,
+    FinalDecision,
+    StopReason,
+    run_review,
+)
 from app.services.cache import ResponseCache, cache_key, get_response_cache, key_prefix
 from app.services.critic import (
     CRITIC_MAX_TOKENS,
     Critic,
+    CriticCategory,
     CriticFeedback,
     CriticIssue,
     CriticReview,
+    CriticSeverity,
+    CriticVerdict,
 )
 from app.services.errors import LLMProviderError, StructuredFailure, StructuredOutputError
 from app.services.evaluation import StructureCheck, evaluate_estimation
@@ -96,13 +107,18 @@ __all__ = [
     "REVIEW_PROMPT_VERSIONS",
     "REVIEW_REQUIRES_V6",
     "SESSION_PROMPT_VERSIONS",
+    "BossDecision",
     "BossIteration",
     "BossTrace",
     "ChatMessage",
     "ComputedEstimate",
+    "CriticCategory",
     "CriticIssue",
+    "CriticSeverity",
+    "CriticVerdict",
     "EstimationOutcome",
     "EstimationService",
+    "FinalDecision",
     "GenerationOptions",
     "GuardrailReason",
     "InputGuardrailViolation",
@@ -116,6 +132,7 @@ __all__ = [
     "PromptVersion",
     "ReviewConfig",
     "SessionPromptVersion",
+    "StopReason",
     "StructuredOutputError",
     "StructuredResult",
     "TurnOutcome",
@@ -400,14 +417,22 @@ class _AttemptStats:
     model_id: str | None = None
     finish_reason: str | None = None
     parse_errors: int = 0
+    # Whether some response did not report its usage, and every deployment that answered:
+    # the usage of a failed call is only known when complete and from one model (D2).
+    usage_missing: bool = False
+    model_ids: set[str | None] = field(default_factory=set)
 
     def on_response(self, response: Any) -> None:
         self.attempts += 1
         usage = getattr(response, "usage", None)
-        if usage:
-            self.input_tokens += getattr(usage, "prompt_tokens", None) or 0
-            self.output_tokens += getattr(usage, "completion_tokens", None) or 0
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        if prompt_tokens is None or completion_tokens is None:
+            self.usage_missing = True
+        self.input_tokens += prompt_tokens or 0
+        self.output_tokens += completion_tokens or 0
         self.model_id = _model_id(response)
+        self.model_ids.add(self.model_id)
         choices = getattr(response, "choices", None) or []
         self.finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
 
@@ -552,9 +577,33 @@ class LiteLLMProvider:
         )
         return LLMProviderError(provider=target.provider)
 
+    def _failed_usage(self, stats: _AttemptStats, target: Deployment, override: bool) -> dict:
+        """Usage of the paid attempts of a failed structured call (design s05-fix D2).
+
+        Unknown (`None`) without any response (a transport failure may still be billed),
+        when a response did not report its usage, or when several deployments answered
+        (one model cannot price them). The model follows `_effective`, without its log.
+        """
+        if stats.attempts == 0 or stats.usage_missing:
+            return {}
+        model: str | None = None
+        if len(stats.model_ids) == 1:
+            (model_id,) = stats.model_ids
+            deployment = target
+            if not override and model_id == FALLBACK_GROUP and self._fallback is not None:
+                deployment = self._fallback
+            model = deployment.model
+        return {
+            "input_tokens": stats.input_tokens,
+            "output_tokens": stats.output_tokens,
+            "model": model,
+        }
+
     def _fail_structured(
-        self, exc: Exception, start: float, target: Deployment, attempts: int
+        self, exc: Exception, start: float, target: Deployment, stats: _AttemptStats, override: bool
     ) -> LLMProviderError:
+        attempts = stats.attempts
+        usage = self._failed_usage(stats, target, override)
         # An exhausted retry wraps the real error: log the type of the original.
         cause = exc.__cause__ if isinstance(exc, InstructorRetryException) else None
         original = cause if isinstance(cause, Exception) else exc
@@ -568,9 +617,9 @@ class LiteLLMProvider:
         )
         reason = _structured_failure(exc)
         if reason is None:
-            return LLMProviderError(provider=target.provider)
+            return LLMProviderError(provider=target.provider, **usage)
         logger.warning("structured_output_failed", reason=reason, attempts=attempts)
-        return StructuredOutputError(target.provider, reason, attempts)
+        return StructuredOutputError(target.provider, reason, attempts, **usage)
 
     def _finish(
         self,
@@ -747,7 +796,8 @@ class LiteLLMProvider:
                 _skip_mcp_handler=True,
             )
         except Exception as exc:
-            raise self._fail_structured(exc, start, target, stats.attempts) from exc
+            override = options is not None and options.model is not None
+            raise self._fail_structured(exc, start, target, stats, override) from exc
 
         deployment, fallback_used = self._effective(stats.model_id, mode, plan)
         result = StructuredResult(
@@ -1091,15 +1141,37 @@ class ReviewConfig:
             raise ValueError("max_iterations must be at least 1")
 
 
-def _sum_cost(calls: Sequence[StructuredResult[Any]]) -> float | None:
-    """Cost of every call of the turn; `None` if any of them has no known price."""
+def _sum_cost(
+    calls: Sequence[StructuredResult[Any]], failed: Sequence[LLMProviderError] = ()
+) -> float | None:
+    """Cost of every call of the turn, failed calls included (design s05-fix D2); `None`
+    if any of them has no known price or a failed call has no known usage.
+    """
+    usages = [(call.model, call.input_tokens, call.output_tokens) for call in calls]
+    for error in failed:
+        if error.model is None or error.input_tokens is None or error.output_tokens is None:
+            return None
+        usages.append((error.model, error.input_tokens, error.output_tokens))
     total = 0.0
-    for call in calls:
-        cost = estimate_cost(call.model, call.input_tokens, call.output_tokens)
+    for model, input_tokens, output_tokens in usages:
+        cost = estimate_cost(model, input_tokens, output_tokens)
         if cost is None:
             return None
         total += cost
     return round(total, 6)
+
+
+def _sum_tokens(
+    calls: Sequence[StructuredResult[Any]], failed: Sequence[LLMProviderError] = ()
+) -> tuple[int, int]:
+    """Input and output tokens of every call of the turn; a failed call with unknown
+    usage adds nothing (its cost is `None`, see `_sum_cost`).
+    """
+    input_tokens = sum(call.input_tokens for call in calls)
+    output_tokens = sum(call.output_tokens for call in calls)
+    input_tokens += sum(error.input_tokens or 0 for error in failed)
+    output_tokens += sum(error.output_tokens or 0 for error in failed)
+    return input_tokens, output_tokens
 
 
 def _default_resolve_model(name: str) -> Deployment:
@@ -1307,13 +1379,15 @@ class EstimationService:
         options: GenerationOptions,
         start: float,
         review: BossTrace | None = None,
+        failed: Sequence[LLMProviderError] = (),
     ) -> EstimationOutcome:
         """Costs and totals in code -> Markdown render -> evaluation, once per request.
 
         `language` is the effective language of the labels when known; otherwise the
         model's `language` decides (`language_source="llm"`). `calls` are every structured
         call of the request (their tokens and costs are summed); `final_call` is the one
-        that produced `result` (model, provider, fallback).
+        that produced `result` (model, provider, fallback). `failed` are the errors of the
+        review's failed calls, whose usage is summed too (design s05-fix D2).
         """
         effective = language or result.language
         computed = compute_estimate(result, effective)
@@ -1326,6 +1400,7 @@ class EstimationService:
             out_of_scope=computed.out_of_scope,
         )
 
+        input_tokens, output_tokens = _sum_tokens(calls, failed)
         validation = None
         if options.evaluate:
             if computed.out_of_scope:
@@ -1349,9 +1424,9 @@ class EstimationService:
             result=computed,
             model=final_call.model,
             provider=final_call.provider,
-            input_tokens=sum(call.input_tokens for call in calls),
-            output_tokens=sum(call.output_tokens for call in calls),
-            cost_usd=_sum_cost(calls),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=_sum_cost(calls, failed),
             fallback_used=final_call.fallback_used,
             cache_hit=all(call.cache_hit for call in calls),
             latency_ms=_elapsed_ms(start),
@@ -1519,6 +1594,8 @@ class EstimationService:
         calls: list[StructuredResult[Any]] = []
         # Each draft with the call that produced it (model and provider of the final one).
         draft_calls: list[tuple[Draft, StructuredResult[Any]]] = []
+        # Failed calls the review survives (Critic, Actor retries): their usage counts (D2).
+        failed: list[LLMProviderError] = []
         drafts = 0
 
         def actor(feedback: CriticFeedback | None) -> Draft:
@@ -1528,14 +1605,19 @@ class EstimationService:
             with structlog.contextvars.bound_contextvars(
                 llm_purpose="estimation", review_iteration=drafts
             ):
-                structured = self._draft(
-                    system=current.system,
-                    messages=[*history, {"role": "user", "content": current.user}],
-                    output_format=turn.output_format,
-                    detail_level=turn.detail_level,
-                    target=target,
-                    options=options,
-                )
+                try:
+                    structured = self._draft(
+                        system=current.system,
+                        messages=[*history, {"role": "user", "content": current.user}],
+                        output_format=turn.output_format,
+                        detail_level=turn.detail_level,
+                        target=target,
+                        options=options,
+                    )
+                except LLMProviderError as exc:
+                    # The first draft's failure fails the turn; a retry's is survived.
+                    failed.append(exc)
+                    raise
             calls.append(structured)
             effective = language or structured.value.language
             draft = Draft(
@@ -1556,10 +1638,14 @@ class EstimationService:
             )
             if result.call is not None:
                 calls.append(result.call)
+            elif result.failed:
+                # A failed review without its error has an unknown usage.
+                failed.append(result.error or LLMProviderError("unknown"))
             return result
 
         run = run_review(actor, critic_review, max_iterations=review.max_iterations)
         trace = run.trace
+        input_tokens, output_tokens = _sum_tokens(calls, failed)
         logger.info(
             "acb_completed",
             final_decision=trace.final_decision,
@@ -1567,8 +1653,10 @@ class EstimationService:
             iterations=trace.iterations_run,
             llm_calls=trace.llm_calls,
             latency_ms=_elapsed_ms(start),
-            input_tokens=sum(call.input_tokens for call in calls),
-            output_tokens=sum(call.output_tokens for call in calls),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            failed_calls=len(failed),
+            cost_usd=_sum_cost(calls, failed),
         )
         return self._finalize(
             run.final,
@@ -1581,4 +1669,5 @@ class EstimationService:
             options=options,
             start=start,
             review=trace,
+            failed=failed,
         )

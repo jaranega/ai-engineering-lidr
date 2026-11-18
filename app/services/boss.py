@@ -7,7 +7,9 @@ makes no LLM call and no I/O (only the `boss_iteration` log event): the Actor an
 Critic are callables wired by `EstimationService.estimate_turn`, so every branch can be
 tested with doubles.
 
-- An out-of-scope draft (confidence below 30) is accepted without calling the Critic.
+- An out-of-scope first draft (confidence below 30) is accepted without calling the
+  Critic; an out-of-scope retry synthesizes the last in-scope draft instead (design
+  s05-fix D1), so a retry never turns a valid estimate into an out-of-scope notice.
 - `accept` (or a failed Critic, fail-open) accepts; `reject` synthesizes;
   `needs_iteration` asks for another draft while the budget lasts, then synthesizes.
 - A failure of the first draft propagates (the turn fails as without review); an
@@ -59,7 +61,13 @@ __all__ = [
 BossDecision = Literal["accept", "iterate", "synthesize"]
 FinalDecision = Literal["accept", "synthesize"]
 StopReason = Literal[
-    "accepted", "out_of_scope", "critic_failed", "rejected", "budget_exhausted", "actor_failed"
+    "accepted",
+    "out_of_scope",
+    "critic_failed",
+    "rejected",
+    "budget_exhausted",
+    "actor_failed",
+    "retry_out_of_scope",
 ]
 
 # Label of the synthesis warnings, by the effective language of the turn (D6).
@@ -86,8 +94,9 @@ class BossIteration:
     """Trace of one iteration: the draft, the Critic's review and the Boss' decision.
 
     `verdict` and `critic_confidence` are `None` when the Critic was not called (an
-    out-of-scope draft); a failed Critic has `critic_failed=True`, verdict `accept` and
-    confidence 0. `issues` are those of the review, in order (empty without a review).
+    out-of-scope draft: accepted on the first iteration, synthesized away on a retry); a
+    failed Critic has `critic_failed=True`, verdict `accept` and confidence 0. `issues`
+    are those of the review, in order (empty without a review).
     """
 
     iteration: int  # 1-based
@@ -235,22 +244,29 @@ def run_review(actor: Actor, critic: Critic, *, max_iterations: int) -> ReviewRu
         return ReviewRun(final=final, draft=draft, trace=trace)
 
     actor_calls += 1
-    draft = actor(None)  # a failure here is the turn's failure
+    candidate = actor(None)  # a failure here is the turn's failure
+    draft = candidate  # the last in-scope draft once past the first iteration
     for iteration in range(1, max_iterations + 1):
-        estimate = draft.estimate
+        estimate = candidate.estimate
         if estimate.out_of_scope:
+            first = iteration == 1
             entry = BossIteration(
                 iteration=iteration,
                 verdict=None,
                 critic_confidence=None,
                 critic_failed=False,
-                decision="accept",
+                decision="accept" if first else "synthesize",
                 draft_confidence_pct=estimate.confidence_pct,
                 draft_total_hours=estimate.total_hours,
             )
             entries.append(entry)
             _log_iteration(entry, out_of_scope=True)
-            return finish(draft, "accept", "out_of_scope")
+            if first:
+                return finish(candidate, "accept", "out_of_scope")
+            # A retry never discards a valid estimate: keep the last in-scope draft (D1).
+            return finish(draft, "synthesize", "retry_out_of_scope")
+
+        draft = candidate
 
         critic_calls += 1
         review = _as_review(critic(draft))
@@ -274,7 +290,7 @@ def run_review(actor: Actor, critic: Critic, *, max_iterations: int) -> ReviewRu
 
         actor_calls += 1
         try:
-            draft = actor(feedback)
+            candidate = actor(feedback)
         except LLMProviderError:
             # Trying to improve never fails the turn: keep the last valid draft (D5).
             return finish(draft, "synthesize", "actor_failed")

@@ -42,6 +42,7 @@ ACB_STOP_REASON_LABELS = {
     "rejected": "el revisor la rechazó",
     "budget_exhausted": "se agotaron las iteraciones",
     "actor_failed": "falló un reintento",
+    "retry_out_of_scope": "un reintento salió fuera de alcance",
 }
 ACB_VERDICT_LABELS = {
     "accept": "Aceptar",
@@ -49,7 +50,8 @@ ACB_VERDICT_LABELS = {
     "reject": "Rechazar",
 }
 REVIEW_HELP = (
-    "El turno tarda más y cuesta más: hasta 3 borradores, cada uno con una revisión. Solo con v6."
+    "El turno tarda más y cuesta más: varios borradores (hasta BOSS_MAX_ITERATIONS, "
+    "3 por defecto), cada uno con una revisión. Solo con v6."
 )
 TIERS = {
     "executive": "Dirección (ejecutivo)",
@@ -477,8 +479,33 @@ def render_sidebar(base_url: str, info: dict | None) -> None:
             st.rerun()
 
 
+def render_advanced_options() -> tuple[str, str | None, bool]:
+    """Paint the options outside the form so they react to the selected prompt version."""
+    with st.expander("Opciones avanzadas"):
+        prompt_version = st.selectbox(
+            "Versión del prompt",
+            SESSION_PROMPT_VERSIONS,
+            index=SESSION_PROMPT_VERSIONS.index(DEFAULT_PROMPT_VERSION),
+            key="prompt_version",
+        )
+        tier = st.selectbox(
+            "Audiencia",
+            [None, *TIERS],
+            format_func=lambda value: AUTO_AUDIENCE_LABEL if value is None else TIERS[value],
+            key="tier",
+            help="Solo con v5 o v6",
+        )
+        if tier is not None and prompt_version not in AUDIENCE_PROMPT_VERSIONS:
+            st.warning(f"La audiencia no se enviará: {prompt_version} no la admite (solo v5 o v6).")
+        review = st.checkbox("Revisión Actor-Critic-Boss", key="review", help=REVIEW_HELP)
+        if review and prompt_version != REVIEW_PROMPT_VERSION:
+            st.warning(f"La revisión no se enviará: {prompt_version} no la admite (solo v6).")
+    return prompt_version, tier, review
+
+
 def render_form() -> TurnForm | None:
     """Paint the form; return the submitted values, or None if it was not submitted."""
+    prompt_version, tier, review = render_advanced_options()
     with st.form("estimation_form"):
         transcript = st.text_area(
             "Transcripción",
@@ -514,31 +541,6 @@ def render_form() -> TurnForm | None:
             accept_multiple_files=True,
             key=f"uploads-{st.session_state.uploader_key}",
         )
-        with st.expander("Opciones avanzadas"):
-            prompt_version = st.selectbox(
-                "Versión del prompt",
-                SESSION_PROMPT_VERSIONS,
-                index=SESSION_PROMPT_VERSIONS.index(DEFAULT_PROMPT_VERSION),
-                key="prompt_version",
-            )
-            # Widgets in a form only update on submit, so this follows the last submitted version.
-            last_version = st.session_state.get("prompt_version")
-            audience_enabled = last_version in AUDIENCE_PROMPT_VERSIONS
-            tier = st.selectbox(
-                "Audiencia",
-                [None, *TIERS],
-                format_func=lambda value: AUTO_AUDIENCE_LABEL if value is None else TIERS[value],
-                key="tier",
-                disabled=not audience_enabled,
-                help=None if audience_enabled else "Solo con v5 o v6",
-            )
-            review = st.checkbox(
-                "Revisión Actor-Critic-Boss",
-                value=False,
-                key="review",
-                disabled=last_version not in (None, REVIEW_PROMPT_VERSION),
-                help=REVIEW_HELP,
-            )
         submitted = st.form_submit_button("Enviar")
     if not submitted:
         return None
