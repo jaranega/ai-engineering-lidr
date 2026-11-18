@@ -55,6 +55,12 @@ REQUIRED_FILES = [
     "evals/metrics.py",
     "evals/run.py",
     "evals/golden_dataset.json",
+    "evals/stress/__init__.py",
+    "evals/stress/scenarios.py",
+    "evals/stress/metrics.py",
+    "evals/stress/run.py",
+    "evals/stress/report.py",
+    "evals/stress/fixtures/build_pdfs.py",
     "app/prompts/conversation_summary/v1/system.j2",
     "app/prompts/conversation_summary/v1/user.j2",
     "app/prompts/anchor_classifier/v1/system.j2",
@@ -430,3 +436,24 @@ def test_boss_does_not_import_the_llm_service():
     references it under TYPE_CHECKING, for annotations).
     """
     assert "app.services.llm_service" not in _imported_modules(REPO_ROOT / "app/services/boss.py")
+
+
+def test_stress_test_deliverables_exist():
+    """cag-stress-test / Scenario: Entregables y ci-pipeline / Scenario: Falta el informe."""
+    report = REPO_ROOT / "evals/stress/REPORT.md"
+    results = REPO_ROOT / "evals/stress/results.csv"
+    assert report.is_file(), "Missing required file: evals/stress/REPORT.md"
+    assert results.is_file(), "Missing required file: evals/stress/results.csv"
+    assert len(results.read_text(encoding="utf-8").splitlines()) - 1 >= 50  # header excluded
+
+
+def test_stress_test_pdf_fixtures_are_gitignored():
+    """ci-pipeline / Requirement: `evals/stress/fixtures/*.pdf` ignorado por git."""
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "evals/stress/fixtures/attach_20kb.pdf"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, "evals/stress/fixtures/*.pdf must be gitignored"

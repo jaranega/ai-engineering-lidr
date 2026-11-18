@@ -15,7 +15,7 @@ Sessions are volatile: in process memory, lost on restart, one store per process
 import hashlib
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Annotated
 
@@ -44,7 +44,7 @@ from app.services.llm_service import (
 )
 from app.services.memory import MemoryCompression, get_memory_compression
 from app.sessions.metadata import update_project_metadata
-from app.sessions.models import LastReview, ProjectMetadata, Session
+from app.sessions.models import LastReview, ProjectMetadata, Session, TurnObservation
 from app.sessions.store import SessionStore, short_id
 from app.sessions.tier import Tier, TierDecision, TierRule, resolve_tier
 
@@ -52,11 +52,13 @@ logger = structlog.get_logger(__name__)
 
 __all__ = [
     "LastReview",
+    "SessionDebugSnapshot",
     "SessionService",
     "SessionSnapshot",
     "SessionTurnOutcome",
     "Tier",
     "TierRule",
+    "TurnObservation",
     "get_session_service",
     "get_session_store",
 ]
@@ -82,6 +84,22 @@ class SessionSnapshot:
     last_tier_rule: TierRule | None = None
     # Review of the last successful turn; None when it was not reviewed (or no turn yet).
     last_review: LastReview | None = None
+
+
+@dataclass(frozen=True)
+class SessionDebugSnapshot:
+    """Debug view of a session for `GET /api/v1/sessions/{id}/debug` (design s06 D2).
+
+    Unlike `SessionSnapshot`, it carries client text (the summary and the anchors'
+    stored `user` messages, attachments as `[…]`): only for the debug endpoint, which is
+    off by default, and never for logs.
+    """
+
+    session_id: str
+    last_observation: TurnObservation | None  # None before the first successful turn
+    summary: str | None  # cumulative summary text; None without one
+    anchors: tuple[str, ...]  # stored `user` message of each anchor, oldest first
+    project_metadata: ProjectMetadata
 
 
 @dataclass(frozen=True)
@@ -152,6 +170,21 @@ class SessionService:
             last_review=session.last_review,
         )
 
+    def debug(self, session_id: str) -> SessionDebugSnapshot:
+        """Debug snapshot of the session (refreshes its recency like `info`, nothing
+        else); `SessionNotFoundError`. Read without the turn lock: every field read is
+        replaced whole by the turn, so it is either the previous or the new state.
+        """
+        session = self._store.get(session_id)
+        history = session.history
+        return SessionDebugSnapshot(
+            session_id=session.session_id,
+            last_observation=session.last_observation,
+            summary=history.summary,
+            anchors=tuple(anchor.turn.user for anchor in history.anchors),
+            project_metadata=session.project_metadata,
+        )
+
     def estimate(
         self,
         session_id: str,
@@ -176,8 +209,11 @@ class SessionService:
         Actor-Critic-Boss review with the service's `ReviewConfig` (`InvalidOptionError` on
         `review` with a prompt version without `<critic_feedback>`, before the tier and
         the attachments); the session stores `last_review` (None for a turn without
-        review). Every event of the turn carries the short session id.
+        review). Every event of the turn carries the short session id. After the
+        compression, the turn's `TurnObservation` is stored in `last_observation` and
+        logged as `turn_observed` (design s06 D1); a failed turn emits neither.
         """
+        start = time.perf_counter()
         options = options or GenerationOptions(prompt_version=DEFAULT_SESSION_PROMPT_VERSION)
         with (
             self._store.turn(session_id) as session,
@@ -237,6 +273,15 @@ class SessionService:
             session.updated_at = self._clock()
             self._compress(session)
             metadata = session.project_metadata
+            observation = _observe(
+                session,
+                transcript_chars=len(turn.transcript),
+                attachments_chars=result.attachments_chars,
+                outcome=outcome,
+                tier=decision.tier,
+                latency_ms=int((time.perf_counter() - start) * 1000),
+            )
+            session.last_observation = observation
             logger.info(
                 "session_turn_completed",
                 turn=session.turn_count,
@@ -256,6 +301,14 @@ class SessionService:
                 review_decision=trace.final_decision if trace is not None else None,
                 constraints=len(metadata.explicit_constraints),
                 rejected=len(metadata.rejected_options),
+            )
+            # Numbers and ids only: never client, summary nor estimate text (design s06 D1).
+            logger.info(
+                "turn_observed",
+                **{
+                    **asdict(observation),
+                    "last_resolved_tier": observation.last_resolved_tier.value,
+                },
             )
             return SessionTurnOutcome(
                 outcome=outcome,
@@ -305,6 +358,34 @@ class SessionService:
             ),
             latency_ms=int((time.perf_counter() - start) * 1000),
         )
+
+
+def _observe(
+    session: Session,
+    *,
+    transcript_chars: int,
+    attachments_chars: int,
+    outcome: EstimationOutcome,
+    tier: Tier,
+    latency_ms: int,
+) -> TurnObservation:
+    """Observation of the turn just stored and compressed (design s06 D1)."""
+    history = session.history
+    return TurnObservation(
+        turn_index=session.turn_count,
+        session_id=short_id(session.session_id),
+        enriched_transcript_chars=transcript_chars + attachments_chars,
+        attachments_total_chars=attachments_chars,
+        messages_in_window=len(history.to_messages()),
+        anchors_count=len(history.anchors),
+        summary_chars=len(history.summary or ""),
+        tokens_in=outcome.input_tokens,
+        tokens_out=outcome.output_tokens,
+        cost_usd=outcome.cost_usd,
+        latency_ms=latency_ms,
+        cache_hit_kind="exact" if outcome.cache_hit else "none",
+        last_resolved_tier=tier,
+    )
 
 
 def _resolve_tier(

@@ -11,6 +11,7 @@ Proyecto del programa **AI-Engineering 2026/10 (LIDR)**. Servicio que recibe la 
 | S04 | Del chat a la interfaz de producto: formulario tipado y prompts Jinja2 versionados | `session-04` |
 | S05 | Puesta al día con el directo de S04 (salida estructurada y guardrails) y memoria conversacional con adjuntos | `session-05` |
 | S05 directo | Memoria con anclas y resumen acumulativo, tier de audiencia dinámico, Actor-Critic-Boss opcional y evals deterministas (puesta al día antes de S06) | `session-06` |
+| S06 | Stress test del CAG: observación por turno (`turn_observed`), escenarios de carga y [`evals/stress/REPORT.md`](evals/stress/REPORT.md) con `results.csv` | `session-06` |
 
 ## Arquitectura
 
@@ -181,6 +182,7 @@ cp .env.example .env
 | `COMPRESSION_MODEL` | No | vacío (= primario con fallback) | Modelo del resumen acumulativo y del clasificador de anclas; si se fija y no se puede usar, la API no arranca |
 | `CRITIC_MODEL` | No | vacío (= primario con fallback) | Modelo del Critic de la revisión Actor-Critic-Boss; si se fija y no se puede usar, la API no arranca |
 | `BOSS_MAX_ITERATIONS` | No | `3` | Borradores máximos (1–5) de una revisión Actor-Critic-Boss; cada uno lleva una llamada al Critic |
+| `DEBUG_ENDPOINTS` | No | `false` | Monta `GET /api/v1/sessions/{id}/debug` (última observación, texto del resumen, anclas y metadata) para el stress test. **Expone texto del cliente: nunca en producción** |
 | `MAX_SESSIONS` | No | `1000` | Sesiones en memoria; al llenarse se desaloja la usada hace más tiempo |
 | `MAX_ATTACHMENTS` | No | `5` | Adjuntos por turno |
 | `MAX_ATTACHMENT_BYTES` | No | `10485760` | Tamaño máximo de cada adjunto (10 MiB) |
@@ -553,6 +555,19 @@ uv run python -m evals.run --http http://localhost:8000 --case case-002-es-app-g
 
 Cada caso usa una sesión nueva. La salida es una línea por caso (latencia, coste, PASS/FAIL por métrica y, en `acb`, la decisión) y un resumen; el código de salida es 0 si todo pasa. **Hace llamadas reales** (≈ 0,02 USD en `actor` y hasta 6 veces más en `acb` con gpt-4o-mini), por eso no corre en CI ni en pytest; vacía `REDIS_URL` para no medir aciertos de caché. `MetricResult` y `run_all_metrics` son la base que amplía el ejercicio de S06.
 
+## Stress test del CAG (S06)
+
+Mide dónde rompe el CAG antes de pasar a RAG. Cada turno de sesión registra un único evento `turn_observed` (13 campos numéricos: turno, caracteres de transcripción y adjuntos, mensajes en la ventana, anclas, longitud del resumen, tokens, coste, latencia, tipo de acierto de caché y tier; el `session_id` va corto) y lo guarda como `last_observation`. `evals/stress/` lanza tres conversaciones de 20 turnos (**crece**: "Nimbus" acumula requisitos; **pivota**: de React Native a Flutter en el turno 5; **se contradice**: presupuesto de 30.000 € en el turno 3 y de 80.000 € en el 8) y una estimación con PDF de 0, 5, 20, 50 y 100 KB, y mide tres métricas deterministas: presupuesto de latencia (10 s), de coste (0,003 USD por turno) y deriva de memoria (los hechos declarados siguen en el resumen, las anclas o la metadata).
+
+```bash
+REDIS_URL= uv run python -m evals.stress.run --repeats 3 --output evals/stress/results.csv --max-cost-usd 0.60   # en proceso
+DEBUG_ENDPOINTS=true uv run uvicorn app.main:app &  # o por HTTP, con el endpoint de depuración activo
+uv run python -m evals.stress.run --http http://localhost:8000 --scenarios growing --turns 3 --repeats 1 --attachment-sizes 0
+uv run python -m evals.stress.report evals/stress/results.csv   # tablas del informe
+```
+
+Los PDF se generan con `fpdf2` (grupo `dev`) y no se commitean. Los entregables son [`evals/stress/REPORT.md`](evals/stress/REPORT.md) y `evals/stress/results.csv`.
+
 ## Tests y calidad
 
 ```bash
@@ -567,6 +582,14 @@ Los tests de `tests/prompts/` comprueban los templates sin llamar al modelo (los
 Los tests no usan API keys reales ni hacen llamadas de red: el proveedor se sustituye por un doble mediante `dependency_overrides` en la API, y en la app Streamlit, que se ejecuta sin navegador con `streamlit.testing.v1.AppTest`, con `httpx.Client` sustituido por un transporte simulado. El proveedor LiteLLM se prueba con un doble del Router y con tests de contrato sobre un `Router` real con `mock_response`; Redis se sustituye por `fakeredis`. Un fixture bloquea cualquier conexión de red y los tests no leen el `.env` local. La CI (`.github/workflows/ci.yml`) ejecuta en cada push y PR: `uv sync --locked`, ruff (lint y formato), pytest y `openspec validate --all --strict`, y en paralelo un job `docker` con `docker build` y `docker compose config`.
 
 ## Desviaciones respecto al enunciado
+
+### S06 (stress test del CAG)
+
+- `turn_observed` se emite en `SessionService.estimate` (aquí no existe `estimate_conversational()`), tras la compresión, con el `session_id` corto: el completo da acceso a la sesión y no se registra.
+- El estado de la memoria se lee con un endpoint de depuración desactivado por defecto (`DEBUG_ENDPOINTS`), para que `MemoryDriftMetric` funcione también con `--http`.
+- Matriz reducida: los perfiles multi-turno no se cruzan con los tamaños de adjunto (≈195 filas en lugar de ≈900); N ∈ {1, 3, 6, 10, 20} se lee en el turno N de cada conversación de 20.
+- Sin Redis ni caché semántica: `cache_hit_kind` solo puede ser `none` o `exact`.
+- El PDF de 100 KB no se trunca: nuestro extractor lo rechaza con 413 `too_much_text` (falla duro); se mide tal cual, sin cambiar el extractor.
 
 ### S05 directo (memoria con anclas, tier dinámico, Actor-Critic-Boss y evals; puesta al día en `session-06`)
 

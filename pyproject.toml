@@ -30,6 +30,7 @@ pythonpath = ["."]
 [dependency-groups]
 dev = [
     "fakeredis>=2.40.0",
+    "fpdf2>=2.9.0",
     "pytest>=9.1.1",
     "ruff>=0.17.1",
 ]

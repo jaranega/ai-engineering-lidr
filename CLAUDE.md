@@ -14,7 +14,8 @@ Es el "Proyecto 1" del programa AI Engineering de LIDR y **evoluciona sesión a 
 | S04 | Formulario tipado (Pydantic + enums), prompts Jinja2 versionados (`prompts/estimation/v1/`), tests de templates | `session-04` |
 | S05 | Puesta al día con el directo de S04 (salida estructurada con Instructor, guardrails de entrada) y ejercicio: sesiones con memoria conversacional (ventana deslizante + `project_metadata`) y adjuntos PDF/DOCX | `session-05` |
 | S05 directo | Puesta al día con el directo de S05: memoria con anclas y resumen acumulativo (`app/sessions/compression/`, `app/services/memory.py`) y tier de audiencia dinámico (`app/sessions/tier.py`), prompt `v5`; Actor-Critic-Boss opcional (`app/services/{critic,boss}.py`, prompt `v6`) y evals deterministas (`evals/`) | `session-06` |
-| S06+ | Contexto dinámico, prompts adaptativos, evaluación, RAG… | — |
+| S06 | Stress test del CAG: evento `turn_observed`, endpoint de depuración opcional (`DEBUG_ENDPOINTS`) y `evals/stress/` (escenarios, PDF sintéticos, métricas de presupuesto y deriva, runner CSV e informe `REPORT.md`) | `session-06` |
+| S07+ | RAG, recuperación, evaluación… | — |
 
 Enunciados y material de referencia: `/Users/javiaranega/claude/AIEngineer-notas/` (carpeta por módulo, `00_ejercicio-*.md` es el enunciado de cada sesión).
 Las notas son de otra edición (2026/09) pero el contenido es el mismo: **ignorar sus fechas límite y los destinatarios de email** que aparecen en ellas.
@@ -95,6 +96,7 @@ app/
 ├── prompts/         # loader.py + templates Jinja2 versionados (estimation/v3 para /estimate, v6 para sesiones y v4/v5 conservadas; conversation_summary/v1 y anchor_classifier/v1 para la memoria; critic/v1 para el Critic)
 └── context/         # Datos estáticos inyectados en el prompt (CAG)
 evals/               # Evals deterministas fuera de app/: golden dataset, métricas (MetricResult) y runner CLI (python -m evals.run); llaman a la API real, nunca en CI
+                     # evals/stress/: stress test del CAG (S06): escenarios, PDF (fpdf2), métricas de latencia/coste/deriva, runner CSV y report.py
 ```
 
 - Routers **no** llaman a SDKs de LLM directamente; dependen de `services/` vía `Depends` (facilita mocks en tests).

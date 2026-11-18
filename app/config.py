@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     structured_max_retries: int = Field(default=2, ge=0, le=5)
     moderation_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"
+    debug_endpoints: bool = False
     cache_ttl: int = Field(default=86400, gt=0)
     max_conversation_turns: int = Field(default=6, ge=1, le=50)
     max_sessions: int = Field(default=1000, ge=1, le=100_000)

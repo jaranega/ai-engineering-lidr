@@ -25,11 +25,13 @@ from app.schemas import (
     ReviewSummary,
     ReviewTrace,
     SessionCreated,
+    SessionDebug,
     SessionErrorResponse,
     SessionEstimateResponse,
     SessionGuardrailErrorResponse,
     SessionInfo,
     Tier,
+    TurnObservationOut,
 )
 from app.services.llm_service import (
     DEFAULT_SESSION_PROMPT_VERSION,
@@ -46,6 +48,18 @@ from app.sessions import SessionBusyError, SessionNotFoundError
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+
+
+def _debug_enabled() -> bool:
+    try:
+        return get_settings().debug_endpoints
+    except ValidationError:
+        return False
+
+
+def require_debug_enabled(settings: Annotated[Settings, Depends(get_settings)]) -> None:
+    if not settings.debug_endpoints:
+        raise HTTPException(status_code=404, detail="Not Found")
 
 
 def _drop_blank_parts(value: object) -> object:
@@ -172,6 +186,32 @@ def get_session(
             if snapshot.last_review
             else None
         ),
+    )
+
+
+@router.get(
+    "/{session_id}/debug",
+    response_model=SessionDebug,
+    summary="Debug snapshot of a session (only with DEBUG_ENDPOINTS=true)",
+    include_in_schema=_debug_enabled(),
+    dependencies=[Depends(require_debug_enabled)],
+    responses={404: {"model": SessionErrorResponse, "description": "Session not found."}},
+)
+def debug_session(
+    session_id: UUID,
+    service: Annotated[SessionService, Depends(get_session_service)],
+) -> SessionDebug:
+    try:
+        snap = service.debug(str(session_id))
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
+    obs = snap.last_observation
+    return SessionDebug(
+        session_id=snap.session_id,
+        last_observation=TurnObservationOut(**vars(obs)) if obs else None,
+        summary=snap.summary,
+        anchors=list(snap.anchors),
+        project_metadata=snap.project_metadata,
     )
 
 

@@ -22,3 +22,6 @@ build/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Stress-test generated fixtures
+evals/stress/fixtures/*.pdf
