@@ -7,14 +7,14 @@ import threading
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain import ChatMessage, Language
 
 if TYPE_CHECKING:  # `tier` imports this module; the annotation only needs the name
-    from app.sessions.tier import TierDecision
+    from app.sessions.tier import Tier, TierDecision
 
 # Maximum length of the cumulative conversation summary (~500 tokens, design s05-memory D6).
 # A constant, not configuration; the summarizer's normalizer cuts to it.
@@ -233,6 +233,32 @@ class LastReview:
     iterations_run: int
 
 
+# Where the result of a turn came from: the exact-match cache or a fresh generation.
+# "semantic" is reserved: there is no semantic cache yet (design s06 D1).
+CacheHitKind = Literal["none", "exact", "semantic"]
+
+
+@dataclass(frozen=True)
+class TurnObservation:
+    """Observation of a successful session turn (design s06 D1): the 13 fields of the
+    `turn_observed` event, with the same names. Numbers and identifiers only, never text.
+    """
+
+    turn_index: int  # 1-based ordinal of the turn in the session
+    session_id: str  # short id (first 8 chars), never the full id: it grants access
+    enriched_transcript_chars: int  # transcript + masked attachment text
+    attachments_total_chars: int  # masked attachment text; 0 without attachments
+    messages_in_window: int  # anchor + window messages after the compression
+    anchors_count: int
+    summary_chars: int  # 0 without a summary
+    tokens_in: int  # summed over every call of the turn (review included)
+    tokens_out: int
+    cost_usd: float | None  # None when any call has no known price
+    latency_ms: int  # whole `SessionService.estimate`, compression included
+    cache_hit_kind: CacheHitKind
+    last_resolved_tier: "Tier"  # tier applied to the turn
+
+
 @dataclass(eq=False)
 class Session:
     """In-process conversation state. Volatile by design (S05 exercise): lost on restart and
@@ -250,6 +276,8 @@ class Session:
     last_tier: "TierDecision | None" = None  # tier of the last successful turn
     # Review of the last successful turn; None when that turn was not reviewed.
     last_review: LastReview | None = None
+    # Observation of the last successful turn (design s06 D1); None before the first.
+    last_observation: TurnObservation | None = None
     turn_count: int = 0  # successful turns, including those out of the window
     created_at: float = 0.0  # time.monotonic()
     updated_at: float = 0.0

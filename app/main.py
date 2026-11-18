@@ -30,6 +30,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     get_llm_provider()
     if settings.fallback is None:
         logger.warning("llm_fallback_disabled", reason=settings.fallback_disabled_reason)
+    if settings.debug_endpoints:
+        logger.warning("debug_endpoints_enabled")
     yield
 
 

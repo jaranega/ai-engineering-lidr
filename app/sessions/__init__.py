@@ -16,11 +16,13 @@ from app.sessions.metadata import (
 from app.sessions.models import (
     SUMMARY_MAX_CHARS,
     Anchor,
+    CacheHitKind,
     ConversationHistory,
     LastReview,
     ProjectMetadata,
     Session,
     Turn,
+    TurnObservation,
 )
 from app.sessions.store import SessionBusyError, SessionNotFoundError, SessionStore
 from app.sessions.tier import Tier, TierDecision, TierRule, resolve_tier
@@ -31,6 +33,7 @@ __all__ = [
     "MAX_METADATA_TECHNOLOGIES",
     "SUMMARY_MAX_CHARS",
     "Anchor",
+    "CacheHitKind",
     "ConversationHistory",
     "LastReview",
     "ProjectMetadata",
@@ -42,6 +45,7 @@ __all__ = [
     "TierDecision",
     "TierRule",
     "Turn",
+    "TurnObservation",
     "merge_technologies",
     "merge_unique",
     "resolve_tier",

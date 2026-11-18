@@ -223,6 +223,30 @@ class SessionInfo(BaseModel):
     )
 
 
+class TurnObservationOut(BaseModel):
+    turn_index: int
+    session_id: str
+    enriched_transcript_chars: int
+    attachments_total_chars: int
+    messages_in_window: int
+    anchors_count: int
+    summary_chars: int
+    tokens_in: int
+    tokens_out: int
+    cost_usd: float | None
+    latency_ms: int
+    cache_hit_kind: Literal["none", "exact", "semantic"]
+    last_resolved_tier: Tier
+
+
+class SessionDebug(BaseModel):
+    session_id: str
+    last_observation: TurnObservationOut | None
+    summary: str | None
+    anchors: list[str]
+    project_metadata: ProjectMetadata
+
+
 class SessionEstimateResponse(EstimationResponse):
     session_id: str
     turn: int = Field(description="Ordinal of this turn (== turn_count after it).")

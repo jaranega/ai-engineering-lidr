@@ -1200,10 +1200,14 @@ def _block(
 class TurnOutcome:
     """Result of one session turn (S05 design D6): the estimation outcome plus the `user`
     message to store in the history (each attachment's text replaced by `[…]`).
+
+    `attachments_chars` is the length of the attachments' text sent to the LLM, after
+    the PII masking (names excluded); 0 without attachments (design s06 D1).
     """
 
     outcome: EstimationOutcome
     history_user: str
+    attachments_chars: int = 0
 
 
 def _masked(attachments: Sequence[ExtractedAttachment]) -> list[tuple[str, str]]:
@@ -1506,6 +1510,7 @@ class EstimationService:
         )
         masked = _masked(attachments)
         self._screen_turn(turn.transcript, masked)
+        attachments_chars = sum(len(text) for _, text in masked)
 
         detected = detect_language(turn.transcript)
         language = detected or session_language
@@ -1543,7 +1548,11 @@ class EstimationService:
                 options=options,
                 start=start,
             )
-            return TurnOutcome(outcome=outcome, history_user=prompt.history_user)
+            return TurnOutcome(
+                outcome=outcome,
+                history_user=prompt.history_user,
+                attachments_chars=attachments_chars,
+            )
 
         outcome = self._reviewed(
             turn,
@@ -1561,7 +1570,9 @@ class EstimationService:
             start=start,
         )
         # The history keeps the turn as the client wrote it: never the feedback.
-        return TurnOutcome(outcome=outcome, history_user=prompt.history_user)
+        return TurnOutcome(
+            outcome=outcome, history_user=prompt.history_user, attachments_chars=attachments_chars
+        )
 
     def _reviewed(
         self,
