@@ -76,6 +76,18 @@ def _rules(*rules: tuple[str, str]) -> tuple[tuple[str, re.Pattern[str]], ...]:
     return tuple((rule_id, re.compile(pattern)) for rule_id, pattern in rules)
 
 
+# Tags of the prompts themselves, opened or closed, in lowercase (the injection rules see
+# normalized text). Shared with `app.services.memory.normalize_summary`, which strips
+# them from the cumulative summary (design s05-fix D5): a tag added here is covered there.
+PROMPT_TAG_PATTERN = (
+    r"<\s*/?\s*(project_description|project_type|reference_projects?|examples?"
+    r"|example_output|example_request|client_request|system|assistant"
+    r"|transcript|attachments?|project_metadata|conversation_summary|audience"
+    r"|previous_summary|project_context|turns|client_message"
+    # Actor-Critic-Boss prompts: a client must not fake an auditor's feedback.
+    r"|critic_feedback|estimation_under_review|resolved_tier|response_language)\s*>"
+)
+
 # Matched against normalized text: lowercase, no accents, single spaces.
 INJECTION_RULES = _rules(
     (
@@ -117,12 +129,7 @@ INJECTION_RULES = _rules(
     ("es_nuevas_instrucciones", r"\bnuevas instrucciones ?:"),
     ("es_no_sigas", r"\bno sigas (las|tus) instrucciones\b"),
     # Tags of the prompt itself, opened or closed, in any language.
-    (
-        "prompt_tag",
-        r"<\s*/?\s*(project_description|project_type|reference_projects?|examples?"
-        r"|example_output|example_request|client_request|system|assistant"
-        r"|transcript|attachments?|project_metadata)\s*>",
-    ),
+    ("prompt_tag", PROMPT_TAG_PATTERN),
 )
 
 # Matched against the original text.

@@ -32,10 +32,18 @@ from app.guardrails.input import GuardrailReason
 from app.main import app
 from app.prompts.loader import DEFAULT_SESSION_PROMPT_VERSION, SESSION_PROMPT_VERSIONS
 from app.services import llm_service
+from app.services import memory as memory_module
 from app.services import session_service as session_service_module
 from app.services.moderation import get_moderator
+from app.sessions.tier import Tier, TierRule
 from tests.attachments.factories import DOCX_MIME, PDF_MIME, make_pdf
-from tests.conftest import FakeModerator, FakeProvider, make_settings, out_of_scope_payload
+from tests.conftest import (
+    FakeModerator,
+    FakeProvider,
+    make_fake_compression,
+    make_settings,
+    out_of_scope_payload,
+)
 
 APP_PATH = Path(__file__).resolve().parent.parent / "streamlit_app.py"
 BASE_URL = "http://api.test"
@@ -81,7 +89,9 @@ METADATA = {
 RESPONSE = {
     "text": "## Estimación: Gimnasio\n\nTEXTO-DE-LA-ESTIMACION",
     "result": {"out_of_scope": False, "total_hours": 120, "total_cost_eur": 7500.0},
-    "prompt_version": "v4",
+    "prompt_version": "v5",
+    "tier": "executive",
+    "tier_rule": "nda_detected",
     "model": "gpt-4o-mini",
     "provider": "openai",
     "input_tokens": 1200,
@@ -229,15 +239,24 @@ def submit(
     project_type: str | None = None,
     detail_level: str | None = None,
     output_format: str | None = None,
+    prompt_version: str | None = None,
+    audience: str | None = None,
+    review: bool | None = None,
 ) -> AppTest:
     """Fill the form and press "Enviar" in the same run (a run in between loses the text)."""
     at.text_area[0].set_value(transcript)
+    if prompt_version is not None:
+        at.selectbox[0].set_value(prompt_version)
+    if audience is not None:
+        at.selectbox[1].set_value(audience)
+    if review is not None:
+        at.checkbox[0].set_value(review)
     if project_type is not None:
-        at.selectbox[0].set_value(project_type)
+        at.selectbox[2].set_value(project_type)
     if detail_level is not None:
         at.radio[0].set_value(detail_level)
     if output_format is not None:
-        at.selectbox[1].set_value(output_format)
+        at.selectbox[3].set_value(output_format)
     if files:
         at.file_uploader[0].set_value(list(files))
     submit_button(at).click().run()
@@ -312,36 +331,48 @@ def test_app_starts_with_the_form_defaults_and_the_attachment_selector(api):
     assert at.title[0].value == "Estimador de software"
     assert len(at.chat_message) == 0
     assert at.text_area[0].label == "Transcripción" and at.text_area[0].value == ""
-    assert at.selectbox[0].label == "Tipo de proyecto"
+    assert at.selectbox[2].label == "Tipo de proyecto"
     assert at.radio[0].label == "Nivel de detalle" and at.radio[0].value == "medium"
-    assert at.selectbox[1].label == "Formato de salida" and at.selectbox[1].value == "line_items"
+    assert at.selectbox[3].label == "Formato de salida" and at.selectbox[3].value == "line_items"
     uploader = at.file_uploader[0]
     assert uploader.label == "Adjuntos" and uploader.accept_multiple_files
     assert [t.lstrip(".") for t in uploader.allowed_type] == ["pdf", "docx"]
     assert at.expander[0].label == "Opciones avanzadas"
-    assert at.selectbox[2].value == "v4" and list(at.selectbox[2].options) == ["v4"]
+    assert at.selectbox[0].label == "Versión del prompt"
+    assert at.selectbox[0].value == "v6" and list(at.selectbox[0].options) == ["v6", "v5", "v4"]
+    assert at.selectbox[1].label == "Audiencia"
+    assert at.selectbox[1].value is None  # "Automático" (no tier is sent)
+    assert list(at.selectbox[1].options) == [
+        "Automático",
+        "Dirección (ejecutivo)",
+        "Gestión (PM)",
+        "Técnica (desarrollo)",
+        "Sin adaptar",
+    ]
+    assert not at.selectbox[1].disabled
     assert submit_button(at).label == "Enviar"
     assert api.estimates == []
 
 
 def test_the_selectors_offer_the_expected_labels(api):
     at = run_app()
-    assert list(at.selectbox[0].options) == [
+    assert list(at.selectbox[2].options) == [
         "App móvil",
         "SaaS web",
         "Herramienta interna",
         "Pipeline de datos",
     ]
     assert list(at.radio[0].options) == ["Resumen", "Medio", "Detallado"]
-    assert list(at.selectbox[1].options) == ["Tabla por fases", "Partidas", "Narrativa"]
+    assert list(at.selectbox[3].options) == ["Tabla por fases", "Partidas", "Narrativa"]
 
 
 def test_the_form_exposes_only_the_agreed_widgets(api):
     """Requirement: sin `reference_projects` ni los demás parámetros de generación."""
     at = run_app()
-    assert len(at.text_area) == 1 and len(at.selectbox) == 3 and len(at.radio) == 1
+    assert len(at.text_area) == 1 and len(at.selectbox) == 4 and len(at.radio) == 1
+    assert [c.label for c in at.checkbox] == ["Revisión Actor-Critic-Boss"]
     assert len(at.file_uploader) == 1
-    for empty in (at.text_input, at.number_input, at.slider, at.checkbox, at.toggle):
+    for empty in (at.text_input, at.number_input, at.slider, at.toggle):
         assert len(empty) == 0
 
 
@@ -360,7 +391,7 @@ def test_submit_posts_multipart_with_exact_enum_values_and_the_attachment(api):
     (request,) = api.estimates
     session_id = api.created[0]
     assert request.method == "POST"
-    assert str(request.url) == f"{BASE_URL}{SESSION_PATH}/{session_id}/estimate?prompt_version=v4"
+    assert str(request.url) == f"{BASE_URL}{SESSION_PATH}/{session_id}/estimate?prompt_version=v6"
     assert request.headers["content-type"].startswith("multipart/form-data")
     fields, files = parse_multipart(request)
     assert fields == {
@@ -370,6 +401,34 @@ def test_submit_posts_multipart_with_exact_enum_values_and_the_attachment(api):
         "output_format": "phases_table",
     }
     assert files == [{"name": "spec.pdf", "type": "application/pdf", "content": pdf}]
+
+
+def test_automatic_audience_sends_no_tier_and_explicit_audience_sends_it_with_v6(api):
+    """Scenarios: Envío tipado con adjuntos (sin tier), Audiencia explícita."""
+    at = submit(run_app())
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "tier" not in fields
+    submit(at, "Otro mensaje.", audience="developer")
+    fields, _ = parse_multipart(api.estimates[1])
+    assert fields["tier"] == "developer"
+    assert api.estimates[1].url.params["prompt_version"] == "v6"
+
+
+@pytest.mark.parametrize("audience", ["executive", "developer", "default"])
+def test_explicit_audience_with_v4_never_sends_tier(api, audience):
+    """Scenario: Audiencia con v4."""
+    at = submit(run_app(), prompt_version="v4", audience=audience)
+    assert not at.exception
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "tier" not in fields
+    assert api.estimates[0].url.params["prompt_version"] == "v4"
+
+
+def test_the_audience_selector_stays_enabled_and_help_says_v5_or_v6(api):
+    """Scenario: Audiencia con v4 (selector deshabilitado con la indicación Solo con v5 o v6)."""
+    at = submit(run_app(), prompt_version="v4")
+    assert not at.selectbox[1].disabled
+    assert at.selectbox[1].proto.help == "Solo con v5 o v6"
 
 
 def test_docx_attachment_goes_with_the_word_mime_type(api):
@@ -397,11 +456,11 @@ def test_the_selectors_keep_their_value_between_turns(api):
     at = submit(
         run_app(), project_type="data_pipeline", detail_level="summary", output_format="narrative"
     )
-    assert at.selectbox[0].value == "data_pipeline"
+    assert at.selectbox[2].value == "data_pipeline"
     assert at.radio[0].value == "summary"
-    assert at.selectbox[1].value == "narrative"
+    assert at.selectbox[3].value == "narrative"
     submit(at, "Otro mensaje del cliente.")
-    assert at.selectbox[0].value == "data_pipeline"
+    assert at.selectbox[2].value == "data_pipeline"
     fields, _ = parse_multipart(api.estimates[1])
     assert (fields["project_type"], fields["detail_level"], fields["output_format"]) == (
         "data_pipeline",
@@ -460,7 +519,11 @@ def test_ui_values_and_limits_match_the_api():
     assert list(ui["PROJECT_TYPE_LABELS"]) == [t.value for t in domain.ProjectType]
     assert list(ui["DETAIL_LEVEL_LABELS"]) == [t.value for t in domain.DetailLevel]
     assert list(ui["OUTPUT_FORMAT_LABELS"]) == [t.value for t in domain.OutputFormat]
-    assert tuple(ui["SESSION_PROMPT_VERSIONS"]) == tuple(SESSION_PROMPT_VERSIONS) == ("v4",)
+    assert tuple(ui["SESSION_PROMPT_VERSIONS"]) == ("v6", "v5", "v4")
+    assert tuple(ui["AUDIENCE_PROMPT_VERSIONS"]) == ("v5", "v6")
+    assert set(ui["SESSION_PROMPT_VERSIONS"]) == set(SESSION_PROMPT_VERSIONS)
+    assert set(ui["TIERS"]) == {t.value for t in Tier}
+    assert set(ui["TIER_RULE_LABELS"]) == set(get_args(TierRule))
     assert ui["DEFAULT_PROMPT_VERSION"] == DEFAULT_SESSION_PROMPT_VERSION
     assert ui["MAX_TRANSCRIPT_CHARS"] == domain.MAX_TRANSCRIPT_CHARS == 20_000
     assert ui["MAX_ATTACHMENTS"] == defaults["max_attachments"] == 5
@@ -537,7 +600,8 @@ def test_full_result_shows_user_turn_text_version_metrics_and_validation(api):
     assert any("spec.pdf" in c.value for c in user.caption)
     assert any("TEXTO-DE-LA-ESTIMACION" in m.value for m in assistant.markdown)
     text = all_text(at)
-    assert "Versión del prompt: v4" in text
+    assert "Versión del prompt: v5" in text
+    assert "Audiencia: Dirección (NDA detectado)" in text
     assert "Modelo: `gpt-4o-mini`" in text and "Proveedor: `openai`" in text
     assert "Respaldo: no" in text and "Desde caché: no" in text
     assert "Tokens de entrada: 1200" in text and "Tokens de salida: 300" in text
@@ -927,7 +991,8 @@ def test_memory_panel_is_empty_without_turns(api):
     text = sidebar_text(run_app())
     assert "Memoria del proyecto" in text
     assert "Aún no hay datos del proyecto" in text
-    assert "Turnos: 0 · en la ventana: 0/6" in text
+    assert "Turnos: 0 · en la ventana: 0/6 · anclas: 0 · resumen: no" in text
+    assert "Audiencia del último turno" not in text
 
 
 def test_memory_panel_shows_the_metadata_and_the_counters(api):
@@ -939,9 +1004,32 @@ def test_memory_panel_shows_the_metadata_and_the_counters(api):
     assert "Clinic booking platform" in text
     assert "Twilio" in text and "Stripe" in text
     assert "Booking with reminders." in text and "3" in text
-    assert "Turnos: 2 · en la ventana: 2/6" in text
+    assert "Turnos: 2 · en la ventana: 2/6 · anclas: 0 · resumen: no" in text
     assert api.created[0][:8] in text and api.created[0] not in text
     assert "Aún no hay datos del proyecto" not in text
+
+
+def test_memory_panel_shows_constraints_rejections_anchors_summary_and_audience(api):
+    """Scenario: Panel con memoria y audiencia."""
+    api.project_metadata = {
+        **METADATA,
+        "explicit_constraints": ["NDA firmado"],
+        "rejected_options": ["Firebase"],
+    }
+    api.info = {
+        "turn_count": 8,
+        "history_turns": 6,
+        "max_turns": 6,
+        "anchors_count": 1,
+        "summary_chars": 340,
+        "last_tier": "executive",
+        "last_tier_rule": "nda_detected",
+    }
+    text = sidebar_text(run_app())
+    assert "Restricciones" in text and "NDA firmado" in text
+    assert "Descartado" in text and "Firebase" in text
+    assert "Turnos: 8 · en la ventana: 6/6 · anclas: 1 · resumen: sí (340 caracteres)" in text
+    assert "Audiencia del último turno: Dirección — regla: NDA detectado" in text
 
 
 def test_memory_panel_lists_only_the_fields_with_a_value(api):
@@ -1065,6 +1153,7 @@ def e2e(monkeypatch: pytest.MonkeyPatch, session_store):
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
     app.dependency_overrides[get_moderator] = lambda: moderator
     app.dependency_overrides[session_service_module.get_session_store] = lambda: session_store
+    app.dependency_overrides[memory_module.get_memory_compression] = make_fake_compression
 
     def factory(*args, **kwargs) -> TestClient:
         return TestClient(app, base_url=kwargs["base_url"])
@@ -1089,14 +1178,17 @@ def test_e2e_two_turns_with_a_pdf_reach_the_service_and_fill_the_memory_panel(e2
     assert f"<transcript>\n{TRANSCRIPT}\n</transcript>" in messages[0]["content"]
     assert "Lista los supuestos de cada fase" in system
     text = all_text(at)
-    assert "Versión del prompt: v4" in text and "Comprobaciones superadas: **8/8**" in text
+    assert "Versión del prompt: v6" in text and "Comprobaciones superadas: **8/8**" in text
     side = sidebar_text(at)
-    assert "Clinic booking platform" in side and "Turnos: 1 · en la ventana: 1/6" in side
+    assert "Clinic booking platform" in side
+    assert "Turnos: 1 · en la ventana: 1/6 · anclas: 0 · resumen: no" in side
+    assert "Audiencia del último turno: Sin adaptar — regla: sin señales" in side
+    assert "Audiencia: Sin adaptar (sin señales)" in text
     submit(at, "Añade pagos con Stripe.")
     _, second = e2e.calls[1]
     assert [m["role"] for m in second] == ["user", "assistant", "user"]
     assert "[…]" in second[0]["content"] and "jefe@cliente.es" not in second[0]["content"]
-    assert "Turnos: 2 · en la ventana: 2/6" in sidebar_text(at)
+    assert "Turnos: 2 · en la ventana: 2/6 · anclas: 0 · resumen: no" in sidebar_text(at)
 
 
 @pytest.mark.parametrize(
@@ -1188,3 +1280,274 @@ def test_e2e_new_conversation_starts_from_a_clean_server_session(e2e, session_st
 def test_session_id_pattern_is_a_uuid_in_the_real_api(e2e):
     at = run_app()
     assert re.fullmatch(r"[0-9a-f-]{36}", at.session_state["session_id"])
+
+
+# --- Requirement: Revisión Actor-Critic-Boss en la interfaz ---
+
+ACB_ISSUE = {
+    "category": "scope_mismatch",
+    "severity": "major",
+    "field_path": "rows[2].hours",
+    "description": "DESCRIPCION-DEL-PROBLEMA",
+}
+ACB_MINOR = {
+    "category": "missing_assumption",
+    "severity": "minor",
+    "field_path": "assumptions_and_risks",
+    "description": "OTRO-PROBLEMA-MENOR",
+}
+
+
+def acb_iteration(number: int, verdict: str | None, decision: str, issues: list[dict]) -> dict:
+    return {
+        "iteration": number,
+        "verdict": verdict,
+        "critic_confidence": 70,
+        "critic_failed": False,
+        "decision": decision,
+        "draft_confidence_pct": 80,
+        "draft_total_hours": 120,
+        "issues": issues,
+    }
+
+
+SYNTHESIZED_ACB = {
+    "final_decision": "synthesize",
+    "stop_reason": "budget_exhausted",
+    "iterations_run": 3,
+    "max_iterations": 3,
+    "iterations": [
+        acb_iteration(1, "needs_iteration", "iterate", [ACB_ISSUE]),
+        acb_iteration(2, "needs_iteration", "iterate", [ACB_ISSUE, ACB_MINOR]),
+        acb_iteration(3, "needs_iteration", "synthesize", [ACB_ISSUE]),
+    ],
+}
+
+
+def acb_expanders(at: AppTest) -> list:
+    return [e for e in at.expander if e.label == "Revisión Actor-Critic-Boss"]
+
+
+def test_the_review_checkbox_is_in_the_advanced_options_unchecked_with_a_cost_help(api):
+    """Requirement: casilla desmarcada por defecto, con ayuda de coste y tiempo."""
+    at = run_app()
+    (box,) = at.checkbox
+    assert box.label == "Revisión Actor-Critic-Boss" and box.value is False
+    assert "tarda más y cuesta más" in box.proto.help
+    assert "Solo con v6" in box.proto.help
+    assert not box.disabled
+
+
+def test_checked_review_sends_review_true(api):
+    """Scenario: Casilla marcada."""
+    at = submit(run_app(), review=True)
+    assert not at.exception
+    fields, _ = parse_multipart(api.estimates[0])
+    assert fields["review"] == "true"
+    assert api.estimates[0].url.params["prompt_version"] == "v6"
+
+
+def test_unchecked_review_sends_no_field_and_shows_no_expander(api):
+    """Scenario: Casilla desmarcada."""
+    at = submit(run_app())
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "review" not in fields
+    assert acb_expanders(at) == []
+
+
+def test_review_is_only_sent_with_a_version_that_accepts_it(api):
+    """The API answers 422 for `review` with v4/v5: the UI never sends it with them."""
+    at = submit(run_app(), prompt_version="v5", review=True)
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "review" not in fields
+    assert not at.exception
+
+
+def test_the_review_trace_is_shown_for_a_synthesized_review(api):
+    """Scenario: Traza sintetizada."""
+    api.json_body = {**RESPONSE, "prompt_version": "v6", "acb": SYNTHESIZED_ACB}
+    at = submit(run_app(), review=True)
+    assert not at.exception
+    (expander,) = acb_expanders(at)
+    text = "\n".join([m.value for m in expander.markdown] + [c.value for c in expander.caption])
+    assert "Sintetizada con avisos — se agotaron las iteraciones" in text
+    assert "Iteraciones: 3" in text
+    for number in (1, 2, 3):
+        assert f"Iteración {number}" in text
+    assert "Necesita iteración" in text
+    assert len(expander.table) == 3
+    first = expander.table[0].value
+    assert list(first.columns) == ["Gravedad", "Categoría", "Campo", "Descripción"]
+    assert first.iloc[0].tolist() == [
+        "major",
+        "scope_mismatch",
+        "rows[2].hours",
+        "DESCRIPCION-DEL-PROBLEMA",
+    ]
+    assert len(expander.table[1].value) == 2
+
+
+def test_an_accepted_review_without_issues_says_no_issues(api):
+    acb = {
+        "final_decision": "accept",
+        "stop_reason": "accepted",
+        "iterations_run": 1,
+        "max_iterations": 3,
+        "iterations": [acb_iteration(1, "accept", "accept", [])],
+    }
+    api.json_body = {**RESPONSE, "prompt_version": "v6", "acb": acb}
+    at = submit(run_app(), review=True)
+    (expander,) = acb_expanders(at)
+    text = "\n".join([m.value for m in expander.markdown] + [c.value for c in expander.caption])
+    assert "Aceptada — el revisor la aceptó" in text and "Sin problemas" in text
+    assert len(expander.table) == 0
+
+
+def test_an_out_of_scope_iteration_without_verdict_is_shown(api):
+    acb = {
+        "final_decision": "accept",
+        "stop_reason": "out_of_scope",
+        "iterations_run": 1,
+        "max_iterations": 3,
+        "iterations": [acb_iteration(1, None, "accept", [])],
+    }
+    api.json_body = {**RESPONSE, "prompt_version": "v6", "acb": acb}
+    at = submit(run_app(), review=True)
+    assert not at.exception
+    (expander,) = acb_expanders(at)
+    text = "\n".join(m.value for m in expander.markdown)
+    assert "fuera de alcance, sin revisar" in text and "Sin veredicto" in text
+
+
+def test_a_response_with_a_null_acb_shows_no_expander(api):
+    api.json_body = {**RESPONSE, "acb": None}
+    at = submit(run_app())
+    assert not at.exception and acb_expanders(at) == []
+
+
+STOP_LABELS = {
+    "accepted": "el revisor la aceptó",
+    "out_of_scope": "fuera de alcance, sin revisar",
+    "critic_failed": "el revisor no respondió",
+    "rejected": "el revisor la rechazó",
+    "budget_exhausted": "se agotaron las iteraciones",
+    "actor_failed": "falló un reintento",
+    "retry_out_of_scope": "un reintento salió fuera de alcance",
+}
+
+
+@pytest.mark.parametrize(("reason", "label"), list(STOP_LABELS.items()))
+@pytest.mark.parametrize(
+    ("decision", "text"), [("accept", "Aceptada"), ("synthesize", "Sintetizada con avisos")]
+)
+def test_acb_summary_uses_the_spanish_labels(decision, text, reason, label):
+    ui = load_ui_namespace()
+    assert ui["acb_summary"]({"final_decision": decision, "stop_reason": reason}) == (
+        f"{text} — {label}"
+    )
+
+
+def test_acb_labels_cover_every_api_value():
+    from app.services.llm_service import FinalDecision, StopReason
+
+    ui = load_ui_namespace()
+    assert set(ui["ACB_STOP_REASON_LABELS"]) == set(get_args(StopReason))
+    assert set(ui["ACB_DECISION_LABELS"]) == set(get_args(FinalDecision))
+
+
+def test_acb_summary_falls_back_to_the_raw_value_for_unknown_codes():
+    ui = load_ui_namespace()
+    assert ui["acb_summary"]({"final_decision": "x", "stop_reason": "y"}) == "x — y"
+
+
+def test_acb_issue_rows_map_the_four_columns():
+    ui = load_ui_namespace()
+    assert ui["acb_issue_rows"]([ACB_ISSUE, ACB_MINOR]) == [
+        {
+            "Gravedad": "major",
+            "Categoría": "scope_mismatch",
+            "Campo": "rows[2].hours",
+            "Descripción": "DESCRIPCION-DEL-PROBLEMA",
+        },
+        {
+            "Gravedad": "minor",
+            "Categoría": "missing_assumption",
+            "Campo": "assumptions_and_risks",
+            "Descripción": "OTRO-PROBLEMA-MENOR",
+        },
+    ]
+    assert ui["acb_issue_rows"]([]) == []
+
+
+def test_review_help_mentions_the_default_budget():
+    from app.config import Settings
+
+    ui = load_ui_namespace()
+    default = Settings.model_fields["boss_max_iterations"].default
+    assert f"{default} por defecto" in ui["REVIEW_HELP"]
+    assert "BOSS_MAX_ITERATIONS" in ui["REVIEW_HELP"]
+    assert ui["REVIEW_PROMPT_VERSION"] == "v6"
+
+
+def test_e2e_review_turn_reaches_the_boss_and_shows_the_trace(e2e):
+    """Scenarios: Casilla marcada y Traza (extremo a extremo con la API real y dobles)."""
+    from tests.conftest import ReviewProvider, critic_issue, critic_payload
+
+    issue = critic_issue("major", "scope_mismatch", "rows[2].hours", "Falta el TPV de la clínica.")
+    reviewer = ReviewProvider(
+        critics=[critic_payload("needs_iteration", [issue]), critic_payload("accept")]
+    )
+    app.dependency_overrides[llm_service.get_llm_provider] = lambda: reviewer
+    at = submit(run_app(), review=True)
+    assert not at.exception
+    assert reviewer.kinds == ["draft", "critic", "draft", "critic"]
+    (expander,) = acb_expanders(at)
+    text = "\n".join(m.value for m in expander.markdown)
+    assert "Aceptada — el revisor la aceptó" in text
+    assert expander.table[0].value.iloc[0]["Campo"] == "rows[2].hours"
+    assert "<critic_feedback>" in reviewer.calls_of("draft")[1][1][-1]["content"]
+
+
+# --- s05-fix-acb-review-findings: controls follow the selected version ---
+
+
+def test_review_is_available_after_a_v4_turn_once_v6_is_selected(api):
+    """Scenario: Revisión tras un turno con v4."""
+    at = submit(run_app(), prompt_version="v4")
+    at = submit(at, "Siguiente.", prompt_version="v6", review=True)
+    assert not at.exception and not at.checkbox[0].disabled
+    fields, _ = parse_multipart(api.estimates[1])
+    assert fields["review"] == "true"
+    assert api.estimates[1].url.params["prompt_version"] == "v6"
+
+
+def test_review_with_a_version_that_does_not_support_it_warns_and_is_not_sent(api):
+    """Scenario: Revisión con una versión que no la admite."""
+    at = run_app()
+    at.checkbox[0].set_value(True).run()
+    assert not [w for w in warnings(at) if "revisión no se enviará" in w]
+    at.selectbox[0].set_value("v4").run()
+    assert any("La revisión no se enviará" in w and "v4" in w for w in warnings(at))
+    at = submit(at)
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "review" not in fields
+
+
+def test_tier_with_a_version_that_does_not_support_it_warns_and_is_not_sent(api):
+    """Requirement: Controles según la versión seleccionada (audiencia)."""
+    at = run_app()
+    at.selectbox[1].set_value("executive").run()
+    assert not [w for w in warnings(at) if "audiencia no se enviará" in w]
+    at.selectbox[0].set_value("v4").run()
+    assert any("La audiencia no se enviará" in w for w in warnings(at))
+    submit(at)
+    assert "tier" not in api.estimates[0].url.params
+    fields, _ = parse_multipart(api.estimates[0])
+    assert "tier" not in fields
+
+
+def test_review_help_does_not_fix_a_hard_limit():
+    """Requirement: la ayuda habla de BOSS_MAX_ITERATIONS, 3 por defecto."""
+    ui = load_ui_namespace()
+    assert "BOSS_MAX_ITERATIONS" in ui["REVIEW_HELP"]
+    assert "hasta 3 borradores" not in ui["REVIEW_HELP"]

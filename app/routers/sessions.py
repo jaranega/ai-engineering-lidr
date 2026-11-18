@@ -20,14 +20,20 @@ from app.domain import (
 from app.routers.estimations import PROVIDER_ERROR_DETAIL, build_estimation_response
 from app.schemas import (
     AttachmentErrorResponse,
+    ReviewIssue,
+    ReviewIteration,
+    ReviewSummary,
+    ReviewTrace,
     SessionCreated,
     SessionErrorResponse,
     SessionEstimateResponse,
     SessionGuardrailErrorResponse,
     SessionInfo,
+    Tier,
 )
 from app.services.llm_service import (
     DEFAULT_SESSION_PROMPT_VERSION,
+    BossTrace,
     GenerationOptions,
     InputGuardrailViolation,
     InvalidOptionError,
@@ -68,6 +74,36 @@ _BUSY = {
 def _attachment_http_error(exc: AttachmentError) -> HTTPException:
     detail = {"reason": exc.reason, "index": exc.index, "message": exc.message}
     return HTTPException(status_code=_STATUS_BY_REASON.get(exc.reason, 422), detail=detail)
+
+
+def _review_trace(trace: BossTrace) -> ReviewTrace:
+    return ReviewTrace(
+        final_decision=trace.final_decision,
+        stop_reason=trace.stop_reason,
+        iterations_run=trace.iterations_run,
+        max_iterations=trace.max_iterations,
+        iterations=[
+            ReviewIteration(
+                iteration=it.iteration,
+                verdict=it.verdict,
+                critic_confidence=it.critic_confidence,
+                critic_failed=it.critic_failed,
+                decision=it.decision,
+                draft_confidence_pct=it.draft_confidence_pct,
+                draft_total_hours=it.draft_total_hours,
+                issues=[
+                    ReviewIssue(
+                        category=i.category,
+                        severity=i.severity,
+                        field_path=i.field_path,
+                        description=i.description,
+                    )
+                    for i in it.issues
+                ],
+            )
+            for it in trace.iterations
+        ],
+    )
 
 
 def _read_uploads(files: list[UploadFile], settings: Settings) -> list[UploadedFile]:
@@ -123,6 +159,19 @@ def get_session(
         history_turns=snapshot.history_turns,
         max_turns=snapshot.max_turns,
         project_metadata=snapshot.project_metadata,
+        anchors_count=snapshot.anchors_count,
+        summary_chars=snapshot.summary_chars,
+        last_tier=snapshot.last_tier,
+        last_tier_rule=snapshot.last_tier_rule,
+        last_review=(
+            ReviewSummary(
+                final_decision=snapshot.last_review.final_decision,
+                stop_reason=snapshot.last_review.stop_reason,
+                iterations_run=snapshot.last_review.iterations_run,
+            )
+            if snapshot.last_review
+            else None
+        ),
     )
 
 
@@ -157,6 +206,20 @@ def estimate_turn(
     project_type: Annotated[ProjectType, Form()],
     detail_level: Annotated[DetailLevel, Form()],
     output_format: Annotated[OutputFormat, Form()],
+    tier: Annotated[
+        Tier | None,
+        Form(
+            description="Audience of the estimate; omit for automatic resolution. "
+            "Accepted with prompt_version v5 and v6 (422 with v4)."
+        ),
+    ] = None,
+    review: Annotated[
+        bool,
+        Form(
+            description="Run the Actor-Critic-Boss review loop. "
+            "Requires prompt_version v6 (422 with v4/v5)."
+        ),
+    ] = False,
     attachments: Annotated[
         list[UploadFile] | None,
         BeforeValidator(_drop_blank_parts),
@@ -187,7 +250,12 @@ def estimate_turn(
         raise _attachment_http_error(exc) from exc
     try:
         outcome = service.estimate(
-            str(session_id), turn, uploads, GenerationOptions(prompt_version=prompt_version)
+            str(session_id),
+            turn,
+            uploads,
+            GenerationOptions(prompt_version=prompt_version),
+            tier=tier,
+            review=review,
         )
     except AttachmentError as exc:
         # The service already logs `attachment_rejected`.
@@ -218,4 +286,7 @@ def estimate_turn(
         session_id=outcome.session_id,
         turn=outcome.turn,
         project_metadata=outcome.project_metadata,
+        tier=outcome.tier,
+        tier_rule=outcome.tier_rule,
+        acb=_review_trace(outcome.review) if outcome.review else None,
     )

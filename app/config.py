@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     max_attachments: int = Field(default=5, ge=0, le=20)
     max_attachment_bytes: int = Field(default=10_485_760, ge=1024, le=52_428_800)
     max_attachment_chars: int = Field(default=60_000, ge=1000, le=200_000)
+    anchor_detection_mode: Literal["heuristic", "llm"] = "heuristic"
+    compression_model: str | None = None  # unset/blank: primary model with fallback
+    max_anchored_turns: int = Field(default=3, ge=0, le=10)
+    critic_model: str | None = None  # unset/blank: primary model with fallback
+    boss_max_iterations: int = Field(default=3, ge=1, le=5)
     app_env: str = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "DEBUG"
 
@@ -93,7 +98,14 @@ class Settings(BaseSettings):
     _fallback: Deployment | None = PrivateAttr(default=None)
     _fallback_disabled_reason: str | None = PrivateAttr(default=None)
 
-    @field_validator("openai_api_key", "anthropic_api_key", "fallback_model", mode="before")
+    @field_validator(
+        "openai_api_key",
+        "anthropic_api_key",
+        "fallback_model",
+        "compression_model",
+        "critic_model",
+        mode="before",
+    )
     @classmethod
     def _blank_to_none(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -121,6 +133,18 @@ class Settings(BaseSettings):
             )
         if fallback is not None and fallback == primary:
             raise ValueError("FALLBACK_MODEL must be different from PRIMARY_MODEL.")
+
+        if self.compression_model is not None:
+            try:
+                self.resolve_request_model(self.compression_model)
+            except ValueError as exc:
+                raise ValueError(f"COMPRESSION_MODEL is unusable: {exc}") from None
+
+        if self.critic_model is not None:
+            try:
+                self.resolve_request_model(self.critic_model)
+            except ValueError as exc:
+                raise ValueError(f"CRITIC_MODEL is unusable: {exc}") from None
 
         self._primary = primary
         if fallback is None:

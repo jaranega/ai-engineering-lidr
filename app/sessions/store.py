@@ -50,14 +50,18 @@ class SessionStore:
         *,
         max_sessions: int,
         max_turns: int,
+        max_anchors: int = 0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_sessions < 1:
             raise ValueError("max_sessions must be at least 1")
         if max_turns < 1:
             raise ValueError("max_turns must be at least 1")
+        if max_anchors < 0:
+            raise ValueError("max_anchors must not be negative")
         self._max_sessions = max_sessions
         self._max_turns = max_turns
+        self._max_anchors = max_anchors
         self._clock = clock
         self._sessions: OrderedDict[str, Session] = OrderedDict()
         self._lock = threading.Lock()
@@ -66,11 +70,15 @@ class SessionStore:
     def max_turns(self) -> int:
         return self._max_turns
 
+    @property
+    def max_anchors(self) -> int:
+        return self._max_anchors
+
     def create(self) -> Session:
         now = self._clock()
         session = Session(
             session_id=str(uuid.uuid4()),
-            history=ConversationHistory(self._max_turns),
+            history=ConversationHistory(self._max_turns, self._max_anchors),
             created_at=now,
             updated_at=now,
         )

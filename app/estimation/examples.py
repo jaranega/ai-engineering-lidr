@@ -32,7 +32,8 @@ def example_result(
 ) -> EstimationResult:
     """The example as the object the model is expected to return (in Spanish).
 
-    `technologies` are always loaded. Per-phase assumptions only with
+    `technologies`, `explicit_constraints` and `rejected_options` are always loaded.
+    Per-phase assumptions only with
     `phase_assumptions=True` (the `detailed` level in prompt v4, S05 design D5): the data
     are `medium` granularity, so by default the phases carry none.
     """
@@ -43,6 +44,8 @@ def example_result(
         title=example["title"],
         summary=example["summary"],
         confidence_pct=example["confidence_pct"],
+        explicit_constraints=list(example["explicit_constraints"]),
+        rejected_options=list(example["rejected_options"]),
         technologies=list(example["technologies"]),
         rows=[EstimateRow(**row) for row in example["rows"]],
         phases=[
@@ -67,6 +70,7 @@ def example_payloads(
     *,
     include_technologies: bool = False,
     include_phase_assumptions: bool = False,
+    include_memory_fields: bool = False,
 ) -> list[ExamplePayload]:
     """Request and expected JSON output of each example, for `examples.j2`.
 
@@ -77,17 +81,29 @@ def example_payloads(
     Both flags are off for prompt v3, whose text must not change by a byte (S05 design
     D4). Prompt v4 passes `include_technologies=True`: the key is then always present,
     right after `confidence_pct` as in the schema, also when empty (`[]` teaches to leave
-    it empty); and `include_phase_assumptions=True` at the `detailed` level (D5).
+    it empty); and `include_phase_assumptions=True` at the `detailed` level (D5). Prompt
+    v5 also passes `include_memory_fields=True`: `explicit_constraints` and
+    `rejected_options` are then always present, right after `confidence_pct` and before
+    `technologies` (design s05-memory D8); v3 and v4 never show them.
     """
-    exclude: set[str] = {"technologies"}
+    # Excluded explicitly (not only by `exclude_defaults`), so v3 and v4 never show the
+    # list fields whatever the example data hold; they are inserted back in schema order.
+    list_fields = ("explicit_constraints", "rejected_options", "technologies")
+    exclude: set[str] = set(list_fields)
     if OutputFormat(output_format) is not OutputFormat.NARRATIVE:
         exclude.add("narrative")
     payloads: list[ExamplePayload] = []
     for example in examples:
         result = example_result(example, phase_assumptions=include_phase_assumptions)
         data = result.model_dump(mode="json", exclude_defaults=True, exclude=exclude)
-        if include_technologies:
-            data = _with_technologies(data, list(result.technologies))
+        shown = {
+            "explicit_constraints": include_memory_fields,
+            "rejected_options": include_memory_fields,
+            "technologies": include_technologies,
+        }
+        fields = {name: list(getattr(result, name)) for name in list_fields if shown[name]}
+        if fields:
+            data = _with_list_fields(data, fields)
         payloads.append(
             {
                 "project_type": example["project_type"],
@@ -98,11 +114,13 @@ def example_payloads(
     return payloads
 
 
-def _with_technologies(data: dict[str, Any], technologies: list[str]) -> dict[str, Any]:
-    """`data` with `technologies` inserted right after `confidence_pct` (schema order)."""
+def _with_list_fields(data: dict[str, Any], fields: dict[str, list[str]]) -> dict[str, Any]:
+    """`data` with `fields` inserted, in the given (schema) order, right after
+    `confidence_pct`.
+    """
     ordered: dict[str, Any] = {}
     for key, value in data.items():
         ordered[key] = value
         if key == "confidence_pct":
-            ordered["technologies"] = technologies
+            ordered.update(fields)
     return ordered

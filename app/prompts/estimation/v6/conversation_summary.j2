@@ -1,0 +1,16 @@
+{#
+  Conversation summary partial, v5 (design s05-memory D7). Only when the session has a
+  summary: the cumulative summary of the turns that left the window and were not
+  anchored, written by the summarizer in the session language and normalized in code (no
+  prompt tags, at most 2000 characters). Printed verbatim; the rules tell the model to
+  treat it as data, and it yields to the current message, the verbatim turns and the
+  project metadata.
+  Each block emits its own leading blank line, so nothing is left behind when absent.
+#}
+{% if conversation_summary %}
+
+
+<conversation_summary>
+{{ conversation_summary }}
+</conversation_summary>
+{%- endif %}

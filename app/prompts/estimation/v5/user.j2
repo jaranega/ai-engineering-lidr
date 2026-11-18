@@ -1,0 +1,19 @@
+{#
+  Session turn user message, v4. Language-neutral wrapper (only tags and values). The
+  attachments go before the transcript (long documents first, the request last), each
+  after the `--- attachment: <name> ---` separator with its masked text, or `[…]` in the
+  copy stored in the history (`text` is none). The transcript goes last, verbatim and
+  unescaped. Attachment names are sanitized and masked before reaching here.
+#}
+<project_type>{{ project_type }}</project_type>
+{% if attachments %}
+<attachments>
+{% for attachment in attachments %}
+--- attachment: {{ attachment.name }} ---
+{{ attachment.text if attachment.text is not none else attachment_placeholder }}
+{% endfor %}
+</attachments>
+{% endif %}
+<transcript>
+{{ transcript }}
+</transcript>

@@ -179,6 +179,8 @@ def test_fields_are_declared_in_generation_order():
         "title",
         "summary",
         "confidence_pct",
+        "explicit_constraints",
+        "rejected_options",
         "technologies",
         "rows",
         "phases",

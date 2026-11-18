@@ -31,9 +31,11 @@ from app.main import app
 from app.prompts import loader as prompt_loader
 from app.services import cache as cache_module
 from app.services import llm_service
+from app.services import memory as memory_module
 from app.services import moderation as moderation_module
 from app.services import session_service as session_service_module
 from app.services.cache import ResponseCache
+from app.services.critic import CriticFeedback
 from app.services.llm_service import (
     FALLBACK_GROUP,
     PRIMARY_GROUP,
@@ -47,7 +49,10 @@ from app.services.llm_service import (
     build_override_router,
     build_router,
 )
+from app.services.memory import MemoryCompression
 from app.sessions import SessionStore
+from app.sessions.compression import detect_anchor
+from app.sessions.models import Turn
 
 
 def _clear_caches() -> None:
@@ -77,6 +82,11 @@ CONFIG_ENV_VARS = (
     "MAX_ATTACHMENTS",
     "MAX_ATTACHMENT_BYTES",
     "MAX_ATTACHMENT_CHARS",
+    "ANCHOR_DETECTION_MODE",
+    "COMPRESSION_MODEL",
+    "MAX_ANCHORED_TURNS",
+    "CRITIC_MODEL",
+    "BOSS_MAX_ITERATIONS",
 )
 
 
@@ -371,6 +381,117 @@ class FakeProvider:
         )
 
 
+def critic_payload(
+    verdict: str = "accept",
+    issues: Sequence[dict] = (),
+    confidence_in_review: int = 80,
+) -> dict:
+    """JSON payload of a `CriticFeedback`."""
+    return {
+        "verdict": verdict,
+        "issues": list(issues),
+        "confidence_in_review": confidence_in_review,
+    }
+
+
+def critic_issue(
+    severity: str = "major",
+    category: str = "scope_mismatch",
+    field_path: str = "rows[2].hours",
+    description: str = "The hours of the item do not match the agreed scope.",
+    suggested_fix: str | None = None,
+) -> dict:
+    """JSON payload of a `CriticIssue`."""
+    issue = {
+        "category": category,
+        "severity": severity,
+        "field_path": field_path,
+        "description": description,
+    }
+    if suggested_fix is not None:
+        issue["suggested_fix"] = suggested_fix
+    return issue
+
+
+class ReviewProvider(FakeProvider):
+    """Provider for the Actor-Critic-Boss review: answers `EstimationResult` calls from
+    `drafts` and `CriticFeedback` calls from `critics`, each scripted per call.
+
+    A script is a list: the n-th call of that kind returns the n-th item and the last one
+    repeats. An item is a payload (dict or `EstimationResult`) or an exception, which is
+    raised. Records `kinds` (`"draft"` / `"critic"`, in call order), the structlog context
+    bound at each call (`contexts`, to check `llm_purpose`) and the number of calls per
+    kind. Tokens and model per kind are configurable (`critic_*`).
+    """
+
+    def __init__(
+        self,
+        drafts: Sequence[StructuredPayload | Exception] | None = None,
+        critics: Sequence[StructuredPayload | Exception] | None = None,
+        *,
+        critic_input_tokens: int = 400,
+        critic_output_tokens: int = 100,
+        critic_model: str | None = None,
+        critic_cache_hit: bool | None = None,
+        input_tokens: int = 1000,
+        output_tokens: int = 200,
+        **kwargs,
+    ) -> None:
+        super().__init__(input_tokens=input_tokens, output_tokens=output_tokens, **kwargs)
+        self.drafts = list(drafts) if drafts is not None else [valid_payload()]
+        self.critics = list(critics) if critics is not None else [critic_payload()]
+        self.critic_tokens = (critic_input_tokens, critic_output_tokens)
+        self.critic_model = critic_model
+        self.critic_cache_hit = critic_cache_hit
+        self.kinds: list[str] = []
+        self.contexts: list[dict] = []
+
+    def count(self, kind: str) -> int:
+        return self.kinds.count(kind)
+
+    def calls_of(self, kind: str) -> list[tuple[str, list[ChatMessage]]]:
+        return [call for call, k in zip(self.calls, self.kinds, strict=True) if k == kind]
+
+    def generate_structured(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        response_model: type,
+        options: LLMCallOptions | None = None,
+    ) -> StructuredResult:
+        is_critic = issubclass(response_model, CriticFeedback)
+        kind = "critic" if is_critic else "draft"
+        self.calls.append((system, list(messages)))
+        self.options.append(options)
+        self.response_models.append(response_model)
+        self.kinds.append(kind)
+        self.contexts.append(structlog.contextvars.get_contextvars())
+        script = self.critics if is_critic else self.drafts
+        item = script[min(self.kinds.count(kind), len(script)) - 1]
+        if isinstance(item, Exception):
+            raise item
+        payload = item.model_dump(mode="json") if isinstance(item, EstimationResult) else item
+        tokens = (
+            self.critic_tokens
+            if is_critic
+            else (self.result.input_tokens, self.result.output_tokens)
+        )
+        return StructuredResult(
+            value=response_model.model_validate(payload),
+            model=(self.critic_model if is_critic and self.critic_model else self.result.model),
+            provider=self.result.provider,
+            input_tokens=tokens[0],
+            output_tokens=tokens[1],
+            attempts=1,
+            fallback_used=False,
+            cache_hit=(
+                self.critic_cache_hit
+                if is_critic and self.critic_cache_hit is not None
+                else self.result.cache_hit
+            ),
+        )
+
+
 class FakeModerator:
     """Moderator double: records the texts it receives; `result` is what `flagged` returns
     (`True`, `False` or `None` for "could not check"), or `error` is raised instead.
@@ -435,11 +556,41 @@ def moderator() -> FakeModerator:
     return FakeModerator(result=False)
 
 
+def fake_summarize(
+    previous: str | None,
+    turns: Sequence[Turn],
+    language: str | None = None,
+    project_metadata: object = None,
+) -> str:
+    """Deterministic summarizer: `"S:"` plus the numbers of the summarized turns, appended to
+    the previous summary (`"S:1,2"`, then `"S:1,2,3"`). Never calls an LLM.
+    """
+    numbers = ",".join(str(turn.number) for turn in turns)
+    return f"{previous},{numbers}" if previous else f"S:{numbers}"
+
+
+def make_fake_compression(max_anchors: int = 3) -> MemoryCompression:
+    """Deterministic `MemoryCompression`: the real heuristic detector (pure, no LLM), the
+    fake summarizer and `max_anchors`.
+    """
+    return MemoryCompression(
+        detect=detect_anchor, summarize=fake_summarize, max_anchors=max_anchors
+    )
+
+
+@pytest.fixture
+def memory_compression(settings: Settings) -> MemoryCompression:
+    """Fake compressor used by the `client` fixture (provider calls stay estimation-only)."""
+    return make_fake_compression(settings.max_anchored_turns)
+
+
 @pytest.fixture
 def session_store(settings: Settings) -> SessionStore:
     """Fresh in-memory session store (one per test) sized like the `settings` fixture."""
     return SessionStore(
-        max_sessions=settings.max_sessions, max_turns=settings.max_conversation_turns
+        max_sessions=settings.max_sessions,
+        max_turns=settings.max_conversation_turns,
+        max_anchors=settings.max_anchored_turns,
     )
 
 
@@ -450,6 +601,7 @@ def client(
     provider: FakeProvider,
     moderator: FakeModerator,
     session_store: SessionStore,
+    memory_compression: MemoryCompression,
 ) -> Iterator[TestClient]:
     """TestClient running the lifespan, with settings and LLM provider overridden.
 
@@ -461,6 +613,7 @@ def client(
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
     app.dependency_overrides[moderation_module.get_moderator] = lambda: moderator
     app.dependency_overrides[session_service_module.get_session_store] = lambda: session_store
+    app.dependency_overrides[memory_module.get_memory_compression] = lambda: memory_compression
     try:
         with TestClient(app) as test_client:
             yield test_client
@@ -479,6 +632,9 @@ def install_overrides(
     app.dependency_overrides[llm_service.get_llm_provider] = lambda: provider
     app.dependency_overrides[moderation_module.get_moderator] = lambda: moderator
     app.dependency_overrides[session_service_module.get_session_store] = lambda: store
+    app.dependency_overrides[memory_module.get_memory_compression] = lambda: make_fake_compression(
+        settings.max_anchored_turns
+    )
 
 
 @pytest.fixture
@@ -501,7 +657,11 @@ def make_session_client(
         cfg = make_settings(**settings_kwargs)
         provider = provider or FakeProvider(model=cfg.primary.model, provider=cfg.primary.provider)
         moderator = moderator or FakeModerator(result=False)
-        store = SessionStore(max_sessions=cfg.max_sessions, max_turns=cfg.max_conversation_turns)
+        store = SessionStore(
+            max_sessions=cfg.max_sessions,
+            max_turns=cfg.max_conversation_turns,
+            max_anchors=cfg.max_anchored_turns,
+        )
         install_overrides(cfg, provider, moderator, store)
         return stack.enter_context(TestClient(app)), provider, moderator, store
 

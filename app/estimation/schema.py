@@ -31,6 +31,9 @@ __all__ = [
     "OUT_OF_SCOPE_CONFIDENCE",
     "DurationRange",
     "EstimateRow",
+    "MAX_CONSTRAINT_CHARS",
+    "MAX_CONSTRAINTS",
+    "MAX_REJECTED_OPTIONS",
     "MAX_TECHNOLOGIES",
     "EstimationResult",
     "PhaseAssessment",
@@ -57,6 +60,10 @@ MAX_ASSUMPTIONS = 8
 MAX_NARRATIVE_PARAGRAPHS = 6
 MAX_TECHNOLOGIES = 15
 MAX_TECH_NAME_CHARS = 60
+# Memory fields, per turn (design s05-memory D8); the session metadata accumulates them.
+MAX_CONSTRAINTS = 8
+MAX_CONSTRAINT_CHARS = 200
+MAX_REJECTED_OPTIONS = 10
 
 
 # Trimmed, non-empty strings of bounded length.
@@ -69,34 +76,43 @@ Paragraph = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1
 TechName = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_TECH_NAME_CHARS)
 ]
+ConstraintText = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_CONSTRAINT_CHARS)
+]
 
 
 def _round_to_step(value: int) -> int:
     return ROUNDING_STEP * round(value / ROUNDING_STEP)
 
 
-def _clean_technologies(value: object) -> object:
-    """Trim, drop blank and over-long names, dedupe by `casefold` keeping the first
-    spelling, and keep the first `MAX_TECHNOLOGIES` (normalizer, no retry, idempotent).
+def _clean_unique_texts(value: object, *, max_items: int, max_chars: int) -> object:
+    """Trim, drop blank and over-long texts, dedupe by `casefold` keeping the first
+    spelling, and keep the first `max_items` (normalizer, no retry, idempotent).
 
-    A secondary field never justifies a paid retry (S05 design D4); non-string items are
-    left for the field validation to report.
+    Shared by `technologies`, `explicit_constraints` and `rejected_options`: a secondary
+    field never justifies a paid retry (S05 design D4); non-string items are left for the
+    field validation to report.
     """
     if not isinstance(value, list):
         return value
     seen: set[str] = set()
-    names: list[object] = []
+    texts: list[object] = []
     for item in value:
         if isinstance(item, str):
             item = item.strip()
-            if not item or len(item) > MAX_TECH_NAME_CHARS:
+            if not item or len(item) > max_chars:
                 continue
             key = item.casefold()
             if key in seen:
                 continue
             seen.add(key)
-        names.append(item)
-    return names[:MAX_TECHNOLOGIES]
+        texts.append(item)
+    return texts[:max_items]
+
+
+def _clean_technologies(value: object) -> object:
+    """`technologies` normalizer: see `_clean_unique_texts`."""
+    return _clean_unique_texts(value, max_items=MAX_TECHNOLOGIES, max_chars=MAX_TECH_NAME_CHARS)
 
 
 def _drop_blank(value: object) -> object:
@@ -197,6 +213,25 @@ class EstimationResult(BaseModel):
         description="Overall confidence (0-100, multiple of 5); below "
         f"{OUT_OF_SCOPE_CONFIDENCE} means the project cannot be estimated.",
     )
+    # Memory fields after `confidence_pct` (the early out-of-scope decision) and before
+    # the breakdown: constraints condition the rows, and the model commits to what was
+    # rejected before listing the stack (design s05-memory D8).
+    explicit_constraints: list[ConstraintText] = Field(
+        default=[],
+        max_length=MAX_CONSTRAINTS,
+        description="Binding constraints the client stated explicitly in any turn or "
+        "attachment and that are still in force (fixed budget, deadline, regulation, NDA, "
+        "mandated platform or hosting, team limits), including those of project_metadata; "
+        "one short phrase each, in the client's language, keeping figures and dates; empty "
+        "if none. Not your assumptions.",
+    )
+    rejected_options: list[TechName] = Field(
+        default=[],
+        max_length=MAX_REJECTED_OPTIONS,
+        description="Technologies, vendors or platforms the client explicitly discarded in "
+        "any turn, written exactly as in technologies or mentioned_technologies; empty if "
+        "none.",
+    )
     # After `confidence_pct` (the early out-of-scope decision) and before `rows`, so the
     # breakdown follows the stack the client named (S05 design D4).
     technologies: list[TechName] = Field(
@@ -233,6 +268,18 @@ class EstimationResult(BaseModel):
     @classmethod
     def _normalize_confidence(cls, value: int) -> int:
         return _round_to_step(value)
+
+    @field_validator("explicit_constraints", mode="before")
+    @classmethod
+    def _normalize_constraints(cls, value: object) -> object:
+        return _clean_unique_texts(value, max_items=MAX_CONSTRAINTS, max_chars=MAX_CONSTRAINT_CHARS)
+
+    @field_validator("rejected_options", mode="before")
+    @classmethod
+    def _normalize_rejected_options(cls, value: object) -> object:
+        return _clean_unique_texts(
+            value, max_items=MAX_REJECTED_OPTIONS, max_chars=MAX_TECH_NAME_CHARS
+        )
 
     @field_validator("technologies", mode="before")
     @classmethod

@@ -63,13 +63,19 @@ def test_version_folders_match_the_single_list_of_versions():
     """Requirement: Templates versionados / Scenario: Estructura de una versión."""
     folders = {path.name for path in TEMPLATES_DIR.iterdir() if path.is_dir()}
     folders.discard("__pycache__")
-    assert folders == set(PUBLISHED_PROMPT_VERSIONS) == {"v3", "v4"}
+    assert folders == set(PUBLISHED_PROMPT_VERSIONS) == {"v3", "v4", "v5", "v6"}
     assert PROMPT_VERSIONS == ("v3",)
-    assert SESSION_PROMPT_VERSIONS == ("v4",)
+    assert SESSION_PROMPT_VERSIONS == ("v4", "v5", "v6")
     base = {"system.j2", "user.j2", "examples.j2"}
+    expected = {
+        "v3": base,
+        "v4": base | {"project_metadata.j2"},
+        "v5": base | {"project_metadata.j2", "conversation_summary.j2", "audience.j2"},
+        "v6": base | {"project_metadata.j2", "conversation_summary.j2", "audience.j2"},
+    }
     for version in PUBLISHED_PROMPT_VERSIONS:
         files = {path.name for path in (TEMPLATES_DIR / version).iterdir()}
-        assert files == (base | {"project_metadata.j2"} if version == "v4" else base)
+        assert files == expected[version]
 
 
 def test_templates_never_reference_another_version_or_leave_their_folder():

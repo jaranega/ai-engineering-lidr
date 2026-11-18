@@ -14,7 +14,11 @@ rendered text. `app.estimation.examples` turns each example into an `EstimationR
 as JSON. The data are `medium` granularity; `phase_assumptions` (per-phase assumptions)
 are only shown by prompt v4 when the `detailed` level is requested (S05 design D5), and
 `technologies` (the ones named in `meeting_summary`, never the estimator's own choices
-such as React Native or Stripe in example 2) only by v4: v3 renders without both.
+such as React Native or Stripe in example 2) only by v4 and v5: v3 renders without both.
+`explicit_constraints` and `rejected_options` (binding constraints and discarded options
+stated in `meeting_summary`; design s05-memory D8) are only shown by v5. No summary
+discards an option, so `rejected_options` stays empty everywhere: adding one would mean
+editing `meeting_summary`, which would change the published v3 and v4 prompts.
 
 Content is in Spanish (product language); the model answers in the language of the
 project description. The `narrative` paragraphs have no figures: in the narrative format
@@ -76,6 +80,8 @@ class EstimationExample(TypedDict):
     summary: str  # 1-2 sentences of scope
     confidence_pct: int  # overall, multiple of 5
     technologies: list[str]  # named in `meeting_summary`; empty if none (S05 design D4)
+    explicit_constraints: list[str]  # binding constraints stated in `meeting_summary`
+    rejected_options: list[str]  # options discarded in `meeting_summary`; empty if none
     rows: list[ExampleRow]
     phase_confidence: dict[PhaseKey, int]  # one entry per phase used in `rows`
     phase_assumptions: dict[PhaseKey, list[str]]  # 1-2 per phase used in `rows`
@@ -119,6 +125,9 @@ ESTIMATION_EXAMPLES: list[EstimationExample] = [
         "confidence_pct": 80,
         # Email and SMS are named, but no product: teaches leaving the list empty.
         "technologies": [],
+        # "Les gustaría tenerla en unos dos meses" is a wish, not a binding constraint.
+        "explicit_constraints": [],
+        "rejected_options": [],
         "rows": [
             _row(
                 "Descubrimiento y diseño UI/UX (flujos, wireframes y prototipo)",
@@ -216,6 +225,8 @@ ESTIMATION_EXAMPLES: list[EstimationExample] = [
         ),
         "confidence_pct": 65,
         "technologies": ["iOS", "Android", "Sign in with Apple", "Google Sign-In"],
+        "explicit_constraints": ["Lanzamiento antes de la campaña de Navidad (unos tres meses)"],
+        "rejected_options": [],
         "rows": [
             _row("Descubrimiento y diseño UI/UX (app y backoffice)", 70, "design", "discovery"),
             _row("Setup multiplataforma (React Native), CI/CD y entornos", 25, "dev", "setup"),
@@ -305,6 +316,8 @@ ESTIMATION_EXAMPLES: list[EstimationExample] = [
         ),
         "confidence_pct": 70,
         "technologies": ["Shopify", "Odoo", "Looker Studio"],
+        "explicit_constraints": ["En marcha en un mes"],
+        "rejected_options": [],
         "rows": [
             _row(
                 "Análisis de las APIs y mapeo de datos (pedidos, clientes, productos)",

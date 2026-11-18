@@ -17,10 +17,16 @@ from app.services.llm_service import (
     MAX_OUTPUT_TOKENS,
     MAX_TOKENS,
     NUM_EXAMPLES,
+    BossDecision,
     ComputedEstimate,
+    CriticCategory,
+    CriticSeverity,
+    CriticVerdict,
+    FinalDecision,
     GuardrailReason,
+    StopReason,
 )
-from app.sessions import ProjectMetadata
+from app.sessions import ProjectMetadata, Tier, TierRule
 
 __all__ = [
     "DetailLevel",
@@ -35,6 +41,10 @@ __all__ = [
     "ProjectMetadata",
     "ProjectType",
     "ReferenceProject",
+    "ReviewIssue",
+    "ReviewIteration",
+    "ReviewSummary",
+    "ReviewTrace",
     "AttachmentErrorDetail",
     "AttachmentErrorResponse",
     "SessionCreated",
@@ -45,6 +55,8 @@ __all__ = [
     "SessionGuardrailErrorResponse",
     "SessionInfo",
     "StructureCheckResponse",
+    "Tier",
+    "TierRule",
 ]
 
 
@@ -156,18 +168,71 @@ class SessionCreated(BaseModel):
     session_id: str
 
 
+class ReviewIssue(BaseModel):
+    category: CriticCategory = Field(description="Category of the defect found by the Critic.")
+    severity: CriticSeverity = Field(description="Severity of the defect.")
+    field_path: str = Field(description="Path of the estimate field the issue refers to.")
+    description: str = Field(description="What is wrong.")
+
+
+class ReviewIteration(BaseModel):
+    iteration: int = Field(description="1-based iteration number.")
+    verdict: CriticVerdict | None = Field(
+        description="Critic verdict; null if the Critic was not called (out-of-scope draft)."
+    )
+    critic_confidence: int | None = Field(
+        description="Critic confidence in its own review (0-100); null if not called."
+    )
+    critic_failed: bool = Field(description="True if the Critic call failed (verdict is accept).")
+    decision: BossDecision = Field(description="Decision of the Boss for this iteration.")
+    draft_confidence_pct: int = Field(description="Confidence of the draft of this iteration.")
+    draft_total_hours: int = Field(description="Total hours of the draft of this iteration.")
+    issues: list[ReviewIssue] = Field(description="Issues of the review, in order.")
+
+
+class ReviewTrace(BaseModel):
+    final_decision: FinalDecision = Field(description="Final decision of the Boss.")
+    stop_reason: StopReason = Field(description="Why the review loop stopped.")
+    iterations_run: int = Field(description="Iterations actually run.")
+    max_iterations: int = Field(description="Iteration budget of the review.")
+    iterations: list[ReviewIteration]
+
+
+class ReviewSummary(BaseModel):
+    final_decision: FinalDecision = Field(description="Final decision of the last review.")
+    stop_reason: StopReason = Field(description="Why the last review stopped.")
+    iterations_run: int = Field(description="Iterations run by the last review.")
+
+
 class SessionInfo(BaseModel):
     session_id: str
     turn_count: int = Field(description="Successful turns since creation.")
     history_turns: int = Field(description="Turns currently in the window (<= max_turns).")
     max_turns: int
     project_metadata: ProjectMetadata
+    anchors_count: int = Field(description="Anchored turns kept verbatim outside the window.")
+    summary_chars: int = Field(description="Length of the cumulative summary; 0 if none.")
+    last_tier: Tier | None = Field(
+        description="Audience tier of the last successful turn; null if none."
+    )
+    last_tier_rule: TierRule | None = Field(
+        description="Rule that resolved the tier of the last successful turn; null if none."
+    )
+    last_review: ReviewSummary | None = Field(
+        default=None, description="Summary of the last review (turn with review); null if none."
+    )
 
 
 class SessionEstimateResponse(EstimationResponse):
     session_id: str
     turn: int = Field(description="Ordinal of this turn (== turn_count after it).")
     project_metadata: ProjectMetadata = Field(description="Project metadata after the update.")
+    tier: Tier = Field(description="Audience tier of this turn.")
+    tier_rule: TierRule = Field(description="Rule that resolved the tier of this turn.")
+    acb: ReviewTrace | None = Field(
+        default=None,
+        description="Actor-Critic-Boss review trace; null unless the turn ran with review.",
+    )
 
 
 class SessionError(BaseModel):

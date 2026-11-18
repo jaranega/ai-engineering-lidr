@@ -1,0 +1,29 @@
+{#
+  Conversation summarizer user message, v1 (design s05-memory D6). The project as context
+  (name and agreed scope from the project metadata, only those present), the previous
+  summary (if any) and the stored `user` message of each turn to integrate, with its
+  ordinal; attachments already appear as `[…]`. Never the assistant replies.
+#}
+{% if project_name or agreed_scope %}
+<project_context>
+{% if project_name %}
+Project: {{ project_name }}
+{% endif %}
+{% if agreed_scope %}
+Agreed scope: {{ agreed_scope }}
+{% endif %}
+</project_context>
+
+{% endif %}
+{% if previous %}
+<previous_summary>
+{{ previous }}
+</previous_summary>
+
+{% endif %}
+<turns>
+{% for turn in turns %}
+--- turn {{ turn.number }} ---
+{{ turn.user }}
+{% endfor %}
+</turns>

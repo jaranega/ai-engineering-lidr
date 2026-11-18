@@ -66,9 +66,15 @@ def test_technologies_sit_between_confidence_and_rows_and_are_optional():
     """Scenario: Posición de las tecnologías."""
     schema = EstimationResult.model_json_schema()
     names = list(schema["properties"])
-    assert names.index("technologies") == names.index("confidence_pct") + 1
+    start = names.index("confidence_pct")
+    assert names[start + 1 : start + 4] == [
+        "explicit_constraints",
+        "rejected_options",
+        "technologies",
+    ]
     assert names.index("technologies") < names.index("rows")
-    assert "technologies" not in schema["required"]
+    for name in ("explicit_constraints", "rejected_options", "technologies"):
+        assert name not in schema["required"]
 
 
 def test_out_of_scope_keeps_the_technologies():
