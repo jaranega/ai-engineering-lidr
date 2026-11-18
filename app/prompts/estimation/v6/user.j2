@@ -1,0 +1,32 @@
+{#
+  Session turn user message, v6 (design s05-acb D4). Language-neutral wrapper (only tags
+  and values), identical to v5 except for the optional `<critic_feedback>` block. The
+  attachments go before the transcript (long documents first, the request last), each
+  after the `--- attachment: <name> ---` separator with its masked text, or `[…]` in the
+  copy stored in the history (`text` is none). The transcript goes verbatim and
+  unescaped. Only on a retry of the Actor-Critic-Boss review, the `critical`/`major`
+  issues of the last Critic review (filtered in code) go last, after the transcript:
+  the most recent instruction. The fixed text is English, like the other instructions;
+  the descriptions are printed verbatim, in the session language. Never in the copy
+  stored in the history. Without feedback this template renders exactly as v5's.
+#}
+<project_type>{{ project_type }}</project_type>
+{% if attachments %}
+<attachments>
+{% for attachment in attachments %}
+--- attachment: {{ attachment.name }} ---
+{{ attachment.text if attachment.text is not none else attachment_placeholder }}
+{% endfor %}
+</attachments>
+{% endif %}
+<transcript>
+{{ transcript }}
+</transcript>
+{% if critic_feedback %}
+<critic_feedback>
+A previous draft of this estimate was reviewed by an independent auditor. Produce a new estimate that fixes these issues and keeps everything else consistent:
+{% for issue in critic_issues %}
+- [{{ issue.severity }}] {{ issue.category }} at {{ issue.field_path }}: {{ issue.description }}{{ " (suggested fix: " ~ issue.suggested_fix ~ ")" if issue.suggested_fix else "" }}
+{% endfor %}
+</critic_feedback>
+{% endif %}

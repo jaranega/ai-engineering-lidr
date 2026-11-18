@@ -122,7 +122,9 @@ INJECTION_RULES = _rules(
         r"<\s*/?\s*(project_description|project_type|reference_projects?|examples?"
         r"|example_output|example_request|client_request|system|assistant"
         r"|transcript|attachments?|project_metadata|conversation_summary|audience"
-        r"|previous_summary|project_context|turns|client_message)\s*>",
+        r"|previous_summary|project_context|turns|client_message"
+        # Actor-Critic-Boss prompts: a client must not fake an auditor's feedback.
+        r"|critic_feedback|estimation_under_review|resolved_tier|response_language)\s*>",
     ),
 )
 

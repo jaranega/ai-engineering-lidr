@@ -221,6 +221,18 @@ class ProjectMetadata(BaseModel):
         ]
 
 
+@dataclass(frozen=True)
+class LastReview:
+    """Outcome of the Actor-Critic-Boss review of a turn (design s05-acb D8): the final
+    decision (`accept` | `synthesize`), the stop reason and the iterations run. Never the
+    Critic's issues.
+    """
+
+    final_decision: str
+    stop_reason: str
+    iterations_run: int
+
+
 @dataclass(eq=False)
 class Session:
     """In-process conversation state. Volatile by design (S05 exercise): lost on restart and
@@ -236,6 +248,8 @@ class Session:
     project_metadata: ProjectMetadata = field(default_factory=ProjectMetadata)
     language: Language | None = None  # effective language of the last successful turn
     last_tier: "TierDecision | None" = None  # tier of the last successful turn
+    # Review of the last successful turn; None when that turn was not reviewed.
+    last_review: LastReview | None = None
     turn_count: int = 0  # successful turns, including those out of the window
     created_at: float = 0.0  # time.monotonic()
     updated_at: float = 0.0

@@ -35,6 +35,7 @@ from app.services import memory as memory_module
 from app.services import moderation as moderation_module
 from app.services import session_service as session_service_module
 from app.services.cache import ResponseCache
+from app.services.critic import CriticFeedback
 from app.services.llm_service import (
     FALLBACK_GROUP,
     PRIMARY_GROUP,
@@ -84,6 +85,8 @@ CONFIG_ENV_VARS = (
     "ANCHOR_DETECTION_MODE",
     "COMPRESSION_MODEL",
     "MAX_ANCHORED_TURNS",
+    "CRITIC_MODEL",
+    "BOSS_MAX_ITERATIONS",
 )
 
 
@@ -375,6 +378,117 @@ class FakeProvider:
             truncated=self.result.truncated,
             fallback_used=self.result.fallback_used,
             cache_hit=self.result.cache_hit,
+        )
+
+
+def critic_payload(
+    verdict: str = "accept",
+    issues: Sequence[dict] = (),
+    confidence_in_review: int = 80,
+) -> dict:
+    """JSON payload of a `CriticFeedback`."""
+    return {
+        "verdict": verdict,
+        "issues": list(issues),
+        "confidence_in_review": confidence_in_review,
+    }
+
+
+def critic_issue(
+    severity: str = "major",
+    category: str = "scope_mismatch",
+    field_path: str = "rows[2].hours",
+    description: str = "The hours of the item do not match the agreed scope.",
+    suggested_fix: str | None = None,
+) -> dict:
+    """JSON payload of a `CriticIssue`."""
+    issue = {
+        "category": category,
+        "severity": severity,
+        "field_path": field_path,
+        "description": description,
+    }
+    if suggested_fix is not None:
+        issue["suggested_fix"] = suggested_fix
+    return issue
+
+
+class ReviewProvider(FakeProvider):
+    """Provider for the Actor-Critic-Boss review: answers `EstimationResult` calls from
+    `drafts` and `CriticFeedback` calls from `critics`, each scripted per call.
+
+    A script is a list: the n-th call of that kind returns the n-th item and the last one
+    repeats. An item is a payload (dict or `EstimationResult`) or an exception, which is
+    raised. Records `kinds` (`"draft"` / `"critic"`, in call order), the structlog context
+    bound at each call (`contexts`, to check `llm_purpose`) and the number of calls per
+    kind. Tokens and model per kind are configurable (`critic_*`).
+    """
+
+    def __init__(
+        self,
+        drafts: Sequence[StructuredPayload | Exception] | None = None,
+        critics: Sequence[StructuredPayload | Exception] | None = None,
+        *,
+        critic_input_tokens: int = 400,
+        critic_output_tokens: int = 100,
+        critic_model: str | None = None,
+        critic_cache_hit: bool | None = None,
+        input_tokens: int = 1000,
+        output_tokens: int = 200,
+        **kwargs,
+    ) -> None:
+        super().__init__(input_tokens=input_tokens, output_tokens=output_tokens, **kwargs)
+        self.drafts = list(drafts) if drafts is not None else [valid_payload()]
+        self.critics = list(critics) if critics is not None else [critic_payload()]
+        self.critic_tokens = (critic_input_tokens, critic_output_tokens)
+        self.critic_model = critic_model
+        self.critic_cache_hit = critic_cache_hit
+        self.kinds: list[str] = []
+        self.contexts: list[dict] = []
+
+    def count(self, kind: str) -> int:
+        return self.kinds.count(kind)
+
+    def calls_of(self, kind: str) -> list[tuple[str, list[ChatMessage]]]:
+        return [call for call, k in zip(self.calls, self.kinds, strict=True) if k == kind]
+
+    def generate_structured(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        response_model: type,
+        options: LLMCallOptions | None = None,
+    ) -> StructuredResult:
+        is_critic = issubclass(response_model, CriticFeedback)
+        kind = "critic" if is_critic else "draft"
+        self.calls.append((system, list(messages)))
+        self.options.append(options)
+        self.response_models.append(response_model)
+        self.kinds.append(kind)
+        self.contexts.append(structlog.contextvars.get_contextvars())
+        script = self.critics if is_critic else self.drafts
+        item = script[min(self.kinds.count(kind), len(script)) - 1]
+        if isinstance(item, Exception):
+            raise item
+        payload = item.model_dump(mode="json") if isinstance(item, EstimationResult) else item
+        tokens = (
+            self.critic_tokens
+            if is_critic
+            else (self.result.input_tokens, self.result.output_tokens)
+        )
+        return StructuredResult(
+            value=response_model.model_validate(payload),
+            model=(self.critic_model if is_critic and self.critic_model else self.result.model),
+            provider=self.result.provider,
+            input_tokens=tokens[0],
+            output_tokens=tokens[1],
+            attempts=1,
+            fallback_used=False,
+            cache_hit=(
+                self.critic_cache_hit
+                if is_critic and self.critic_cache_hit is not None
+                else self.result.cache_hit
+            ),
         )
 
 

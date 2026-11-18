@@ -89,6 +89,7 @@ def test_a_new_session_is_empty(client):
         "summary_chars": 0,
         "last_tier": None,
         "last_tier_rule": None,
+        "last_review": None,
     }
 
 
@@ -151,8 +152,10 @@ def test_a_turn_returns_the_estimate_contract_plus_the_session_fields(client, pr
         "project_metadata",
         "tier",
         "tier_rule",
+        "acb",
     }
-    assert body["prompt_version"] == "v5"
+    assert body["acb"] is None
+    assert body["prompt_version"] == "v6"
     assert (body["tier"], body["tier_rule"]) == ("default", "default")
     assert body["session_id"] == session_id and body["turn"] == 1
     assert body["text"] and body["result"]["total_hours"] > 0
@@ -605,8 +608,8 @@ def test_openapi_documents_the_session_operations_multipart_and_codes(client):
     params = {p["name"]: p for p in turn["parameters"]}
     assert params["session_id"]["schema"]["format"] == "uuid"
     assert params["prompt_version"]["in"] == "query"
-    assert params["prompt_version"]["schema"]["default"] == "v5"
-    assert params["prompt_version"]["schema"]["enum"] == ["v4", "v5"]
+    assert params["prompt_version"]["schema"]["default"] == "v6"
+    assert params["prompt_version"]["schema"]["enum"] == ["v4", "v5", "v6"]
     assert "tier" in body["properties"] and "tier" not in body["required"]
     tier_values = spec["components"]["schemas"]["Tier"]["enum"]
     assert tier_values == ["executive", "pm", "developer", "default"]

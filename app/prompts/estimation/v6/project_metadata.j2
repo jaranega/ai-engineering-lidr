@@ -1,0 +1,28 @@
+{#
+  Project metadata partial, v5 (design s05-memory D10). The v4 lines plus, only when they
+  have a value, the accumulated `explicit_constraints` (joined with "; " because they
+  may contain commas) and `rejected_options`. Facts derived in code from the structured
+  estimates (never by an extra LLM call); English keys, one `key: value` line per field
+  with a value; on the first turn the block is empty. Values come from earlier model
+  output and are printed verbatim: the rules tell the model to treat the block as data.
+#}
+<project_metadata>
+{% if project_metadata.project_name %}
+project_name: {{ project_metadata.project_name }}
+{% endif %}
+{% if project_metadata.assumed_team_size is not none %}
+assumed_team_size: {{ project_metadata.assumed_team_size }}
+{% endif %}
+{% if project_metadata.mentioned_technologies %}
+mentioned_technologies: {{ project_metadata.mentioned_technologies | join(", ") }}
+{% endif %}
+{% if project_metadata.agreed_scope %}
+agreed_scope: {{ project_metadata.agreed_scope }}
+{% endif %}
+{% if project_metadata.explicit_constraints %}
+explicit_constraints: {{ project_metadata.explicit_constraints | join("; ") }}
+{% endif %}
+{% if project_metadata.rejected_options %}
+rejected_options: {{ project_metadata.rejected_options | join(", ") }}
+{% endif %}
+</project_metadata>

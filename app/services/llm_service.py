@@ -2,10 +2,14 @@
 response cache) and the estimation use case: input guardrails, prompt render, structured
 generation, costs computed in code, Markdown render and evaluation.
 
-The use case has two entry points sharing one generation step (`_generate`): `estimate`
+The use case has two entry points sharing one generation step, split in a structured
+call (`_draft`) and its finalization (`_finalize`: costs, render, evaluation): `estimate`
 (one typed description, prompt v3) and `estimate_turn` (one stateless turn of a session,
-prompt v4, with the history and the project metadata passed in as data; the session state
-lives in `app.services.session_service`, S05 design D6)."""
+prompts v4-v6, with the history and the project metadata passed in as data; the session
+state lives in `app.services.session_service`, S05 design D6). With a `ReviewConfig`,
+`estimate_turn` replaces the single structured call with the Actor-Critic-Boss loop
+(`app.services.boss`, `app.services.critic`, design s05-acb D2) and finalizes the final
+result once."""
 
 import hashlib
 import json
@@ -13,7 +17,7 @@ import time
 from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache, partial
-from typing import Any, Generic, Literal, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 import instructor
 import structlog
@@ -51,14 +55,25 @@ from app.prompts.loader import (
     MEMORY_PROMPT_VERSIONS,
     NUM_EXAMPLES,
     PROMPT_VERSIONS,
+    REVIEW_PROMPT_VERSIONS,
     SESSION_PROMPT_VERSIONS,
     PromptVersion,
+    SessionPrompt,
     SessionPromptVersion,
     UnknownPromptVersionError,
     render_estimation_prompt,
     render_session_prompt,
 )
+from app.services.boss import BossIteration, BossTrace, Draft, run_review
 from app.services.cache import ResponseCache, cache_key, get_response_cache, key_prefix
+from app.services.critic import (
+    CRITIC_MAX_TOKENS,
+    Critic,
+    CriticFeedback,
+    CriticIssue,
+    CriticReview,
+)
+from app.services.errors import LLMProviderError, StructuredFailure, StructuredOutputError
 from app.services.evaluation import StructureCheck, evaluate_estimation
 from app.services.moderation import Moderator, NullModerator, get_moderator
 from app.services.pricing import estimate_cost
@@ -78,9 +93,14 @@ __all__ = [
     "MAX_TOKENS",
     "NUM_EXAMPLES",
     "PROMPT_VERSIONS",
+    "REVIEW_PROMPT_VERSIONS",
+    "REVIEW_REQUIRES_V6",
     "SESSION_PROMPT_VERSIONS",
+    "BossIteration",
+    "BossTrace",
     "ChatMessage",
     "ComputedEstimate",
+    "CriticIssue",
     "EstimationOutcome",
     "EstimationService",
     "GenerationOptions",
@@ -94,6 +114,7 @@ __all__ = [
     "LLMStream",
     "Moderator",
     "PromptVersion",
+    "ReviewConfig",
     "SessionPromptVersion",
     "StructuredOutputError",
     "StructuredResult",
@@ -265,28 +286,6 @@ def _call_structured(
     if options is None or options == LLMCallOptions():
         return provider.generate_structured(system, messages, response_model)
     return provider.generate_structured(system, messages, response_model, options)
-
-
-class LLMProviderError(Exception):
-    """Domain error for any LLM failure. The original exception is kept as `__cause__`."""
-
-    def __init__(self, provider: str) -> None:
-        super().__init__(f"LLM provider '{provider}' failed")
-        self.provider = provider
-
-
-StructuredFailure = Literal["truncated", "invalid"]
-
-
-class StructuredOutputError(LLMProviderError):
-    """The structured output was cut at the token limit (`truncated`) or is still invalid
-    after every validation retry (`invalid`); `attempts` calls were made.
-    """
-
-    def __init__(self, provider: str, reason: StructuredFailure, attempts: int) -> None:
-        super().__init__(provider)
-        self.reason: StructuredFailure = reason
-        self.attempts = attempts
 
 
 def _elapsed_ms(start: float) -> int:
@@ -1044,7 +1043,11 @@ class EstimationOutcome:
     `result` is the validated estimate with the costs and totals computed by the code,
     and `text` its server-side Markdown render. `prompt_version` is the version actually
     rendered for this request (never cached: a cache hit reports the version of the
-    current request). Tokens are summed over every structured attempt.
+    current request). Tokens are summed over every structured attempt and, with the
+    Actor-Critic-Boss review, over every call of the turn (drafts and Critic): `cost_usd`
+    is `None` if any call has no known price, `cache_hit` is true only if every call was
+    a hit, and `model`/`provider`/`fallback_used` are those of the final draft (design
+    s05-acb D8).
     """
 
     text: str
@@ -1063,6 +1066,40 @@ class EstimationOutcome:
     prompt_version: str = DEFAULT_PROMPT_VERSION
     # None when `evaluate` is off or the estimate is out of scope (D9).
     validation: StructureCheck | None = None
+    # Trace of the Actor-Critic-Boss review; None when the turn was not reviewed.
+    review: BossTrace | None = None
+
+
+# Message of the 422 for `review` with a prompt version without `<critic_feedback>`.
+REVIEW_REQUIRES_V6 = "requires prompt_version v6"
+
+
+@dataclass(frozen=True)
+class ReviewConfig:
+    """Actor-Critic-Boss review of a session turn (design s05-acb D2, D9), passed as data.
+
+    `max_iterations` is the draft budget (`BOSS_MAX_ITERATIONS`); `critic_target` is the
+    `CRITIC_MODEL` deployment (an override without fallback) or `None` for the primary
+    model with fallback.
+    """
+
+    max_iterations: int = 3
+    critic_target: Deployment | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_iterations < 1:
+            raise ValueError("max_iterations must be at least 1")
+
+
+def _sum_cost(calls: Sequence[StructuredResult[Any]]) -> float | None:
+    """Cost of every call of the turn; `None` if any of them has no known price."""
+    total = 0.0
+    for call in calls:
+        cost = estimate_cost(call.model, call.input_tokens, call.output_tokens)
+        if cost is None:
+            return None
+        total += cost
+    return round(total, 6)
 
 
 def _default_resolve_model(name: str) -> Deployment:
@@ -1219,20 +1256,67 @@ class EstimationService:
         options: GenerationOptions,
         start: float,
     ) -> EstimationOutcome:
-        """Shared generation step of `estimate` and `estimate_turn` (S05 design D6).
-
-        Structured call (cache, LLM with validation retries) -> costs and totals in code ->
-        Markdown render -> evaluation. `language` is the effective language of the labels
-        when known; otherwise the model's `language` decides (`language_source="llm"`).
+        """Shared generation step of `estimate` and `estimate_turn` without review (S05
+        design D6): one structured call, then `_finalize`.
         """
-        call_options = LLMCallOptions(model=target, max_tokens=options.max_tokens)
-        response_model: type[EstimationResult] = response_model_for(output_format, detail_level)
-        structured = _call_structured(
-            self._provider, system, messages, response_model, call_options
+        structured = self._draft(
+            system=system,
+            messages=messages,
+            output_format=output_format,
+            detail_level=detail_level,
+            target=target,
+            options=options,
+        )
+        return self._finalize(
+            structured.value,
+            calls=[structured],
+            final_call=structured,
+            output_format=output_format,
+            detail_level=detail_level,
+            language=language,
+            language_source=language_source,
+            options=options,
+            start=start,
         )
 
-        effective = language or structured.value.language
-        computed = compute_estimate(structured.value, effective)
+    def _draft(
+        self,
+        *,
+        system: str,
+        messages: list[ChatMessage],
+        output_format: OutputFormat,
+        detail_level: DetailLevel,
+        target: Deployment | None,
+        options: GenerationOptions,
+    ) -> StructuredResult[EstimationResult]:
+        """One structured estimation call (cache, LLM with validation retries)."""
+        call_options = LLMCallOptions(model=target, max_tokens=options.max_tokens)
+        response_model: type[EstimationResult] = response_model_for(output_format, detail_level)
+        return _call_structured(self._provider, system, messages, response_model, call_options)
+
+    def _finalize(
+        self,
+        result: EstimationResult,
+        *,
+        calls: Sequence[StructuredResult[Any]],
+        final_call: StructuredResult[Any],
+        output_format: OutputFormat,
+        detail_level: DetailLevel,
+        language: Language | None,
+        language_source: str,
+        options: GenerationOptions,
+        start: float,
+        review: BossTrace | None = None,
+    ) -> EstimationOutcome:
+        """Costs and totals in code -> Markdown render -> evaluation, once per request.
+
+        `language` is the effective language of the labels when known; otherwise the
+        model's `language` decides (`language_source="llm"`). `calls` are every structured
+        call of the request (their tokens and costs are summed); `final_call` is the one
+        that produced `result` (model, provider, fallback).
+        """
+        effective = language or result.language
+        computed = compute_estimate(result, effective)
         text = render_markdown(computed, output_format, detail_level)
         logger.info(
             "estimation_rendered",
@@ -1263,18 +1347,17 @@ class EstimationService:
         return EstimationOutcome(
             text=text,
             result=computed,
-            model=structured.model,
-            provider=structured.provider,
-            input_tokens=structured.input_tokens,
-            output_tokens=structured.output_tokens,
-            cost_usd=estimate_cost(
-                structured.model, structured.input_tokens, structured.output_tokens
-            ),
-            fallback_used=structured.fallback_used,
-            cache_hit=structured.cache_hit,
+            model=final_call.model,
+            provider=final_call.provider,
+            input_tokens=sum(call.input_tokens for call in calls),
+            output_tokens=sum(call.output_tokens for call in calls),
+            cost_usd=_sum_cost(calls),
+            fallback_used=final_call.fallback_used,
+            cache_hit=all(call.cache_hit for call in calls),
             latency_ms=_elapsed_ms(start),
             prompt_version=options.prompt_version,
             validation=validation,
+            review=review,
         )
 
     def _screen_turn(self, transcript: str, attachments: Sequence[tuple[str, str]]) -> None:
@@ -1306,22 +1389,29 @@ class EstimationService:
         options: GenerationOptions | None = None,
         tier: Tier = Tier.DEFAULT,
         conversation_summary: str | None = None,
+        review: ReviewConfig | None = None,
     ) -> TurnOutcome:
         """Estimate one turn of a session, without state (S05 design D6).
 
-        Order: option checks (session prompt versions), PII masking of the attachments,
-        regex of the transcript and of each attachment, one moderation call, response
-        language (detected in the transcript, else the session's; never in the
-        attachments), render with the project metadata and, with v5, the conversation
-        summary and the audience `tier` (both resolved by the caller and passed as data,
-        design s05-memory D9/D10; v4 ignores them), then the shared generation step with
-        `history` (anchors and window) followed by the new `user` message. Raise
+        Order: option checks (session prompt versions; `review` only with a version in
+        `REVIEW_PROMPT_VERSIONS`), PII masking of the attachments, regex of the
+        transcript and of each attachment, one moderation call, response language
+        (detected in the transcript, else the session's; never in the attachments),
+        render with the project metadata and, with v5/v6, the conversation summary and
+        the audience `tier` (both resolved by the caller and passed as data, design
+        s05-memory D9/D10; v4 ignores them), then the generation with `history` (anchors
+        and window) followed by the new `user` message. With `review`, the generation is
+        the Actor-Critic-Boss loop (design s05-acb D2): guardrails and moderation still
+        run once, and the final result is computed, rendered and evaluated once. Raise
         `InvalidOptionError`, `InputGuardrailViolation` (nothing sent to the moderation,
-        the cache nor the LLM after a block) or `LLMProviderError`.
+        the cache nor the LLM after a block) or `LLMProviderError` (of the first draft
+        only, with review).
         """
         start = time.perf_counter()
         options = options or GenerationOptions(prompt_version=DEFAULT_SESSION_PROMPT_VERSION)
         _check_options(options, allowed=SESSION_PROMPT_VERSIONS)
+        if review is not None and options.prompt_version not in REVIEW_PROMPT_VERSIONS:
+            raise InvalidOptionError("review", REVIEW_REQUIRES_V6)
         target = self._target(options)
         num_examples = options.effective_num_examples
         logger.info(
@@ -1337,37 +1427,158 @@ class EstimationService:
             evaluate=options.evaluate,
             attachments=len(attachments),
             history_messages=len(history),
+            review=review is not None,
         )
         masked = _masked(attachments)
         self._screen_turn(turn.transcript, masked)
 
         detected = detect_language(turn.transcript)
         language = detected or session_language
-        try:
-            prompt = render_session_prompt(
-                turn,
-                options.prompt_version,
-                attachments=masked,
+        language_source = "detected" if detected else "session"
+
+        def render(feedback: CriticFeedback | None = None) -> SessionPrompt:
+            try:
+                return render_session_prompt(
+                    turn,
+                    options.prompt_version,
+                    attachments=masked,
+                    project_metadata=project_metadata,
+                    response_language=language,
+                    num_examples=num_examples,
+                    conversation_summary=conversation_summary,
+                    tier=tier,
+                    critic_feedback=feedback,
+                )
+            except UnknownPromptVersionError:
+                # Unreachable after `_check_options`; never a 500 for a version.
+                raise InvalidOptionError(
+                    "prompt_version", _prompt_version_message(SESSION_PROMPT_VERSIONS)
+                ) from None
+
+        prompt = render()
+        if review is None:
+            outcome = self._generate(
+                system=prompt.system,
+                messages=[*history, {"role": "user", "content": prompt.user}],
+                output_format=turn.output_format,
+                detail_level=turn.detail_level,
+                language=language,
+                language_source=language_source,
+                target=target,
+                options=options,
+                start=start,
+            )
+            return TurnOutcome(outcome=outcome, history_user=prompt.history_user)
+
+        outcome = self._reviewed(
+            turn,
+            prompt=prompt,
+            render=render,
+            history=history,
+            project_metadata=project_metadata,
+            conversation_summary=conversation_summary,
+            tier=tier,
+            language=language,
+            language_source=language_source,
+            target=target,
+            options=options,
+            review=review,
+            start=start,
+        )
+        # The history keeps the turn as the client wrote it: never the feedback.
+        return TurnOutcome(outcome=outcome, history_user=prompt.history_user)
+
+    def _reviewed(
+        self,
+        turn: SessionTurnInput,
+        *,
+        prompt: SessionPrompt,
+        render: Callable[[CriticFeedback | None], SessionPrompt],
+        history: Sequence[ChatMessage],
+        project_metadata: ProjectMetadata | None,
+        conversation_summary: str | None,
+        tier: Tier,
+        language: Language | None,
+        language_source: str,
+        target: Deployment | None,
+        options: GenerationOptions,
+        review: ReviewConfig,
+        start: float,
+    ) -> EstimationOutcome:
+        """Actor-Critic-Boss generation of a session turn (design s05-acb D2, D8, D10).
+
+        Actor: the turn's system and history plus the `user` message, re-rendered with
+        the `<critic_feedback>` block from the second draft on. Critic: each draft already
+        computed. The Boss decides; the final result is finalized once, with the metrics
+        of every call. Logs `acb_completed` without content.
+        """
+        critic = Critic(
+            self._provider,
+            LLMCallOptions(model=review.critic_target, max_tokens=CRITIC_MAX_TOKENS),
+        )
+        calls: list[StructuredResult[Any]] = []
+        # Each draft with the call that produced it (model and provider of the final one).
+        draft_calls: list[tuple[Draft, StructuredResult[Any]]] = []
+        drafts = 0
+
+        def actor(feedback: CriticFeedback | None) -> Draft:
+            nonlocal drafts
+            drafts += 1
+            current = prompt if feedback is None else render(feedback)
+            with structlog.contextvars.bound_contextvars(
+                llm_purpose="estimation", review_iteration=drafts
+            ):
+                structured = self._draft(
+                    system=current.system,
+                    messages=[*history, {"role": "user", "content": current.user}],
+                    output_format=turn.output_format,
+                    detail_level=turn.detail_level,
+                    target=target,
+                    options=options,
+                )
+            calls.append(structured)
+            effective = language or structured.value.language
+            draft = Draft(
+                result=structured.value, estimate=compute_estimate(structured.value, effective)
+            )
+            draft_calls.append((draft, structured))
+            return draft
+
+        def critic_review(draft: Draft) -> CriticReview:
+            result = critic.review(
+                draft.estimate,
+                transcript=turn.transcript,
                 project_metadata=project_metadata,
-                response_language=language,
-                num_examples=num_examples,
                 conversation_summary=conversation_summary,
                 tier=tier,
+                language=draft.estimate.language,
+                iteration=drafts,
             )
-        except UnknownPromptVersionError:
-            # Unreachable after `_check_options`; never a 500 for a version.
-            raise InvalidOptionError(
-                "prompt_version", _prompt_version_message(SESSION_PROMPT_VERSIONS)
-            ) from None
-        outcome = self._generate(
-            system=prompt.system,
-            messages=[*history, {"role": "user", "content": prompt.user}],
+            if result.call is not None:
+                calls.append(result.call)
+            return result
+
+        run = run_review(actor, critic_review, max_iterations=review.max_iterations)
+        trace = run.trace
+        logger.info(
+            "acb_completed",
+            final_decision=trace.final_decision,
+            stop_reason=trace.stop_reason,
+            iterations=trace.iterations_run,
+            llm_calls=trace.llm_calls,
+            latency_ms=_elapsed_ms(start),
+            input_tokens=sum(call.input_tokens for call in calls),
+            output_tokens=sum(call.output_tokens for call in calls),
+        )
+        return self._finalize(
+            run.final,
+            calls=calls,
+            final_call=next(call for draft, call in draft_calls if draft is run.draft),
             output_format=turn.output_format,
             detail_level=turn.detail_level,
             language=language,
-            language_source="detected" if detected else "session",
-            target=target,
+            language_source=language_source,
             options=options,
             start=start,
+            review=trace,
         )
-        return TurnOutcome(outcome=outcome, history_user=prompt.history_user)

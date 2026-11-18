@@ -4,10 +4,12 @@
 extracts the attachments, runs the stateless turn pipeline of
 `EstimationService.estimate_turn` with the session's history (anchors and window),
 metadata and summary, and only when everything succeeded appends the turn, updates the
-project metadata, language, tier and counters, and compresses the history (design
-s05-memory D4, D9). Any exception before that leaves the session untouched (failed turns
-leave no trace); a failing compression never fails the turn. Sessions are volatile: in
-process memory, lost on restart, one store per process.
+project metadata, language, tier, review and counters, and compresses the history
+(design s05-memory D4, D9). With `review=True` the turn goes through the Actor-Critic-Boss
+review inside `estimate_turn` (design s05-acb D2): the session is still updated and
+compressed once, with the final result. Any exception before that leaves the session
+untouched (failed turns leave no trace); a failing compression never fails the turn.
+Sessions are volatile: in process memory, lost on restart, one store per process.
 """
 
 import hashlib
@@ -26,24 +28,30 @@ from app.domain import SessionTurnInput
 from app.services.llm_service import (
     DEFAULT_SESSION_PROMPT_VERSION,
     MEMORY_PROMPT_VERSIONS,
+    REVIEW_PROMPT_VERSIONS,
+    REVIEW_REQUIRES_V6,
+    SESSION_PROMPT_VERSIONS,
+    BossTrace,
     EstimationOutcome,
     EstimationService,
     GenerationOptions,
     InvalidOptionError,
     LLMProvider,
     Moderator,
+    ReviewConfig,
     get_llm_provider,
     get_moderator,
 )
 from app.services.memory import MemoryCompression, get_memory_compression
 from app.sessions.metadata import update_project_metadata
-from app.sessions.models import ProjectMetadata, Session
+from app.sessions.models import LastReview, ProjectMetadata, Session
 from app.sessions.store import SessionStore, short_id
 from app.sessions.tier import Tier, TierDecision, TierRule, resolve_tier
 
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "LastReview",
     "SessionService",
     "SessionSnapshot",
     "SessionTurnOutcome",
@@ -72,6 +80,8 @@ class SessionSnapshot:
     summary_chars: int = 0  # length of the cumulative summary; 0 without one (never the text)
     last_tier: Tier | None = None  # tier of the last successful turn
     last_tier_rule: TierRule | None = None
+    # Review of the last successful turn; None when it was not reviewed (or no turn yet).
+    last_review: LastReview | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,11 @@ class SessionTurnOutcome:
     tier: Tier = Tier.DEFAULT
     tier_rule: TierRule = "default"
 
+    @property
+    def review(self) -> BossTrace | None:
+        """Trace of the Actor-Critic-Boss review of this turn; None without review."""
+        return self.outcome.review
+
 
 class SessionService:
     """Stateful side of the session turns; the LLM pipeline stays in `EstimationService`."""
@@ -100,16 +115,20 @@ class SessionService:
         limits: AttachmentLimits,
         clock: Callable[[], float] = time.monotonic,
         memory: MemoryCompression | None = None,
+        review: ReviewConfig | None = None,
     ) -> None:
         """`memory` compresses the history after each successful turn; without it (direct
         callers and tests that do not need the memory) evicted turns are discarded, as in
-        S05.
+        S05. `review` is the Actor-Critic-Boss configuration applied to the turns that ask
+        for it (`BOSS_MAX_ITERATIONS`, `CRITIC_MODEL`); by default 3 iterations and the
+        primary model with fallback for the Critic.
         """
         self._store = store
         self._estimation = estimation
         self._limits = limits
         self._clock = clock
         self._memory = memory
+        self._review = review or ReviewConfig()
 
     def create(self) -> str:
         """Create an empty session and return its id (canonical lowercase UUID4)."""
@@ -130,6 +149,7 @@ class SessionService:
             summary_chars=len(history.summary or ""),
             last_tier=last_tier.tier if last_tier else None,
             last_tier_rule=last_tier.rule if last_tier else None,
+            last_review=session.last_review,
         )
 
     def estimate(
@@ -140,6 +160,7 @@ class SessionService:
         options: GenerationOptions | None = None,
         *,
         tier: Tier | None = None,
+        review: bool = False,
     ) -> SessionTurnOutcome:
         """Run one turn of the session.
 
@@ -151,8 +172,11 @@ class SessionService:
         `InputGuardrailViolation`, `LLMProviderError`) and, only on success, append the
         turn, update the metadata (not when out of scope), the language, `last_tier` and
         the counters, then compress the history (never failing the turn). `tier` is the
-        explicit audience of the turn; `None` resolves it by rules. Every event of the
-        turn carries the short session id.
+        explicit audience of the turn; `None` resolves it by rules. `review=True` runs the
+        Actor-Critic-Boss review with the service's `ReviewConfig` (`InvalidOptionError` on
+        `review` with a prompt version without `<critic_feedback>`, before the tier and
+        the attachments); the session stores `last_review` (None for a turn without
+        review). Every event of the turn carries the short session id.
         """
         options = options or GenerationOptions(prompt_version=DEFAULT_SESSION_PROMPT_VERSION)
         with (
@@ -162,6 +186,13 @@ class SessionService:
             # Anchors and window before the new turn: the history sent to the LLM and the
             # stored client messages the tier reads (NDA and regulation).
             history = session.history.to_messages()
+            # An unknown version is left to `estimate_turn`, which rejects it.
+            if (
+                review
+                and options.prompt_version in SESSION_PROMPT_VERSIONS
+                and options.prompt_version not in REVIEW_PROMPT_VERSIONS
+            ):
+                raise InvalidOptionError("review", REVIEW_REQUIRES_V6)
             decision = _resolve_tier(
                 turn.transcript,
                 session,
@@ -179,6 +210,7 @@ class SessionService:
                 options=options,
                 tier=decision.tier,
                 conversation_summary=session.history.summary,
+                review=self._review if review else None,
             )
 
             # Success only from here on: nothing above mutates the session.
@@ -191,6 +223,16 @@ class SessionService:
                 )
             session.language = outcome.result.language
             session.last_tier = decision
+            trace = outcome.review
+            session.last_review = (
+                LastReview(
+                    final_decision=trace.final_decision,
+                    stop_reason=trace.stop_reason,
+                    iterations_run=trace.iterations_run,
+                )
+                if trace is not None
+                else None
+            )
             session.turn_count += 1
             session.updated_at = self._clock()
             self._compress(session)
@@ -210,6 +252,8 @@ class SessionService:
                 summary_chars=len(session.history.summary or ""),
                 tier=decision.tier.value,
                 tier_rule=decision.rule,
+                review=review,
+                review_decision=trace.final_decision if trace is not None else None,
                 constraints=len(metadata.explicit_constraints),
                 rejected=len(metadata.rejected_options),
             )
@@ -314,7 +358,9 @@ def get_session_service(
     memory: Annotated[MemoryCompression, Depends(get_memory_compression)],
 ) -> SessionService:
     """FastAPI dependency: a service over the process store, provider, moderator and
-    memory compression (tests override `get_memory_compression` with a deterministic one).
+    memory compression (tests override `get_memory_compression` with a deterministic one),
+    with the Actor-Critic-Boss configuration of the settings (`BOSS_MAX_ITERATIONS` and
+    `CRITIC_MODEL`, unset: the primary with fallback). No network at build time.
     """
     estimation = EstimationService(
         provider, resolve_model=settings.resolve_request_model, moderator=moderator
@@ -324,4 +370,10 @@ def get_session_service(
         max_bytes=settings.max_attachment_bytes,
         max_chars=settings.max_attachment_chars,
     )
-    return SessionService(store, estimation, limits, memory=memory)
+    review = ReviewConfig(
+        max_iterations=settings.boss_max_iterations,
+        critic_target=(
+            settings.resolve_request_model(settings.critic_model) if settings.critic_model else None
+        ),
+    )
+    return SessionService(store, estimation, limits, memory=memory, review=review)

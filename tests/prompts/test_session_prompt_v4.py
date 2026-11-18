@@ -54,11 +54,11 @@ FILLED = ProjectMetadata(
 # --- Render por defecto ---
 
 
-def test_default_render_returns_v5_and_history_user_equals_user_without_attachments():
-    """Scenario: Render por defecto (v5 es la versión por defecto de las sesiones)."""
-    assert loader.DEFAULT_SESSION_PROMPT_VERSION == "v5"
+def test_default_render_returns_v6_and_history_user_equals_user_without_attachments():
+    """Scenario: Render por defecto (v6 es la versión por defecto de las sesiones)."""
+    assert loader.DEFAULT_SESSION_PROMPT_VERSION == "v6"
     prompt = render_session_prompt(make_turn())
-    assert prompt.system == render_session_prompt(make_turn(), "v5").system
+    assert prompt.system == render_session_prompt(make_turn(), "v6").system
     assert prompt.system and prompt.user
     assert prompt.history_user == prompt.user
     assert prompt.system == prompt.system.strip() and prompt.user == prompt.user.strip()

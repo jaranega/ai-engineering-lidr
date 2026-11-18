@@ -1,0 +1,76 @@
+{#
+  Critic user message, v1 (design s05-acb D7). The transcript of the turn (verbatim,
+  unescaped), the session's project metadata (one `key: value` line per field with a
+  value, as in the estimation prompt), the cumulative summary (only when present), the
+  resolved tier, the effective language of the turn and a compact view of the computed
+  draft, ending with `precomputed_figures` (phase shares, FTE, implied weeks) computed by
+  code in `critic_figures`: the model gets that arithmetic wrong when it does it itself.
+  Never the attachments' text nor the history.
+#}
+<transcript>
+{{ transcript }}
+</transcript>
+
+<project_metadata>
+{% if project_metadata.project_name %}
+project_name: {{ project_metadata.project_name }}
+{% endif %}
+{% if project_metadata.assumed_team_size is not none %}
+assumed_team_size: {{ project_metadata.assumed_team_size }}
+{% endif %}
+{% if project_metadata.mentioned_technologies %}
+mentioned_technologies: {{ project_metadata.mentioned_technologies | join(", ") }}
+{% endif %}
+{% if project_metadata.agreed_scope %}
+agreed_scope: {{ project_metadata.agreed_scope }}
+{% endif %}
+{% if project_metadata.explicit_constraints %}
+explicit_constraints: {{ project_metadata.explicit_constraints | join("; ") }}
+{% endif %}
+{% if project_metadata.rejected_options %}
+rejected_options: {{ project_metadata.rejected_options | join(", ") }}
+{% endif %}
+</project_metadata>
+{% if conversation_summary %}
+
+<conversation_summary>
+{{ conversation_summary }}
+</conversation_summary>
+{% endif %}
+
+<resolved_tier>{{ tier }}</resolved_tier>
+
+<response_language>{{ {"es": "Spanish", "en": "English"}.get(language, "the language of the transcript") }}</response_language>
+
+<estimation_under_review>
+title: {{ estimate.title }}
+summary: {{ estimate.summary }}
+confidence_pct: {{ estimate.confidence_pct }}
+rows:
+{% for row in estimate.rows %}
+- [{{ loop.index0 }}] {{ row.phase }} | {{ row.rate_profile }} | {{ row.hours }} h | {{ row.task }}
+{% endfor %}
+phases:
+{% for phase in estimate.phases %}
+- [{{ loop.index0 }}] {{ phase.phase }} | {{ phase.hours }} h ({{ figures.phase_shares[loop.index0] }}% of total hours) | {{ phase.cost_eur }} EUR | confidence {{ phase.confidence_pct }}%
+{% endfor %}
+team:
+{% for member in estimate.team %}
+- {{ member.count }} {{ member.role }}{{ " (part-time)" if member.part_time else "" }}
+{% endfor %}
+duration_weeks: {% if estimate.duration_weeks %}{{ estimate.duration_weeks.min_weeks }}-{{ estimate.duration_weeks.max_weeks }}{% else %}none{% endif %}
+
+assumptions_and_risks:
+{% for item in estimate.assumptions_and_risks %}
+- {{ item }}
+{% endfor %}
+technologies: {{ estimate.technologies | join(", ") if estimate.technologies else "none" }}
+precomputed_figures (exact, computed by code; use them, do not recompute):
+total_hours: {{ estimate.total_hours }}
+total_cost_eur: {{ estimate.total_cost_eur }}
+largest_phase_share: {{ figures.largest_phase_share ~ "%" if figures.largest_phase_share is not none else "none" }} (threshold 75%)
+team_fte: {{ figures.team_fte if figures.team_fte is not none else "none" }}
+implied_weeks: {{ figures.implied_weeks if figures.implied_weeks is not none else "none" }} at {{ figures.hours_per_fte_week }} h per FTE per week (declared duration_weeks: {% if estimate.duration_weeks %}{{ estimate.duration_weeks.min_weeks }}-{{ estimate.duration_weeks.max_weeks }}{% else %}none{% endif %})
+</estimation_under_review>
+
+Audit this estimate and return the structured review.

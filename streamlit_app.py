@@ -31,8 +31,26 @@ OUTPUT_FORMAT_LABELS = {
     "line_items": "Partidas",
     "narrative": "Narrativa",
 }
-SESSION_PROMPT_VERSIONS = ("v5", "v4")
-AUDIENCE_PROMPT_VERSION = "v5"
+SESSION_PROMPT_VERSIONS = ("v6", "v5", "v4")
+AUDIENCE_PROMPT_VERSIONS = ("v5", "v6")
+REVIEW_PROMPT_VERSION = "v6"
+ACB_DECISION_LABELS = {"accept": "Aceptada", "synthesize": "Sintetizada con avisos"}
+ACB_STOP_REASON_LABELS = {
+    "accepted": "el revisor la aceptó",
+    "out_of_scope": "fuera de alcance, sin revisar",
+    "critic_failed": "el revisor no respondió",
+    "rejected": "el revisor la rechazó",
+    "budget_exhausted": "se agotaron las iteraciones",
+    "actor_failed": "falló un reintento",
+}
+ACB_VERDICT_LABELS = {
+    "accept": "Aceptar",
+    "needs_iteration": "Necesita iteración",
+    "reject": "Rechazar",
+}
+REVIEW_HELP = (
+    "El turno tarda más y cuesta más: hasta 3 borradores, cada uno con una revisión. Solo con v6."
+)
 TIERS = {
     "executive": "Dirección (ejecutivo)",
     "pm": "Gestión (PM)",
@@ -51,7 +69,7 @@ TIER_RULE_LABELS = {
 AUTO_AUDIENCE_LABEL = "Automático"
 DEFAULT_DETAIL_LEVEL = "medium"
 DEFAULT_OUTPUT_FORMAT = "line_items"
-DEFAULT_PROMPT_VERSION = "v5"
+DEFAULT_PROMPT_VERSION = "v6"
 MAX_TRANSCRIPT_CHARS = 20_000
 MAX_ATTACHMENTS = 5
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
@@ -164,6 +182,7 @@ class TurnForm:
     prompt_version: str
     uploads: list[Any]
     tier: str | None = None
+    review: bool = False
 
     def fields(self) -> dict[str, str]:
         fields = {
@@ -172,8 +191,10 @@ class TurnForm:
             "detail_level": self.detail_level,
             "output_format": self.output_format,
         }
-        if self.tier is not None and self.prompt_version == AUDIENCE_PROMPT_VERSION:
+        if self.tier is not None and self.prompt_version in AUDIENCE_PROMPT_VERSIONS:
             fields["tier"] = self.tier
+        if self.review and self.prompt_version == REVIEW_PROMPT_VERSION:
+            fields["review"] = "true"
         return fields
 
     def files(self) -> list[tuple[str, tuple[str, bytes, str]]]:
@@ -501,14 +522,22 @@ def render_form() -> TurnForm | None:
                 key="prompt_version",
             )
             # Widgets in a form only update on submit, so this follows the last submitted version.
-            audience_enabled = st.session_state.get("prompt_version") == AUDIENCE_PROMPT_VERSION
+            last_version = st.session_state.get("prompt_version")
+            audience_enabled = last_version in AUDIENCE_PROMPT_VERSIONS
             tier = st.selectbox(
                 "Audiencia",
                 [None, *TIERS],
                 format_func=lambda value: AUTO_AUDIENCE_LABEL if value is None else TIERS[value],
                 key="tier",
                 disabled=not audience_enabled,
-                help=None if audience_enabled else "Solo con v5",
+                help=None if audience_enabled else "Solo con v5 o v6",
+            )
+            review = st.checkbox(
+                "Revisión Actor-Critic-Boss",
+                value=False,
+                key="review",
+                disabled=last_version not in (None, REVIEW_PROMPT_VERSION),
+                help=REVIEW_HELP,
             )
         submitted = st.form_submit_button("Enviar")
     if not submitted:
@@ -521,6 +550,7 @@ def render_form() -> TurnForm | None:
         prompt_version,
         list(uploads or []),
         tier,
+        review,
     )
 
 
@@ -560,6 +590,42 @@ def render_validation(validation: dict | None) -> None:
         st.json(validation)
 
 
+def acb_summary(acb: dict) -> str:
+    decision = str(acb.get("final_decision"))
+    reason = str(acb.get("stop_reason"))
+    return (
+        f"{ACB_DECISION_LABELS.get(decision, decision)} — "
+        f"{ACB_STOP_REASON_LABELS.get(reason, reason)}"
+    )
+
+
+def acb_issue_rows(issues: list[dict]) -> list[dict[str, str]]:
+    return [
+        {
+            "Gravedad": str(issue.get("severity", "")),
+            "Categoría": str(issue.get("category", "")),
+            "Campo": str(issue.get("field_path") or ""),
+            "Descripción": str(issue.get("description", "")),
+        }
+        for issue in issues
+    ]
+
+
+def render_acb(acb: dict) -> None:
+    with st.expander("Revisión Actor-Critic-Boss", expanded=False):
+        st.markdown(f"**Decisión final:** {acb_summary(acb)}")
+        st.caption(f"Iteraciones: {acb.get('iterations_run', 0)}")
+        for iteration in acb.get("iterations", []):
+            verdict = iteration.get("verdict")
+            verdict_text = ACB_VERDICT_LABELS.get(str(verdict), "Sin veredicto")
+            st.markdown(f"**Iteración {iteration.get('iteration')}** — {verdict_text}")
+            issues = iteration.get("issues") or []
+            if issues:
+                st.table(acb_issue_rows(issues))
+            else:
+                st.caption("Sin problemas")
+
+
 def render_user_turn(turn: dict) -> None:
     transcript = turn["transcript"]
     with st.chat_message("user"):
@@ -580,6 +646,8 @@ def render_assistant_turn(turn: dict) -> None:
         if data.get("truncated"):
             st.warning(TRUNCATED_WARNING)
         st.markdown(data["text"])
+        if isinstance(data.get("acb"), dict):
+            render_acb(data["acb"])
         with st.expander("Métricas y validación", expanded=False):
             st.caption(f"Versión del prompt: {data.get('prompt_version')}")
             if data.get("tier") is not None:

@@ -96,7 +96,7 @@ def test_tier_resolved_is_logged_with_the_explicit_flag(make_session_client):
     first, second = events(logs, "tier_resolved")
     assert (first["tier"], first["rule"], first["explicit"]) == ("executive", "nda_detected", False)
     assert (second["tier"], second["rule"], second["explicit"]) == ("pm", "explicit", True)
-    assert first["prompt_version"] == "v5"
+    assert first["prompt_version"] == "v6"
     assert "TEXTO-SECRETO" not in json.dumps(logs, default=str)
 
 
